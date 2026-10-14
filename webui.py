@@ -828,6 +828,12 @@ html, body {
     border: 1.5px dashed #64748b !important;
     color: #94a3b8 !important;
 }
+.btn-generate-glow:disabled img,
+.btn-generate-glow[disabled] img,
+.btn-generate-glow:disabled .button-icon,
+.btn-generate-glow[disabled] .button-icon {
+    animation: spin 1s linear infinite;
+}
 
 /* Caja de Estado y Barra de Progreso Dinámica */
 .live-status-container {
@@ -1173,6 +1179,8 @@ with gr.Blocks(title="Kaboomi 3D Studio") as demo:
                         icon="assets/icons/wand.svg",
                         elem_classes=["btn-generate-glow"]
                     )
+                    icon_wand_dict = btn_generate.serve_static_file("assets/icons/wand.svg")
+                    icon_loader_dict = btn_generate.serve_static_file("assets/icons/loader.svg")
                     
                     status_widget = gr.HTML(
                         value=render_progress_html("Listo para generar. Sube una imagen y presiona generar.", 0)
@@ -1374,7 +1382,7 @@ with gr.Blocks(title="Kaboomi 3D Studio") as demo:
     # 2. Generación 3D en streaming con bloqueo anti-doble clic instantáneo
     btn_generate.click(
         fn=lambda: (
-            gr.update(interactive=False, value="PROCESANDO MODELO 3D...", icon="assets/icons/loader.svg"),
+            gr.update(interactive=False, value="PROCESANDO MODELO 3D...", icon=icon_loader_dict),
             gr.update(interactive=False),
             gr.update(interactive=False),
             gr.update(interactive=False)
@@ -1392,7 +1400,7 @@ with gr.Blocks(title="Kaboomi 3D Studio") as demo:
         ],
         outputs=[viewer_3d, download_glb_btn, download_stl_btn, download_3mf_btn, status_widget]
     ).then(
-        fn=lambda: gr.update(interactive=True, value="GENERAR MODELO 3D (GLB / STL / 3MF)", icon="assets/icons/wand.svg"),
+        fn=lambda: gr.update(interactive=True, value="GENERAR MODELO 3D (GLB / STL / 3MF)", icon=icon_wand_dict),
         inputs=[],
         outputs=[btn_generate]
     )

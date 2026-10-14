@@ -32,7 +32,7 @@ if not exist "%MODELS_ROOT%\u2net" mkdir "%MODELS_ROOT%\u2net" 2>nul
 if not exist "%MODELS_ROOT%\pip_cache" mkdir "%MODELS_ROOT%\pip_cache" 2>nul
 if not exist "%MODELS_ROOT%\temp" mkdir "%MODELS_ROOT%\temp" 2>nul
 
-:: 2. Deteccion Inteligente de Python (Variable de entorno PATH, variables del usuario y sistema)
+:: 2. Deteccion Inteligente de Python (Priorizando el lanzador py y respetando Inkscape)
 echo [1/7] Buscando interprete de Python en el sistema...
 set "PY_CMD="
 
@@ -54,10 +54,38 @@ if defined PYTHON_CMD (
     )
 )
 
-:: B) Variable de entorno PATH (where python.exe)
+:: B) PRIORIDAD PRINCIPAL: Lanzador oficial de Python (py.exe)
+:: Extrae la ruta real del interprete oficial sin interferir con Inkscape
+where py.exe >nul 2>&1
+if !errorlevel! equ 0 (
+    for /f "delims=" %%P in ('py -3.11 -c "import sys; print(sys.executable)" 2^>nul') do (
+        if not defined PY_CMD set "PY_CMD=%%P"
+    )
+    if not defined PY_CMD (
+        for /f "delims=" %%P in ('py -3.10 -c "import sys; print(sys.executable)" 2^>nul') do (
+            if not defined PY_CMD set "PY_CMD=%%P"
+        )
+    )
+    if not defined PY_CMD (
+        for /f "delims=" %%P in ('py -3 -c "import sys; print(sys.executable)" 2^>nul') do (
+            if not defined PY_CMD set "PY_CMD=%%P"
+        )
+    )
+    if not defined PY_CMD (
+        for /f "delims=" %%P in ('py -c "import sys; print(sys.executable)" 2^>nul') do (
+            if not defined PY_CMD set "PY_CMD=%%P"
+        )
+    )
+    if defined PY_CMD (
+        echo [INFO] Detectado mediante lanzador oficial py: "!PY_CMD!"
+        goto :python_found
+    )
+)
+
+:: C) Variable de entorno PATH (where python.exe, ignorando Inkscape y WindowsApps)
 for /f "delims=" %%I in ('where python.exe 2^>nul') do (
     if not defined PY_CMD (
-        echo %%I | findstr /i "WindowsApps" >nul
+        echo %%I | findstr /i "WindowsApps Inkscape" >nul
         if !errorlevel! neq 0 (
             "%%I" -c "import sys; exit(0)" >nul 2>&1
             if !errorlevel! equ 0 (
@@ -69,31 +97,13 @@ for /f "delims=" %%I in ('where python.exe 2^>nul') do (
     )
 )
 
-:: C) Lanzador py oficial
-where py.exe >nul 2>&1
-if !errorlevel! equ 0 (
-    py -3.11 -c "import sys; exit(0)" >nul 2>&1
-    if !errorlevel! equ 0 (
-        set "PY_CMD=py -3.11"
-        echo [INFO] Detectado mediante lanzador py -3.11
-        goto :python_found
-    )
-    py -3 -c "import sys; exit(0)" >nul 2>&1
-    if !errorlevel! equ 0 (
-        set "PY_CMD=py -3"
-        echo [INFO] Detectado mediante lanzador py -3
-        goto :python_found
-    )
-)
-
-:: D) Rutas estandar de instalacion en Windows
+:: D) Rutas estandar de instalacion en Windows (excluyendo Inkscape)
 if not defined PY_CMD if exist "%LocalAppData%\Programs\Python\Python311\python.exe" set "PY_CMD=%LocalAppData%\Programs\Python\Python311\python.exe"
 if not defined PY_CMD if exist "%LocalAppData%\Programs\Python\Python310\python.exe" set "PY_CMD=%LocalAppData%\Programs\Python\Python310\python.exe"
 if not defined PY_CMD if exist "%LocalAppData%\Programs\Python\Python312\python.exe" set "PY_CMD=%LocalAppData%\Programs\Python\Python312\python.exe"
 if not defined PY_CMD if exist "%ProgramFiles%\Python311\python.exe" set "PY_CMD=%ProgramFiles%\Python311\python.exe"
 if not defined PY_CMD if exist "%ProgramFiles%\Python310\python.exe" set "PY_CMD=%ProgramFiles%\Python310\python.exe"
 if not defined PY_CMD if exist "%ProgramFiles%\Python312\python.exe" set "PY_CMD=%ProgramFiles%\Python312\python.exe"
-if not defined PY_CMD if exist "%ProgramFiles%\Inkscape\bin\python.exe" set "PY_CMD=%ProgramFiles%\Inkscape\bin\python.exe"
 if not defined PY_CMD if exist "D:\Programas\Python311\python.exe" set "PY_CMD=D:\Programas\Python311\python.exe"
 
 if defined PY_CMD (
