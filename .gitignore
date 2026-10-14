@@ -1,0 +1,37 @@
+# Entorno virtual (en este proyecto es un enlace a D:\AI_Models\venv_3dgen)
+.venv/
+.venv
+venv/
+env/
+
+# Variables de entorno locales (usa .env.example como plantilla)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Modelos y salidas generadas
+outputs/
+output/
+*.glb
+*.obj
+*.ply
+*.safetensors
+*.ckpt
+*.pth
+*.onnx
+
+# Notas locales / archivos sueltos
+Entorno
+Nota
+Python
+
+# Sistema / editores
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
