@@ -76,11 +76,14 @@ python img2glb.py --input foto.png --output ../Games/kaboomi-party/assets/models
 | Parámetro | Valor por Defecto | Descripción |
 | :--- | :--- | :--- |
 | `--input`, `-i` | *(Requerido)* | Ruta a la imagen (PNG, JPG, WEBP). Si no es transparente, `rembg` quita el fondo. |
-| `--output`, `-o` | *(Requerido)* | Ruta de destino del archivo `.glb`. Crea carpetas automáticamente. |
+| `--output`, `-o` | *(Requerido)* | Ruta de destino del modelo (`.glb`, `.stl` o `.3mf`). Crea carpetas automáticamente. |
 | `--faces`, `-f` | `4000` | Número de triángulos objetivo (ideal móvil: 3000-5000). |
 | `--steps`, `-s` | `5` | Pasos de inferencia DiT (5 pasos en Turbo = ~15 segundos). |
 | `--seed` | `42` | Semilla de generación (-1 para aleatorio). |
 | `--align-bottom` | `False` | Si se activa, coloca los pies en `Y=0.0` en lugar de centrar en el centro geométrico. |
+| `--formats` | `None` | Formatos a exportar separados por comas (ej: `glb,stl,3mf`). |
+| `--export-stl` | `False` | Exporta adicionalmente el modelo en formato `.stl` para impresión 3D / CAD. |
+| `--export-3mf` | `False` | Exporta adicionalmente el modelo en formato `.3mf` para slicers de manufactura (Bambu, Prusa, Orca). |
 
 ---
 
@@ -94,9 +97,13 @@ Para arrastrar imágenes en el navegador y generar modelos interactivamente:
    ```
 2. Se abrirá automáticamente tu navegador en **`http://127.0.0.1:7860`**.
 3. **Flujo de uso en 3 pasos:**
-   - **Paso 1:** Arrastra una imagen y pulsa *"Quitar Fondo"* si deseas previsualizar la silueta.
-   - **Paso 2:** Ajusta los triángulos (4000 por defecto) y pulsa **"🚀 Generar Modelo 3D (.glb)"**.
-   - **Paso 3:** Inspecciona el modelo en el visor 3D interactivo con rotación de 360°, dale un nombre y pulsa **`💣 Enviar a bombos/`**, **`🧸 Enviar a bozis/`** o **`👑 Enviar a cosmetics/`**.
+   - **Paso 1:** Arrastra una imagen y pulsa *"Extraer Silueta Alfa"* si deseas previsualizar la silueta.
+   - **Paso 2:** Ajusta los triángulos (presets de 2K, 4K u 8K caras) y pulsa **"GENERAR MODELO 3D (GLB / STL / 3MF)"**.
+   - **Paso 3:** Inspecciona el modelo en el visor 3D interactivo con rotación de 360° y:
+     - **Descargar .GLB:** Con texturas PBR completas y normales (Godot 4, Unity, Web).
+     - **Descargar .STL:** Geometría triangular sólida optimizada para cualquier impresora 3D.
+     - **Descargar .3MF:** Formato moderno de manufactura aditiva con metadatos para Bambu Studio, OrcaSlicer y PrusaSlicer.
+     - O guárdalo directamente en el juego Godot 4 con 1 clic (`bombos/`, `bozis/`, `cosmetics/`).
 
 ---
 

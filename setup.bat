@@ -3,164 +3,277 @@ setlocal enabledelayedexpansion
 chcp 65001 >nul
 
 echo ==============================================================================
-echo       3D GENERATOR - SETUP (Tencent Hunyuan3D-2 para GPU 16GB VRAM)
-echo       Optimizador y Exportador de Modelos .GLB para Kaboomi Party (Godot 4)
-echo       MODO ALMACENAMIENTO SEGURO: 100%% EN DISCO D:\ (Modelos, Venv y Cache)
+echo       3D GENERATOR - SETUP (Tencent Hunyuan3D-2 para GPU)
+echo       Optimizador y Exportador de Modelos .GLB para Kaboomi Party
 echo ==============================================================================
 echo.
 
-:: 1. Variables de entorno globales para almacenar 100% en D:
-set "HF_HOME=D:\AI_Models\huggingface"
-set "HUGGINGFACE_HUB_CACHE=D:\AI_Models\huggingface\hub"
-set "TORCH_HOME=D:\AI_Models\torch"
-set "U2NET_HOME=D:\AI_Models\u2net"
-set "PIP_CACHE_DIR=D:\AI_Models\pip_cache"
-set "TEMP=D:\AI_Models\temp"
-set "TMP=D:\AI_Models\temp"
+:: 1. Deteccion dinamica de disco y almacenamiento (Sin rutas fijas/quemadas)
+if defined AI_MODELS_DIR (
+    set "MODELS_ROOT=%AI_MODELS_DIR%"
+) else if exist "D:\" (
+    set "MODELS_ROOT=D:\AI_Models"
+) else (
+    set "MODELS_ROOT=%~dp0AI_Models"
+)
 
-:: Asegurar carpetas base en D:\
-if not exist "D:\AI_Models\huggingface" mkdir "D:\AI_Models\huggingface"
-if not exist "D:\AI_Models\torch" mkdir "D:\AI_Models\torch"
-if not exist "D:\AI_Models\u2net" mkdir "D:\AI_Models\u2net"
-if not exist "D:\AI_Models\pip_cache" mkdir "D:\AI_Models\pip_cache"
-if not exist "D:\AI_Models\venv_3dgen" mkdir "D:\AI_Models\venv_3dgen"
-if not exist "D:\AI_Models\temp" mkdir "D:\AI_Models\temp"
+echo [INFO] Carpeta de modelos y cache: %MODELS_ROOT%
+set "HF_HOME=%MODELS_ROOT%\huggingface"
+set "HUGGINGFACE_HUB_CACHE=%MODELS_ROOT%\huggingface\hub"
+set "TORCH_HOME=%MODELS_ROOT%\torch"
+set "U2NET_HOME=%MODELS_ROOT%\u2net"
+set "PIP_CACHE_DIR=%MODELS_ROOT%\pip_cache"
+set "TEMP=%MODELS_ROOT%\temp"
+set "TMP=%MODELS_ROOT%\temp"
 
-:: 2. Detección de Python
-echo [1/7] Buscando interprete de Python 3.11...
+if not exist "%MODELS_ROOT%\huggingface" mkdir "%MODELS_ROOT%\huggingface" 2>nul
+if not exist "%MODELS_ROOT%\torch" mkdir "%MODELS_ROOT%\torch" 2>nul
+if not exist "%MODELS_ROOT%\u2net" mkdir "%MODELS_ROOT%\u2net" 2>nul
+if not exist "%MODELS_ROOT%\pip_cache" mkdir "%MODELS_ROOT%\pip_cache" 2>nul
+if not exist "%MODELS_ROOT%\temp" mkdir "%MODELS_ROOT%\temp" 2>nul
+
+:: 2. Deteccion Inteligente de Python (Variable de entorno PATH, variables del usuario y sistema)
+echo [1/7] Buscando interprete de Python en el sistema...
 set "PY_CMD="
 
-if exist "D:\Programas\Python311\python.exe" (
-    set "PY_CMD=D:\Programas\Python311\python.exe"
-    goto :python_found
+:: A) Variable de entorno definida por el usuario
+if defined PYTHON (
+    "%PYTHON%" -c "import sys; exit(0)" >nul 2>&1
+    if !errorlevel! equ 0 (
+        set "PY_CMD=%PYTHON%"
+        echo [INFO] Detectado mediante variable de entorno PYTHON
+        goto :python_found
+    )
+)
+if defined PYTHON_CMD (
+    "%PYTHON_CMD%" -c "import sys; exit(0)" >nul 2>&1
+    if !errorlevel! equ 0 (
+        set "PY_CMD=%PYTHON_CMD%"
+        echo [INFO] Detectado mediante variable PYTHON_CMD
+        goto :python_found
+    )
 )
 
-where python >nul 2>&1
+:: B) Variable de entorno PATH (where python.exe)
+for /f "delims=" %%I in ('where python.exe 2^>nul') do (
+    if not defined PY_CMD (
+        echo %%I | findstr /i "WindowsApps" >nul
+        if !errorlevel! neq 0 (
+            "%%I" -c "import sys; exit(0)" >nul 2>&1
+            if !errorlevel! equ 0 (
+                set "PY_CMD=%%I"
+                echo [INFO] Detectado en variable PATH: %%I
+                goto :python_found
+            )
+        )
+    )
+)
+
+:: C) Lanzador py oficial
+where py.exe >nul 2>&1
 if !errorlevel! equ 0 (
-    set "PY_CMD=python"
+    py -3.11 -c "import sys; exit(0)" >nul 2>&1
+    if !errorlevel! equ 0 (
+        set "PY_CMD=py -3.11"
+        echo [INFO] Detectado mediante lanzador py -3.11
+        goto :python_found
+    )
+    py -3 -c "import sys; exit(0)" >nul 2>&1
+    if !errorlevel! equ 0 (
+        set "PY_CMD=py -3"
+        echo [INFO] Detectado mediante lanzador py -3
+        goto :python_found
+    )
+)
+
+:: D) Rutas estandar de instalacion en Windows
+if not defined PY_CMD if exist "%LocalAppData%\Programs\Python\Python311\python.exe" set "PY_CMD=%LocalAppData%\Programs\Python\Python311\python.exe"
+if not defined PY_CMD if exist "%LocalAppData%\Programs\Python\Python310\python.exe" set "PY_CMD=%LocalAppData%\Programs\Python\Python310\python.exe"
+if not defined PY_CMD if exist "%LocalAppData%\Programs\Python\Python312\python.exe" set "PY_CMD=%LocalAppData%\Programs\Python\Python312\python.exe"
+if not defined PY_CMD if exist "%ProgramFiles%\Python311\python.exe" set "PY_CMD=%ProgramFiles%\Python311\python.exe"
+if not defined PY_CMD if exist "%ProgramFiles%\Python310\python.exe" set "PY_CMD=%ProgramFiles%\Python310\python.exe"
+if not defined PY_CMD if exist "%ProgramFiles%\Python312\python.exe" set "PY_CMD=%ProgramFiles%\Python312\python.exe"
+if not defined PY_CMD if exist "%ProgramFiles%\Inkscape\bin\python.exe" set "PY_CMD=%ProgramFiles%\Inkscape\bin\python.exe"
+if not defined PY_CMD if exist "D:\Programas\Python311\python.exe" set "PY_CMD=D:\Programas\Python311\python.exe"
+
+if defined PY_CMD (
+    echo [INFO] Detectado en ruta: "!PY_CMD!"
     goto :python_found
 )
 
-where py >nul 2>&1
-if !errorlevel! equ 0 (
-    set "PY_CMD=py -3.11"
-    goto :python_found
+:: E) Si no se encontro automaticamente, solicitar al usuario o usar winget
+echo.
+echo [ALERTA] No se encontro Python en PATH ni en las carpetas comunes.
+echo.
+set /p "USER_PY=Ingresa la ruta completa de tu python.exe o presiona ENTER para instalarlo con winget: "
+if defined USER_PY (
+    set "USER_PY=!USER_PY:"=!"
+    if exist "!USER_PY!" (
+        set "PY_CMD=!USER_PY!"
+        goto :python_found
+    )
 )
 
-echo [ALERTA] No se encontró Python 3.11 en D:\Programas\Python311 ni en PATH.
-echo Instalando Python 3.11 directamente en D:\Programas\Python311...
-winget install -e --id Python.Python.3.11 --override "/passive InstallAllUsers=0 TargetDir=D:\Programas\Python311 PrependPath=1 Include_launcher=0 Include_test=0" --accept-package-agreements --accept-source-agreements
-if exist "D:\Programas\Python311\python.exe" (
-    set "PY_CMD=D:\Programas\Python311\python.exe"
-    echo Python 3.11 instalado con éxito en D:\Programas\Python311.
+echo [INFO] Instalando Python 3.11 con winget...
+winget install -e --id Python.Python.3.11 --accept-package-agreements --accept-source-agreements
+
+if exist "%LocalAppData%\Programs\Python\Python311\python.exe" (
+    set "PY_CMD=%LocalAppData%\Programs\Python\Python311\python.exe"
+    goto :python_found
+)
+if exist "%ProgramFiles%\Python311\python.exe" (
+    set "PY_CMD=%ProgramFiles%\Python311\python.exe"
+    goto :python_found
+)
+for /f "delims=" %%I in ('where python.exe 2^>nul') do (
+    if not defined PY_CMD (
+        set "PY_CMD=%%I"
+        goto :python_found
+    )
+)
+
+echo [ERROR] No se pudo encontrar ni instalar Python.
+echo Por favor instala Python 3.11 marcando la casilla Add Python to PATH.
+pause
+exit /b 1
+
+:python_found
+echo [INFO] Interprete seleccionado: "!PY_CMD!"
+echo.
+
+:: 3. Creacion y Activacion del Entorno Virtual (.venv)
+echo [2/7] Configurando entorno virtual...
+
+if exist "D:\" (
+    set "VENV_DIR=%MODELS_ROOT%\venv_3dgen"
 ) else (
-    echo [ERROR] Por favor instala Python 3.11 en D:\Programas\Python311.
+    set "VENV_DIR=%~dp0.venv"
+)
+
+:: Crear venv si no existe
+if not exist "!VENV_DIR!\Scripts\activate.bat" (
+    echo [INFO] Creando entorno virtual en "!VENV_DIR!"...
+    "!PY_CMD!" -m venv "!VENV_DIR!"
+    if not exist "!VENV_DIR!\Scripts\activate.bat" (
+        echo [INFO] Intentando crear entorno virtual alternativo en .venv...
+        set "VENV_DIR=%~dp0.venv"
+        "!PY_CMD!" -m venv "!VENV_DIR!"
+    )
+)
+
+:: Enlace o activacion directa
+set "ACTIVATE_BAT="
+if exist "%~dp0.venv\Scripts\activate.bat" (
+    set "ACTIVATE_BAT=%~dp0.venv\Scripts\activate.bat"
+) else if exist "!VENV_DIR!\Scripts\activate.bat" (
+    if /i "!VENV_DIR!" neq "%~dp0.venv" (
+        if not exist "%~dp0.venv" mklink /J "%~dp0.venv" "!VENV_DIR!" >nul 2>&1
+    )
+    if exist "%~dp0.venv\Scripts\activate.bat" (
+        set "ACTIVATE_BAT=%~dp0.venv\Scripts\activate.bat"
+    ) else (
+        set "ACTIVATE_BAT=!VENV_DIR!\Scripts\activate.bat"
+    )
+)
+
+if not defined ACTIVATE_BAT (
+    echo.
+    echo [ERROR CRITICO] No se pudo generar el entorno virtual en: !VENV_DIR!
+    echo Causa: El interprete seleccionado no incluye el modulo venv o ensurepip.
+    echo Si estas usando el Python embebido de Inkscape, necesitas instalar la version
+    echo oficial de Python 3.11 desde python.org marcando Add to PATH.
+    echo.
     pause
     exit /b 1
 )
 
-:python_found
-echo -> Python utilizado: !PY_CMD!
-echo.
-
-:: 3. Creación de Entorno Virtual en D:\ con Enlace Simbólico/Unión Local
-echo [2/7] Configurando entorno virtual 100%% en D:\AI_Models\venv_3dgen...
-if not exist "D:\AI_Models\venv_3dgen\Scripts\activate.bat" (
-    echo -> Creando entorno virtual en D:\AI_Models\venv_3dgen...
-    !PY_CMD! -m venv D:\AI_Models\venv_3dgen
+echo [INFO] Activando entorno: "!ACTIVATE_BAT!"
+call "!ACTIVATE_BAT!"
+if !errorlevel! neq 0 (
+    echo [ERROR] No se pudo activar el entorno virtual.
+    pause
+    exit /b 1
 )
-
-:: Crear unión local .venv -> D:\AI_Models\venv_3dgen si no existe
-if not exist ".venv\Scripts\activate.bat" (
-    if exist ".venv" rmdir /q ".venv" 2>nul
-    echo -> Creando unión de directorio .venv que apunta a D:\AI_Models\venv_3dgen...
-    mklink /J .venv D:\AI_Models\venv_3dgen
-)
-
-call .venv\Scripts\activate.bat
-echo -> Entorno virtual activado.
+echo [INFO] Entorno virtual activado con exito.
 echo.
 
-:: 4. Actualización de pip, setuptools y wheel usando cache en D:
-echo [3/7] Actualizando pip, setuptools y wheel en D:\...
-python -m pip install --upgrade pip setuptools wheel --cache-dir D:\AI_Models\pip_cache
+:: 4. Actualizacion de pip, setuptools y wheel
+echo [3/7] Actualizando pip, setuptools y wheel...
+python -m pip install --upgrade pip setuptools wheel --cache-dir "%PIP_CACHE_DIR%"
 echo.
 
-:: 5. Instalación de PyTorch con soporte CUDA 12.4 en D:\
-echo [4/7] Instalando PyTorch con aceleración CUDA 12.4 en D:\...
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --cache-dir D:\AI_Models\pip_cache
+:: 5. Instalacion de PyTorch con soporte CUDA 12.4
+echo [4/7] Instalando PyTorch con aceleracion CUDA 12.4...
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --cache-dir "%PIP_CACHE_DIR%"
 echo.
 
-:: 6. Instalación de dependencias del proyecto (requirements.txt)
-echo [5/7] Instalando librerias 3D y dependencias en D:\...
-pip install -r requirements.txt --cache-dir D:\AI_Models\pip_cache
+:: 6. Instalacion de dependencias del proyecto (requirements.txt)
+echo [5/7] Instalando librerias 3D y dependencias...
+pip install -r requirements.txt --cache-dir "%PIP_CACHE_DIR%"
 
 :: Instalar hy3dgen si es necesario
 python -c "import hy3dgen" 2>nul
 if !errorlevel! neq 0 (
-    echo -> Instalando paquete hy3dgen oficial de Tencent en D:\...
-    pip install git+https://github.com/Tencent-Hunyuan/Hunyuan3D-2.git --cache-dir D:\AI_Models\pip_cache
+    echo [INFO] Instalando paquete hy3dgen oficial de Tencent...
+    pip install git+https://github.com/Tencent-Hunyuan/Hunyuan3D-2.git --cache-dir "%PIP_CACHE_DIR%"
 )
+echo.
 
 :: 7. Extensiones opcionales C++/CUDA
-echo [6/7] Verificando extensiones de textura C++/CUDA...
+echo [6/7] Verificando compilador C++/CUDA...
 python -c "import custom_rasterizer" 2>nul
 if !errorlevel! neq 0 (
     where cl.exe >nul 2>&1
     if !errorlevel! equ 0 (
-        echo -> Compilador MSVC detectado.
+        echo [INFO] Compilador MSVC detectado.
     ) else (
-        echo -> Nota: Compilador MSVC cl.exe no detectado en PATH.
-        echo    El generador utilizará el motor de texturizado y horneado UV integrado sin problemas.
+        echo [INFO] Compilador MSVC cl.exe no detectado en PATH.
+        echo        El generador utilizara el motor integrado sin problemas.
     )
 )
 echo.
 
-:: 8. Verificación de GPU y Creación de Lanzadores Rápidos
+:: 8. Verificacion de GPU y Creacion de Lanzadores Dinamicos
 echo [7/7] Verificando estado de GPU (NVIDIA CUDA)...
 python -c "import torch; print(f'>>> CUDA Disponible: {torch.cuda.is_available()} | GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"CPU\"} | VRAM: {torch.cuda.get_device_properties(0).total_memory / (1024**3):.1f} GB' if torch.cuda.is_available() else '>>> CUDA no disponible')"
 
-:: Lanzador WebUI
-if not exist "run_webui.bat" (
-    echo @echo off > run_webui.bat
-    echo set "HF_HOME=D:\AI_Models\huggingface" >> run_webui.bat
-    echo set "HUGGINGFACE_HUB_CACHE=D:\AI_Models\huggingface\hub" >> run_webui.bat
-    echo set "TORCH_HOME=D:\AI_Models\torch" >> run_webui.bat
-    echo set "U2NET_HOME=D:\AI_Models\u2net" >> run_webui.bat
-    echo set "PIP_CACHE_DIR=D:\AI_Models\pip_cache" >> run_webui.bat
-    echo set "TEMP=D:\AI_Models\temp" >> run_webui.bat
-    echo set "TMP=D:\AI_Models\temp" >> run_webui.bat
-    echo call .venv\Scripts\activate.bat >> run_webui.bat
-    echo python webui.py >> run_webui.bat
-    echo pause >> run_webui.bat
-)
+:: Generar o actualizar lanzador WebUI con rutas dinamicas
+echo @echo off > run_webui.bat
+echo set "HF_HOME=%HF_HOME%" >> run_webui.bat
+echo set "HUGGINGFACE_HUB_CACHE=%HUGGINGFACE_HUB_CACHE%" >> run_webui.bat
+echo set "TORCH_HOME=%TORCH_HOME%" >> run_webui.bat
+echo set "U2NET_HOME=%U2NET_HOME%" >> run_webui.bat
+echo set "PIP_CACHE_DIR=%PIP_CACHE_DIR%" >> run_webui.bat
+echo set "TEMP=%TEMP%" >> run_webui.bat
+echo set "TMP=%TMP%" >> run_webui.bat
+echo call "!ACTIVATE_BAT!" >> run_webui.bat
+echo python webui.py >> run_webui.bat
+echo pause >> run_webui.bat
 
-:: Lanzador CLI
-if not exist "run_cli.bat" (
-    echo @echo off > run_cli.bat
-    echo set "HF_HOME=D:\AI_Models\huggingface" >> run_cli.bat
-    echo set "HUGGINGFACE_HUB_CACHE=D:\AI_Models\huggingface\hub" >> run_cli.bat
-    echo set "TORCH_HOME=D:\AI_Models\torch" >> run_cli.bat
-    echo set "U2NET_HOME=D:\AI_Models\u2net" >> run_cli.bat
-    echo set "PIP_CACHE_DIR=D:\AI_Models\pip_cache" >> run_cli.bat
-    echo set "TEMP=D:\AI_Models\temp" >> run_cli.bat
-    echo set "TMP=D:\AI_Models\temp" >> run_cli.bat
-    echo call .venv\Scripts\activate.bat >> run_cli.bat
-    echo python img2glb.py %%* >> run_cli.bat
-)
+:: Generar o actualizar lanzador CLI con rutas dinamicas
+echo @echo off > run_cli.bat
+echo set "HF_HOME=%HF_HOME%" >> run_cli.bat
+echo set "HUGGINGFACE_HUB_CACHE=%HUGGINGFACE_HUB_CACHE%" >> run_cli.bat
+echo set "TORCH_HOME=%TORCH_HOME%" >> run_cli.bat
+echo set "U2NET_HOME=%U2NET_HOME%" >> run_cli.bat
+echo set "PIP_CACHE_DIR=%PIP_CACHE_DIR%" >> run_cli.bat
+echo set "TEMP=%TEMP%" >> run_cli.bat
+echo set "TMP=%TMP%" >> run_cli.bat
+echo call "!ACTIVATE_BAT!" >> run_cli.bat
+echo python img2glb.py %%* >> run_cli.bat
 
 echo.
 echo ==============================================================================
-echo  ¡INSTALACIÓN CONFIGURADA 100%% EN DISCO D:!
+echo  ¡INSTALACION CONFIGURADA CORRECTAMENTE!
 echo ==============================================================================
-echo  Modelos y Cache: D:\AI_Models\huggingface
-echo  Entorno Virtual: D:\AI_Models\venv_3dgen (.venv)
+echo  Modelos y Cache: %MODELS_ROOT%
+echo  Entorno Virtual: !VENV_DIR!
 echo.
 echo  Para abrir la interfaz web:
 echo     run_webui.bat
 echo.
 echo  Para ejecutar por consola:
-echo     run_cli.bat --input mi_foto.png --output ../Games/kaboomi-party/assets/models/bombos/personaje.glb --faces 4000
+echo     run_cli.bat --input mi_foto.png --output personaje.glb --faces 4000
 echo ==============================================================================
 echo.
 pause

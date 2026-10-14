@@ -732,7 +732,76 @@ def postprocess_and_validate_glb(
 
 
 # ==============================================================================
-# 7. Función Orquestadora Completa: generate_model_pipeline()
+# 7. Exportación Multi-Formato (.GLB, .STL, .3MF)
+# ==============================================================================
+
+def export_formats_from_mesh(
+    mesh: Any,
+    base_output_path: Union[str, Path],
+    formats: Optional[list] = None,
+    target_faces: int = 4000
+) -> dict:
+    """
+    Exporta una malla a múltiples formatos 3D (.glb, .stl, .3mf).
+    Retorna un diccionario con las rutas de los archivos exportados: {'glb': Path, 'stl': Path, '3mf': Path}
+    """
+    if formats is None:
+        formats = ["glb"]
+
+    norm_formats = [str(f).lower().lstrip(".") for f in formats]
+    dest_base = Path(base_output_path)
+    stem_base = dest_base.with_suffix("")
+    
+    results = {}
+    geo_mesh = mesh.to_geometry() if isinstance(mesh, trimesh.Scene) else mesh
+
+    for fmt in norm_formats:
+        out_file = stem_base.with_suffix(f".{fmt}")
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        print(f" -> Exportando formato .{fmt.upper()}: {out_file.name}...")
+        
+        try:
+            if fmt == "glb":
+                mesh.export(str(out_file), file_type="glb", include_normals=True)
+                try:
+                    postprocess_and_validate_glb(out_file, asset_name=out_file.stem, target_faces=target_faces)
+                except Exception as e_post:
+                    print(f"    [Aviso pygltflib] {e_post}")
+            elif fmt == "stl":
+                geo_mesh.export(str(out_file), file_type="stl")
+            elif fmt == "3mf":
+                geo_mesh.export(str(out_file), file_type="3mf")
+            else:
+                geo_mesh.export(str(out_file), file_type=fmt)
+                
+            results[fmt] = out_file
+            print(f"    [OK] .{fmt.upper()} generado ({out_file.stat().st_size / 1024:.1f} KB)")
+        except Exception as e_exp:
+            print(f"    [ERROR] Falló exportación a .{fmt.upper()}: {e_exp}")
+
+    return results
+
+
+def convert_glb_to_format(glb_path: Union[str, Path], target_format: str) -> Path:
+    """
+    Convierte un archivo .glb existente a .stl o .3mf en la misma ubicación.
+    Si ya existe y no está desactualizado, retorna la ruta existente.
+    """
+    glb_path = Path(glb_path)
+    fmt = target_format.lower().lstrip(".")
+    if fmt == "glb":
+        return glb_path
+    
+    out_file = glb_path.with_suffix(f".{fmt}")
+    if not out_file.exists() or out_file.stat().st_mtime < glb_path.stat().st_mtime:
+        scene = trimesh.load(str(glb_path))
+        geo = scene.to_geometry() if isinstance(scene, trimesh.Scene) else scene
+        geo.export(str(out_file), file_type=fmt)
+    return out_file
+
+
+# ==============================================================================
+# 8. Función Orquestadora Completa: generate_model_pipeline()
 # ==============================================================================
 
 def generate_model_pipeline(
@@ -748,7 +817,8 @@ def generate_model_pipeline(
     generate_texture: bool = True,
     rembg_session: Optional[Any] = None,
     clean_image_input: Optional[Image.Image] = None,
-    step_callback: Optional[Callable[[int, str], None]] = None
+    step_callback: Optional[Callable[[int, str], None]] = None,
+    export_formats: Optional[list] = None
 ) -> Path:
     """
     Ejecuta el pipeline automático completo de 4 etapas:
@@ -838,31 +908,44 @@ def generate_model_pipeline(
         aligned_mesh.visual.material = neutral_mat
         final_textured_mesh = aligned_mesh
 
-    # 5. Exportación a .GLB en D:\AI_Models\output\ con normales de vértice
-    print(f"\n[Guardando] Exportando modelo .glb a: {dest_path}...")
-    final_textured_mesh.export(str(dest_path), file_type="glb", include_normals=True)
+    # 5. Exportación Multi-Formato (.GLB, .STL, .3MF)
+    req_formats = list(export_formats) if export_formats else []
+    if not req_formats:
+        out_ext = dest_path.suffix.lower().lstrip(".")
+        if out_ext in ("glb", "stl", "3mf"):
+            req_formats = [out_ext]
+        else:
+            req_formats = ["glb"]
 
-    # 6. Post-procesamiento y Validación pygltflib
-    postprocess_and_validate_glb(dest_path, asset_name=dest_path.stem, target_faces=target_faces)
+    print(f"\n[Guardando] Exportando modelo en formatos: {[f.upper() for f in req_formats]}...")
+    exported_map = export_formats_from_mesh(
+        mesh=final_textured_mesh,
+        base_output_path=dest_path,
+        formats=req_formats,
+        target_faces=target_faces
+    )
 
     elapsed = time.time() - total_start
-    file_size_mb = dest_path.stat().st_size / (1024 * 1024)
+    main_file = exported_map.get("glb") or (list(exported_map.values())[0] if exported_map else dest_path)
+    file_size_mb = main_file.stat().st_size / (1024 * 1024) if main_file.exists() else 0.0
     
     print("\n" + "="*70)
     print(" ¡GENERACIÓN COMPLETADA CON ÉXITO!")
-    print(f" -> Archivo GLB: {dest_path.name}")
-    print(f" -> Ruta Absoluta: {dest_path}")
-    print(f" -> Tamaño: {file_size_mb:.2f} MB")
+    for fmt_k, fmt_path in exported_map.items():
+        if fmt_path.exists():
+            f_mb = fmt_path.stat().st_size / (1024 * 1024)
+            print(f" -> Formato .{fmt_k.upper()}: {fmt_path.name} ({f_mb:.2f} MB)")
+    print(f" -> Directorio Destino: {dest_path.parent}")
     print(f" -> Triángulos: {len(final_textured_mesh.faces):,}")
     print(f" -> Vértices: {len(final_textured_mesh.vertices):,}")
     print(f" -> Tiempo Total: {elapsed:.2f} segundos")
     print("="*70 + "\n")
 
-    return dest_path
+    return main_file
 
 
 # ==============================================================================
-# 8. Interfaz por Consola (CLI)
+# 9. Interfaz por Consola (CLI)
 # ==============================================================================
 
 def main():
@@ -880,7 +963,7 @@ def main():
         "--output", "-o",
         type=str,
         required=True,
-        help="Ruta de salida del modelo .glb (ej: ../kaboomi-party/assets/models/bombos/mi_modelo.glb)"
+        help="Ruta de salida del modelo .glb, .stl o .3mf (ej: ../kaboomi-party/assets/models/bombos/mi_modelo.glb)"
     )
     parser.add_argument(
         "--faces", "-f",
@@ -916,6 +999,22 @@ def main():
         action="store_true",
         help="Desactivar el modo de bajo VRAM (mantiene ambos modelos en VRAM simultáneamente)"
     )
+    parser.add_argument(
+        "--formats",
+        type=str,
+        default=None,
+        help="Formatos a exportar separados por comas (ej: glb,stl,3mf). Si se omite, se deduce de --output o usa glb."
+    )
+    parser.add_argument(
+        "--export-stl",
+        action="store_true",
+        help="Exportar también en formato STL (.stl) para impresión 3D"
+    )
+    parser.add_argument(
+        "--export-3mf",
+        action="store_true",
+        help="Exportar también en formato 3MF (.3mf) para slicers de manufactura aditiva (Bambu, Prusa)"
+    )
 
     args = parser.parse_args()
 
@@ -923,6 +1022,16 @@ def main():
     if not input_path.exists():
         print(f"[ERROR] El archivo de entrada '{input_path}' no existe.")
         sys.exit(1)
+
+    requested_formats = []
+    if args.formats:
+        requested_formats.extend([f.strip().lower() for f in args.formats.split(",") if f.strip()])
+    if args.export_stl and "stl" not in requested_formats:
+        requested_formats.append("stl")
+    if args.export_3mf and "3mf" not in requested_formats:
+        requested_formats.append("3mf")
+    if not requested_formats:
+        requested_formats = None
 
     try:
         generate_model_pipeline(
@@ -933,7 +1042,8 @@ def main():
             octree_resolution=args.octree,
             seed=args.seed,
             align_bottom=args.align_bottom,
-            low_vram_mode=not args.no_low_vram
+            low_vram_mode=not args.no_low_vram,
+            export_formats=requested_formats
         )
     except Exception as e:
         print(f"\n[ERROR FATAL] La generación falló: {e}")

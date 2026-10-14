@@ -57,6 +57,8 @@ from img2glb import (
     decimate_mesh_to_target_faces,
     center_and_orient_mesh,
     postprocess_and_validate_glb,
+    export_formats_from_mesh,
+    convert_glb_to_format,
     Hunyuan3DGenerator,
     is_dit_cached,
     DEFAULT_OUTPUT_DIR
@@ -107,6 +109,7 @@ for folder in [BOMBOS_DIR, BOZIS_DIR, COSMETICS_DIR]:
     folder.mkdir(parents=True, exist_ok=True)
 
 CURRENT_GENERATED_GLB: Optional[Path] = None
+CURRENT_GENERATED_FILES: dict[str, Optional[Path]] = {"glb": None, "stl": None, "3mf": None}
 IS_GENERATING: bool = False
 
 if torch.cuda.is_available():
@@ -182,18 +185,21 @@ def _ui_generate_3d_impl(
     preset_label: str,
     generate_texture: bool,
     model_name: str
-) -> Generator[Tuple[Optional[str], any, str], None, None]:
+) -> Generator[Tuple[Optional[str], any, any, any, str], None, None]:
     """
     Función generadora interna en streaming que emite actualizaciones en vivo etapa por etapa:
       - Etapa 1: Extracción alfa (15%)
       - Etapa 2: GPU VRAM init (25%)
       - Etapa 3: Síntesis DiT granular (30% -> 65%), Volume Decoding (66% -> 84%), Decimación (88%)
-      - Etapa 4: Texturizado UV (94%), Empaquetado GLB (97%), Finalizado (100%)
+      - Etapa 4: Texturizado UV (94%), Empaquetado Multi-Formato GLB/STL/3MF (97%), Finalizado (100%)
     """
-    global CURRENT_GENERATED_GLB
+    global CURRENT_GENERATED_GLB, CURRENT_GENERATED_FILES
+
+    def step_yield(msg_html: str):
+        return None, gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), msg_html
     
     if image is None and clean_silhouette is None:
-        yield None, gr.update(interactive=False), render_progress_html("Sube una imagen en el Paso 1 antes de generar.", 0)
+        yield step_yield(render_progress_html("Sube una imagen en el Paso 1 antes de generar.", 0))
         return
 
     cfg = PRESET_CONFIG_MAP.get(preset_label, {"faces": 4000, "steps": 5, "octree": 256})
@@ -205,7 +211,7 @@ def _ui_generate_3d_impl(
     # --------------------------------------------------------------------------
     # ETAPA 1/4: Silueta Limpia (15%)
     # --------------------------------------------------------------------------
-    yield None, gr.update(interactive=False), render_progress_html("[1/4] Extracción Alfa: Procesando silueta con Rembg U2-Net...", 15)
+    yield step_yield(render_progress_html("[1/4] Extracción Alfa: Procesando silueta con Rembg U2-Net...", 15))
     
     try:
         if clean_silhouette is not None:
@@ -218,7 +224,7 @@ def _ui_generate_3d_impl(
                 session=REMBG_SESSION
             )
     except Exception as e:
-        yield None, gr.update(interactive=False), render_progress_html(f"Error en Rembg: {e}", 0)
+        yield step_yield(render_progress_html(f"Error en Rembg: {e}", 0))
         return
 
     # --------------------------------------------------------------------------
@@ -246,15 +252,15 @@ def _ui_generate_3d_impl(
                     eta = sdata.get("eta_seconds", 0)
                     eta_str = f"{int(eta//60)}m {int(eta%60):02d}s" if eta > 0 else "calculando..."
                     txt = f"[2/4] Descargando pesos DiT ({dl_mb:.0f}/{tot_mb:.0f} MB • {pct}% • {spd} MB/s • ETA: {eta_str})"
-                    yield None, gr.update(interactive=False), render_progress_html(txt, int(pct * 0.45 + 5))
+                    yield step_yield(render_progress_html(txt, int(pct * 0.45 + 5)))
                 except Exception:
                     pass
             else:
-                yield None, gr.update(interactive=False), render_progress_html("[2/4] Iniciando descarga de pesos Hunyuan3D-2 (~4.9GB) a Disco D:...", 25)
+                yield step_yield(render_progress_html("[2/4] Iniciando descarga de pesos Hunyuan3D-2 (~4.9GB) a Disco D:...", 25))
             
             time.sleep(1.5)
 
-    yield None, gr.update(interactive=False), render_progress_html("[2/4] Aceleración GPU: Cargando Hunyuan3D-2 DiT en VRAM (fp16)...", 25)
+    yield step_yield(render_progress_html("[2/4] Aceleración GPU: Cargando Hunyuan3D-2 DiT en VRAM (fp16)...", 25))
 
     try:
         generator = Hunyuan3DGenerator(
@@ -265,13 +271,13 @@ def _ui_generate_3d_impl(
             low_vram_mode=False
         )
     except Exception as e:
-        yield None, gr.update(interactive=False), render_progress_html(f"Error al cargar Hunyuan3D-2: {e}", 0)
+        yield step_yield(render_progress_html(f"Error al cargar Hunyuan3D-2: {e}", 0))
         return
 
     # --------------------------------------------------------------------------
     # ETAPA 3/4: Geometría 3D y Decimación (Streaming granular 30% -> 88%)
     # --------------------------------------------------------------------------
-    yield None, gr.update(interactive=False), render_progress_html("[3/4] Síntesis Geométrica: Iniciando inferencia en GPU...", 30)
+    yield step_yield(render_progress_html("[3/4] Síntesis Geométrica: Iniciando inferencia en GPU...", 30))
 
     progress_q = queue.Queue()
     gen_result = {"mesh": None, "error": None}
@@ -303,19 +309,19 @@ def _ui_generate_3d_impl(
             msg, pct = item
             if msg == "__DONE__":
                 break
-            yield None, gr.update(interactive=False), render_progress_html(msg, pct)
+            yield step_yield(render_progress_html(msg, pct))
         except queue.Empty:
             pass
 
     worker_thread.join()
 
     if gen_result["error"] is not None:
-        yield None, gr.update(interactive=False), render_progress_html(f"Error en geometría: {gen_result['error']}", 0)
+        yield step_yield(render_progress_html(f"Error en geometría: {gen_result['error']}", 0))
         return
 
     raw_mesh = gen_result["mesh"]
 
-    yield None, gr.update(interactive=False), render_progress_html(f"[3/4] Optimización de Malla: Decimando a {target_faces:,} caras...", 88)
+    yield step_yield(render_progress_html(f"[3/4] Optimización de Malla: Decimando a {target_faces:,} caras...", 88))
     decimated_mesh = decimate_mesh_to_target_faces(raw_mesh, target_faces=target_faces)
     aligned_mesh = center_and_orient_mesh(
         decimated_mesh,
@@ -325,10 +331,10 @@ def _ui_generate_3d_impl(
     )
 
     # --------------------------------------------------------------------------
-    # ETAPA 4/4: Texturizado y Empaquetado GLB (94% -> 100%)
+    # ETAPA 4/4: Texturizado y Empaquetado Multi-Formato (94% -> 100%)
     # --------------------------------------------------------------------------
     if generate_texture:
-        yield None, gr.update(interactive=False), render_progress_html("[4/4] Texturizado PBR: Horneando mapas de color y proyección UV...", 94)
+        yield step_yield(render_progress_html("[4/4] Texturizado PBR: Horneando mapas de color y proyección UV...", 94))
         try:
             final_mesh = generator.paint_and_texture_mesh(aligned_mesh, clean_img)
             final_mesh = center_and_orient_mesh(
@@ -340,7 +346,7 @@ def _ui_generate_3d_impl(
             print(f" -> [Aviso Textura] {e}. Usando geometría base.")
             final_mesh = aligned_mesh
     else:
-        yield None, gr.update(interactive=False), render_progress_html("[4/4] Empaquetado: Ensamblando malla base (sin textura)...", 94)
+        yield step_yield(render_progress_html("[4/4] Empaquetado: Ensamblando malla base (sin textura)...", 94))
         import trimesh
         neutral_mat = trimesh.visual.material.PBRMaterial(
             baseColorFactor=[0.84, 0.86, 0.90, 1.0],
@@ -351,40 +357,60 @@ def _ui_generate_3d_impl(
         aligned_mesh.visual.material = neutral_mat
         final_mesh = aligned_mesh
 
-    yield None, gr.update(interactive=False), render_progress_html("[4/4] Exportación glTF: Validando y guardando archivo .GLB con normales PBR...", 97)
+    yield step_yield(render_progress_html("[4/4] Exportación Multi-Formato: Generando archivos .GLB, .STL y .3MF...", 97))
 
-    # Guardar archivo .glb en D:\AI_Models\output\
+    # Guardar archivos .glb, .stl y .3mf en D:\AI_Models\output\
     timestamp = int(time.time())
     raw_name = (model_name or "").strip()
-    if raw_name.lower().endswith(".glb"):
-        raw_name = raw_name[:-4]
+    for ext in [".glb", ".stl", ".3mf"]:
+        if raw_name.lower().endswith(ext):
+            raw_name = raw_name[:-len(ext)]
     safe_base = "".join(c for c in raw_name if c.isalnum() or c in ("_", "-")).strip()
     if not safe_base:
         safe_base = f"modelo_{timestamp}"
-    safe_base += ".glb"
 
-    out_file = OUTPUT_DIR / safe_base
-    if out_file.exists():
-        out_file = OUTPUT_DIR / f"{out_file.stem}_{timestamp}.glb"
+    base_dest = OUTPUT_DIR / safe_base
+    if (OUTPUT_DIR / f"{safe_base}.glb").exists():
+        base_dest = OUTPUT_DIR / f"{safe_base}_{timestamp}"
 
     try:
-        final_mesh.export(str(out_file), file_type="glb", include_normals=True)
-        postprocess_and_validate_glb(out_file, asset_name=out_file.stem, target_faces=target_faces)
-        
-        CURRENT_GENERATED_GLB = out_file
+        exported_map = export_formats_from_mesh(
+            mesh=final_mesh,
+            base_output_path=base_dest,
+            formats=["glb", "stl", "3mf"],
+            target_faces=target_faces
+        )
+
+        glb_file = exported_map.get("glb")
+        stl_file = exported_map.get("stl")
+        threemf_file = exported_map.get("3mf")
+
+        CURRENT_GENERATED_GLB = glb_file
+        CURRENT_GENERATED_FILES["glb"] = glb_file
+        CURRENT_GENERATED_FILES["stl"] = stl_file
+        CURRENT_GENERATED_FILES["3mf"] = threemf_file
+
         elapsed = time.time() - total_start
-        file_size_mb = out_file.stat().st_size / (1024 * 1024)
+        glb_size_mb = glb_file.stat().st_size / (1024 * 1024) if glb_file and glb_file.exists() else 0.0
+        stl_size_kb = stl_file.stat().st_size / 1024 if stl_file and stl_file.exists() else 0.0
+        threemf_size_kb = threemf_file.stat().st_size / 1024 if threemf_file and threemf_file.exists() else 0.0
         num_faces = len(final_mesh.faces)
 
         final_msg = render_progress_html(
-            f"Modelo generado en {elapsed:.1f}s | {num_faces:,} caras | {file_size_mb:.2f} MB",
+            f"Modelo generado en {elapsed:.1f}s | {num_faces:,} caras | GLB: {glb_size_mb:.2f} MB • STL: {stl_size_kb:.0f} KB • 3MF: {threemf_size_kb:.0f} KB",
             100
         )
-        
-        yield str(out_file), gr.update(value=str(out_file), interactive=True), final_msg
+
+        yield (
+            str(glb_file),
+            gr.update(value=str(glb_file), interactive=True),
+            gr.update(value=str(stl_file), interactive=True),
+            gr.update(value=str(threemf_file), interactive=True),
+            final_msg
+        )
 
     except Exception as e:
-        yield None, gr.update(interactive=False), render_progress_html(f"Error al exportar GLB: {e}", 0)
+        yield step_yield(render_progress_html(f"Error al exportar formatos: {e}", 0))
 
 
 def ui_generate_3d(
@@ -393,13 +419,19 @@ def ui_generate_3d(
     preset_label: str,
     generate_texture: bool,
     model_name: str
-) -> Generator[Tuple[Optional[str], any, str], None, None]:
+) -> Generator[Tuple[Optional[str], any, any, any, str], None, None]:
     """
     Función generadora externa con bloqueo atómico anti-doble clic (mutex).
     """
     global IS_GENERATING
     if IS_GENERATING:
-        yield None, gr.update(interactive=False), render_progress_html("Ya hay una generación en progreso. Por favor espera a que finalice.", 0)
+        yield (
+            None,
+            gr.update(interactive=False),
+            gr.update(interactive=False),
+            gr.update(interactive=False),
+            render_progress_html("Ya hay una generación en progreso. Por favor espera a que finalice.", 0)
+        )
         return
     IS_GENERATING = True
     try:
@@ -469,6 +501,37 @@ def load_existing_model_preview(selection: str) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def on_select_library_model(selection: str):
+    """Carga el modelo en el visor y prepara descargas en GLB, STL y 3MF."""
+    glb_path_str = load_existing_model_preview(selection)
+    if not glb_path_str:
+        return (
+            None,
+            gr.update(interactive=False, value=None),
+            gr.update(interactive=False, value=None),
+            gr.update(interactive=False, value=None)
+        )
+    glb_path = Path(glb_path_str)
+    try:
+        stl_path = convert_glb_to_format(glb_path, "stl")
+        stl_val = str(stl_path) if stl_path.exists() else None
+    except Exception:
+        stl_val = None
+
+    try:
+        threemf_path = convert_glb_to_format(glb_path, "3mf")
+        threemf_val = str(threemf_path) if threemf_path.exists() else None
+    except Exception:
+        threemf_val = None
+
+    return (
+        str(glb_path),
+        gr.update(interactive=True, value=str(glb_path)),
+        gr.update(interactive=stl_val is not None, value=stl_val),
+        gr.update(interactive=threemf_val is not None, value=threemf_val)
+    )
 
 
 # ==============================================================================
@@ -849,23 +912,104 @@ html, body {
     font-variant-numeric: tabular-nums;
 }
 
-/* Botón Azul de Descarga en Columna 3 */
-.btn-download-blue {
-    background: linear-gradient(135deg, #0284c7, #0369a1) !important;
-    border: 1px solid #38bdf8 !important;
+/* Contenedor de Formatos de Descarga */
+.download-card {
+    background: #111728 !important;
+    border: 1px solid rgba(255, 255, 255, 0.08) !important;
+    border-radius: 12px !important;
+    padding: 10px 12px !important;
+    margin: 8px 0 6px 0 !important;
+    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.3) !important;
+}
+
+.download-card-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.78rem;
+    font-weight: 800;
+    color: #94a3b8;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+}
+
+.download-buttons-row {
+    display: flex !important;
+    gap: 8px !important;
+}
+
+.btn-download-format {
     border-radius: 8px !important;
     color: #ffffff !important;
-    font-size: 0.9rem !important;
+    font-size: 0.84rem !important;
     font-weight: 700 !important;
     height: 42px !important;
-    margin: 8px 0 6px 0 !important;
-    box-shadow: 0 4px 14px rgba(2, 132, 199, 0.35) !important;
     transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1) !important;
 }
-.btn-download-blue:hover:not(:disabled) {
+
+.btn-download-glb {
+    background: linear-gradient(135deg, #0284c7, #0369a1) !important;
+    border: 1px solid #38bdf8 !important;
+    box-shadow: 0 4px 14px rgba(2, 132, 199, 0.35) !important;
+}
+.btn-download-glb:hover:not(:disabled) {
     background: #0284c7 !important;
-    box-shadow: 0 6px 20px rgba(2, 132, 199, 0.5) !important;
+    box-shadow: 0 6px 20px rgba(2, 132, 199, 0.55) !important;
     transform: translateY(-1px) !important;
+}
+
+.btn-download-stl {
+    background: linear-gradient(135deg, #059669, #047857) !important;
+    border: 1px solid #34d399 !important;
+    box-shadow: 0 4px 14px rgba(16, 185, 129, 0.35) !important;
+}
+.btn-download-stl:hover:not(:disabled) {
+    background: #059669 !important;
+    box-shadow: 0 6px 20px rgba(16, 185, 129, 0.55) !important;
+    transform: translateY(-1px) !important;
+}
+
+.btn-download-3mf {
+    background: linear-gradient(135deg, #7c3aed, #6d28d9) !important;
+    border: 1px solid #a78bfa !important;
+    box-shadow: 0 4px 14px rgba(139, 92, 246, 0.35) !important;
+}
+.btn-download-3mf:hover:not(:disabled) {
+    background: #7c3aed !important;
+    box-shadow: 0 6px 20px rgba(139, 92, 246, 0.55) !important;
+    transform: translateY(-1px) !important;
+}
+
+/* Badges explicativos de compatibilidad */
+.formats-info-badges {
+    display: flex;
+    justify-content: space-between;
+    gap: 6px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+.format-badge {
+    flex: 1;
+    background: #151b2e;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 6px;
+    padding: 4px 6px;
+    text-align: center;
+}
+.format-badge strong {
+    display: block;
+    color: #e2e8f0;
+    font-size: 0.72rem;
+    font-weight: 700;
+}
+.format-badge span {
+    display: block;
+    color: #94a3b8;
+    font-size: 0.65rem;
+    line-height: 1.2;
+    margin-top: 1px;
 }
 
 /* Tarjeta 'Guardar directo en el Juego' en Columna 3 */
@@ -1025,7 +1169,7 @@ with gr.Blocks(title="Kaboomi 3D Studio") as demo:
                         )
 
                     btn_generate = gr.Button(
-                        "GENERAR MODELO 3D (.GLB)",
+                        "GENERAR MODELO 3D (GLB / STL / 3MF)",
                         icon="assets/icons/wand.svg",
                         elem_classes=["btn-generate-glow"]
                     )
@@ -1049,16 +1193,65 @@ with gr.Blocks(title="Kaboomi 3D Studio") as demo:
                     
                     viewer_3d = gr.Model3D(
                         label="Visor 3D Interactivo",
-                        height=340,
+                        height=310,
                         clear_color=[0.10, 0.12, 0.18, 1.0]
                     )
                     
-                    download_btn = gr.DownloadButton(
-                        "DESCARGAR ARCHIVO .GLB",
-                        icon="assets/icons/download.svg",
-                        elem_classes=["btn-download-blue"],
-                        interactive=False
-                    )
+                    with gr.Group(elem_classes=["download-card"]):
+                        gr.HTML(
+                            """
+                            <div class="download-card-header">
+                                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                    <polyline points="7 10 12 15 17 10"/>
+                                    <line x1="12" x2="12" y1="15" y2="3"/>
+                                </svg>
+                                <span>DESCARGAS POR FORMATO</span>
+                            </div>
+                            """
+                        )
+                        
+                        with gr.Row(elem_classes=["download-buttons-row"]):
+                            download_glb_btn = gr.DownloadButton(
+                                "Descargar .GLB",
+                                icon="assets/icons/cube.svg",
+                                elem_classes=["btn-download-format", "btn-download-glb"],
+                                interactive=False,
+                                scale=1
+                            )
+                            download_stl_btn = gr.DownloadButton(
+                                "Descargar .STL",
+                                icon="assets/icons/printer.svg",
+                                elem_classes=["btn-download-format", "btn-download-stl"],
+                                interactive=False,
+                                scale=1
+                            )
+                            download_3mf_btn = gr.DownloadButton(
+                                "Descargar .3MF",
+                                icon="assets/icons/layers.svg",
+                                elem_classes=["btn-download-format", "btn-download-3mf"],
+                                interactive=False,
+                                scale=1
+                            )
+                        
+                        gr.HTML(
+                            """
+                            <div class="formats-info-badges">
+                                <div class="format-badge">
+                                    <strong>.GLB (glTF)</strong>
+                                    <span>Color PBR • Godot / Web</span>
+                                </div>
+                                <div class="format-badge">
+                                    <strong>.STL (Malla)</strong>
+                                    <span>Sólido 3D • Slicers / CAD</span>
+                                </div>
+                                <div class="format-badge">
+                                    <strong>.3MF (Avanzado)</strong>
+                                    <span>Manufactura • Bambu / Prusa</span>
+                                </div>
+                            </div>
+                            """
+                        )
                     
                     with gr.Group(elem_classes=["game-save-card"]):
                         gr.HTML(
@@ -1106,6 +1299,41 @@ with gr.Blocks(title="Kaboomi 3D Studio") as demo:
                         choices=list_existing_models(),
                         label="Selecciona un modelo existente"
                     )
+                    with gr.Group(elem_classes=["download-card"]):
+                        gr.HTML(
+                            """
+                            <div class="download-card-header">
+                                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                    <polyline points="7 10 12 15 17 10"/>
+                                    <line x1="12" x2="12" y1="15" y2="3"/>
+                                </svg>
+                                <span>DESCARGAR MODELO SELECCIONADO</span>
+                            </div>
+                            """
+                        )
+                        with gr.Row(elem_classes=["download-buttons-row"]):
+                            lib_download_glb = gr.DownloadButton(
+                                "Descargar .GLB",
+                                icon="assets/icons/cube.svg",
+                                elem_classes=["btn-download-format", "btn-download-glb"],
+                                interactive=False,
+                                scale=1
+                            )
+                            lib_download_stl = gr.DownloadButton(
+                                "Descargar .STL",
+                                icon="assets/icons/printer.svg",
+                                elem_classes=["btn-download-format", "btn-download-stl"],
+                                interactive=False,
+                                scale=1
+                            )
+                            lib_download_3mf = gr.DownloadButton(
+                                "Descargar .3MF",
+                                icon="assets/icons/layers.svg",
+                                elem_classes=["btn-download-format", "btn-download-3mf"],
+                                interactive=False,
+                                scale=1
+                            )
                 with gr.Column(scale=1):
                     library_viewer = gr.Model3D(
                         label="Visualizador",
@@ -1120,7 +1348,7 @@ with gr.Blocks(title="Kaboomi 3D Studio") as demo:
                 ### Arquitectura y Entorno de Ejecución
                 - **GPU:** {GPU_SYS_TEXT}
                 - **Almacenamiento Local:** `D:\\AI_Models` (100% en Disco D:)
-                - **Directorio de Salida (.GLB):** `{OUTPUT_DIR}`
+                - **Directorio de Salida:** `{OUTPUT_DIR}` (Formatos: `.GLB`, `.STL`, `.3MF`)
                 - **Ruta de Juego Godot 4:** `{KABOOMI_ROOT}`
                 - **Motor de Inferencia:** Tencent Hunyuan3D-2 Turbo + Rembg U2-Net
                 """
@@ -1147,10 +1375,12 @@ with gr.Blocks(title="Kaboomi 3D Studio") as demo:
     btn_generate.click(
         fn=lambda: (
             gr.update(interactive=False, value="PROCESANDO MODELO 3D...", icon="assets/icons/loader.svg"),
+            gr.update(interactive=False),
+            gr.update(interactive=False),
             gr.update(interactive=False)
         ),
         inputs=[],
-        outputs=[btn_generate, download_btn]
+        outputs=[btn_generate, download_glb_btn, download_stl_btn, download_3mf_btn]
     ).then(
         fn=ui_generate_3d,
         inputs=[
@@ -1160,9 +1390,9 @@ with gr.Blocks(title="Kaboomi 3D Studio") as demo:
             chk_texture,
             txt_model_name
         ],
-        outputs=[viewer_3d, download_btn, status_widget]
+        outputs=[viewer_3d, download_glb_btn, download_stl_btn, download_3mf_btn, status_widget]
     ).then(
-        fn=lambda: gr.update(interactive=True, value="GENERAR MODELO 3D (.GLB)", icon="assets/icons/wand.svg"),
+        fn=lambda: gr.update(interactive=True, value="GENERAR MODELO 3D (GLB / STL / 3MF)", icon="assets/icons/wand.svg"),
         inputs=[],
         outputs=[btn_generate]
     )
@@ -1181,9 +1411,9 @@ with gr.Blocks(title="Kaboomi 3D Studio") as demo:
         outputs=[dropdown_models]
     )
     dropdown_models.change(
-        fn=load_existing_model_preview,
+        fn=on_select_library_model,
         inputs=[dropdown_models],
-        outputs=[library_viewer]
+        outputs=[library_viewer, lib_download_glb, lib_download_stl, lib_download_3mf]
     )
 
 
