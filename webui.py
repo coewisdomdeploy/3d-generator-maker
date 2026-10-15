@@ -354,17 +354,22 @@ def _ui_generate_3d_impl(
         cached = is_dit_cached()
         if not cached:
             status_file = Path("D:/AI_Models/download_status.json")
+            script_dir = Path(__file__).resolve().parent
+            download_script = script_dir / "download_model.py"
+            print(f" -> [WebUI] Pesos DiT de Hunyuan3D-2 no encontrados en cache. Iniciando descarga automatica en segundo plano ({download_script})...")
             try:
-                subprocess.Popen([sys.executable, "download_model.py"], cwd=str(Path("D:/3d-generator").resolve()))
-            except Exception:
-                pass
+                subprocess.Popen([sys.executable, str(download_script)], cwd=str(script_dir))
+            except Exception as e_dl:
+                print(f" -> [WebUI Error] No se pudo lanzar download_model.py: {e_dl}")
 
+            last_console_time = 0
             while not is_dit_cached():
                 if status_file.exists():
                     try:
                         with open(status_file, "r", encoding="utf-8") as f:
                             sdata = json.load(f)
                         if sdata.get("is_complete"):
+                            print(" -> [WebUI] ¡Descarga de pesos DiT completada con exito!")
                             break
                         pct = sdata.get("percent", 0)
                         dl_mb = sdata.get("downloaded_mb", 0)
@@ -373,10 +378,18 @@ def _ui_generate_3d_impl(
                         eta = sdata.get("eta_seconds", 0)
                         eta_str = f"{int(eta//60)}m {int(eta%60):02d}s" if eta > 0 else "calculando..."
                         txt = f"[2/4] Descargando pesos DiT ({dl_mb:.0f}/{tot_mb:.0f} MB • {pct}% • {spd} MB/s • ETA: {eta_str})"
+                        now_t = time.time()
+                        if now_t - last_console_time >= 5.0:
+                            print(f" -> {txt}")
+                            last_console_time = now_t
                         yield step_yield(render_progress_html(txt, int(pct * 0.45 + 5)))
                     except Exception:
                         pass
                 else:
+                    now_t = time.time()
+                    if now_t - last_console_time >= 5.0:
+                        print(" -> [WebUI] Esperando sincronizacion de descarga de pesos...")
+                        last_console_time = now_t
                     yield step_yield(render_progress_html("[2/4] Iniciando descarga de pesos Hunyuan3D-2 (~4.9GB) a Disco D:...", 25))
                 
                 time.sleep(1.5)
