@@ -1,6 +1,7 @@
 @echo off 
 setlocal 
 chcp 65001 >nul 
+set "CUDA_VISIBLE_DEVICES=0" 
 set "HF_HOME=D:\AI_Models\huggingface" 
 set "HUGGINGFACE_HUB_CACHE=D:\AI_Models\huggingface\hub" 
 set "TORCH_HOME=D:\AI_Models\torch" 

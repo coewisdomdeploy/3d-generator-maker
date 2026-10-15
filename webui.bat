@@ -7,6 +7,7 @@ echo       3D AI STUDIO - INTERFAZ WEB GENERAL
 echo       Motor Predeterminado: Hunyuan3D-2 Turbo • Modo Arcilla / Sin Textura 
 echo       Almacenamiento de Modelos y Cache: 100%% en Disco D:\ 
 echo ============================================================================== 
+set "CUDA_VISIBLE_DEVICES=0" 
 set "HF_HOME=D:\AI_Models\huggingface" 
 set "HUGGINGFACE_HUB_CACHE=D:\AI_Models\huggingface\hub" 
 set "TORCH_HOME=D:\AI_Models\torch" 

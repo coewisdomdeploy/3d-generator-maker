@@ -7,6 +7,7 @@ echo       KABOOMI 3D STUDIO - EDICION KABOOMI PARTY (GODOT 4)
 echo       Motor Predeterminado: Stable Fast 3D (SF3D) • Con Textura PBR Completa 
 echo       Almacenamiento de Modelos y Cache: 100%% en Disco D:\ 
 echo ============================================================================== 
+set "CUDA_VISIBLE_DEVICES=0" 
 set "HF_HOME=D:\AI_Models\huggingface" 
 set "HUGGINGFACE_HUB_CACHE=D:\AI_Models\huggingface\hub" 
 set "TORCH_HOME=D:\AI_Models\torch" 

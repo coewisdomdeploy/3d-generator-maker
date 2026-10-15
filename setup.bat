@@ -331,7 +331,7 @@ if "!VENV_EXISTS!"=="0" (
 )
 
 set "VENV_PY=!VENV_DIR!\Scripts\python.exe"
-set "VENV_PIP=!VENV_DIR!\Scripts\python.exe -m pip"
+set "VENV_PIP=!VENV_DIR!\Scripts\pip.exe"
 
 if not exist "!VENV_PY!" (
     echo !RED![ERROR CRITICO]!RESET! No se encontro python.exe en !VENV_DIR!\Scripts.
@@ -363,7 +363,7 @@ if exist "!VENV_DIR!\Scripts\activate.bat" (
 )
 
 echo [INFO] Actualizando pip en el entorno virtual...
-"!VENV_PIP!" install --upgrade pip >nul 2>&1
+"!VENV_PY!" -m pip install --upgrade pip >nul 2>&1
 echo !GREEN![OK]!RESET! Gestor pip del entorno verificado y actualizado.
 echo !GREEN![OK]!RESET! Paso [2/8] superado exitosamente.
 echo.
@@ -447,7 +447,7 @@ if "!GPU_OPT!"=="2" (
     "!VENV_PY!" -c "import torch" >nul 2>&1
     if !errorlevel! equ 0 goto :pytorch_ok
     echo [INFO] Instalando PyTorch en modo CPU...
-    "!VENV_PIP!" install torch torchvision --cache-dir "%PIP_CACHE_DIR%"
+    "!VENV_PY!" -m pip install torch torchvision --cache-dir "%PIP_CACHE_DIR%"
     goto :pytorch_done
 )
 
@@ -455,7 +455,7 @@ if "!GPU_OPT!"=="2" (
 if !errorlevel! equ 0 goto :pytorch_ok
 
 echo [INFO] Instalando PyTorch con aceleracion CUDA 12.4 para !DETECTED_GPU_NAME!...
-"!VENV_PIP!" install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --cache-dir "%PIP_CACHE_DIR%"
+"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --cache-dir "%PIP_CACHE_DIR%"
 "!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
 if !errorlevel! equ 0 (
     echo !GREEN![OK]!RESET! PyTorch con aceleracion CUDA 12.4 instalado con exito.
@@ -463,7 +463,7 @@ if !errorlevel! equ 0 (
 )
 
 echo [INFO] Reintentando con indice alternativo CUDA 12.1...
-"!VENV_PIP!" install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --cache-dir "%PIP_CACHE_DIR%"
+"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --cache-dir "%PIP_CACHE_DIR%"
 "!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
 if !errorlevel! equ 0 (
     echo !GREEN![OK]!RESET! PyTorch con aceleracion CUDA 12.1 instalado con exito.
@@ -476,6 +476,9 @@ if !errorlevel! neq 0 (
     echo !RED![ERROR CRITICO EN DESCARGA DE PYTORCH]!RESET!
     echo No se pudo descargar PyTorch con CUDA en el entorno virtual.
     echo Revisa tu conexion a internet o posibles bloqueos de firewall hacia download.pytorch.org.
+    echo.
+    echo Presiona una tecla para continuar de todos modos o Ctrl+C para cancelar...
+    pause
 ) else (
     echo !YELLOW![AVISO]!RESET! PyTorch se instalo pero 'torch.cuda.is_available()' reporto Falso.
     where nvidia-smi.exe >nul 2>&1
@@ -504,7 +507,7 @@ echo [4/8] Verificando librerias 3D base y utilidades...
 if !errorlevel! equ 0 goto :base_deps_ok
 
 echo [INFO] Instalando dependencias base desde requirements.txt (usando entorno virtual)...
-"!VENV_PIP!" install -r requirements.txt --cache-dir "%PIP_CACHE_DIR%"
+"!VENV_PY!" -m pip install -r requirements.txt --cache-dir "%PIP_CACHE_DIR%"
 echo !GREEN![OK]!RESET! Dependencias base instaladas.
 goto :base_deps_done
 
@@ -580,9 +583,9 @@ if !errorlevel! equ 0 goto :hy3dgen_ok
 echo [INFO] hy3dgen no encontrado. Verificando Git para instalacion...
 where git.exe >nul 2>&1
 if !errorlevel! equ 0 (
-    "!VENV_PIP!" install git+https://github.com/Tencent-Hunyuan/Hunyuan3D-2.git --cache-dir "%PIP_CACHE_DIR%"
+    "!VENV_PY!" -m pip install git+https://github.com/Tencent-Hunyuan/Hunyuan3D-2.git --cache-dir "%PIP_CACHE_DIR%"
 ) else (
-    "!VENV_PIP!" install https://github.com/Tencent-Hunyuan/Hunyuan3D-2/archive/refs/heads/main.zip --cache-dir "%PIP_CACHE_DIR%"
+    "!VENV_PY!" -m pip install https://github.com/Tencent-Hunyuan/Hunyuan3D-2/archive/refs/heads/main.zip --cache-dir "%PIP_CACHE_DIR%"
 )
 goto :hy3dgen_weights_check
 
@@ -625,7 +628,7 @@ echo !GREEN![OK]!RESET! Repositorio oficial de Stable Fast 3D presente en "%REPO
 if !errorlevel! equ 0 goto :sf3d_deps_ok
 
 echo [INFO] Instalando dependencias especializadas de SF3D...
-"!VENV_PIP!" install jaxtyping open-clip-torch gpytoolbox pynanoinstantmeshes numba xatlas --cache-dir "%PIP_CACHE_DIR%"
+"!VENV_PY!" -m pip install jaxtyping open-clip-torch gpytoolbox pynanoinstantmeshes numba xatlas --cache-dir "%PIP_CACHE_DIR%"
 echo !GREEN![OK]!RESET! Dependencias especializadas de SF3D instaladas.
 goto :sf3d_token_check
 
@@ -693,7 +696,7 @@ echo [8/8] Generando y actualizando lanzadores ejecutables (.bat)...
 if exist "%~dp0.env" (
     findstr /i "CUDA_VISIBLE_DEVICES" "%~dp0.env" >nul 2>&1
     if !errorlevel! neq 0 (
-        echo CUDA_VISIBLE_DEVICES=%CUDA_VISIBLE_DEVICES%>> "%~dp0.env"
+        echo CUDA_VISIBLE_DEVICES=!CUDA_VISIBLE_DEVICES!>> "%~dp0.env"
     )
 )
 
