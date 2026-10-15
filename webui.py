@@ -162,9 +162,10 @@ else:
 
 
 PRESET_CONFIG_MAP = {
-    "Móvil Rápido (4,000 caras • Balanceado)": {"faces": 4000, "steps": 5, "octree": 256},
-    "Alta Calidad (8,000 caras • Detallado)": {"faces": 8000, "steps": 6, "octree": 320},
-    "Ultra Ligero (2,000 caras • Máximo Rendimiento)": {"faces": 2000, "steps": 4, "octree": 256}
+    "Máxima Calidad HD (Malla Completa • Máximo Detalle)": {"faces": 0, "steps": 5, "octree": 320},
+    "Alta Calidad (30,000 caras • Detallado)": {"faces": 30000, "steps": 5, "octree": 320},
+    "Balanceado (10,000 caras • Suave)": {"faces": 10000, "steps": 5, "octree": 256},
+    "Móvil Low-Poly (4,000 caras • Juegos)": {"faces": 4000, "steps": 4, "octree": 256}
 }
 
 PRESET_FACES_MAP = {k: v["faces"] for k, v in PRESET_CONFIG_MAP.items()}
@@ -466,9 +467,14 @@ def _ui_generate_3d_impl(
         yield step_yield(render_progress_html("[3/4] Depuración Geométrica: Eliminando losas e islas parásitas...", 86))
         cleaned_mesh = clean_mesh_floating_artifacts(raw_mesh)
 
-        yield step_yield(render_progress_html(f"[3/4] Optimización de Malla: Decimando a {target_faces:,} caras...", 88))
-        decimated_mesh = decimate_mesh_to_target_faces(cleaned_mesh, target_faces=target_faces)
-        decimated_mesh = clean_mesh_floating_artifacts(decimated_mesh)
+        if target_faces > 0:
+            yield step_yield(render_progress_html(f"[3/4] Optimización de Malla: Decimando a {target_faces:,} caras...", 88))
+            decimated_mesh = decimate_mesh_to_target_faces(cleaned_mesh, target_faces=target_faces)
+            decimated_mesh = clean_mesh_floating_artifacts(decimated_mesh)
+        else:
+            yield step_yield(render_progress_html(f"[3/4] Malla HD Original: Conservando {len(cleaned_mesh.faces):,} caras sin comprimir...", 88))
+            decimated_mesh = cleaned_mesh
+
         aligned_mesh = center_and_orient_mesh(
             decimated_mesh,
             align_floor=False,
@@ -1985,7 +1991,7 @@ with gr.Blocks(title=page_title) as demo:
                         
                         preset_radio = gr.Radio(
                             choices=list(PRESET_CONFIG_MAP.keys()),
-                            value="Móvil Rápido (4,000 caras • Balanceado)",
+                            value="Máxima Calidad HD (Malla Completa • Máximo Detalle)",
                             label="",
                             show_label=False,
                             elem_classes=["preset-radio-list"]
@@ -2015,9 +2021,9 @@ with gr.Blocks(title=page_title) as demo:
                         )
 
                         chk_texture = gr.Checkbox(
-                            value=True if MODE == "kambo" else False,
-                            label="Generar y Proyectar Textura de Color",
-                            info="Desmarcar para modo Arcilla / Geometría Pura (ideal para impresión 3D / amigos)"
+                            value=True,
+                            label="Generar y Proyectar Textura de Color PBR",
+                            info="Proyecta los colores y detalles fotorrealistas de tu imagen original sobre el modelo 3D"
                         )
 
                     btn_generate = gr.Button(

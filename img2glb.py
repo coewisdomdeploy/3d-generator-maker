@@ -662,7 +662,7 @@ class Hunyuan3DGenerator:
         self.low_vram_mode = pcfg.get("low_vram", True) if low_vram_mode is None else low_vram_mode
 
         print(f"[Hunyuan3D] Dispositivo: {self.device.upper()} | Tipo de dato: {self.dtype} | Perfil VRAM: {self.vram_profile_name}")
-        if self.device == "cuda":
+        if "cuda" in str(self.device):
             gpu_name = torch.cuda.get_device_name(0)
             vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
             print(f"[Hunyuan3D] GPU: {gpu_name} ({vram_gb:.1f} GB VRAM) -> Low VRAM: {'Activado (Optimizado 8GB)' if self.low_vram_mode else 'Desactivado (Residente en VRAM)'}")
@@ -674,7 +674,7 @@ class Hunyuan3DGenerator:
     def _clean_vram(self):
         """Libera VRAM y recolecta basura para evitar fragmentación o desbordamiento en memoria compartida."""
         gc.collect()
-        if self.device == "cuda":
+        if "cuda" in str(self.device):
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
 
@@ -709,8 +709,8 @@ class Hunyuan3DGenerator:
                     torch_dtype=self.dtype,
                     device=self.device
                 )
-                if self.device == "cuda":
-                    shape_pipe.to("cuda")
+                if "cuda" in str(self.device):
+                    shape_pipe.to(self.device)
                 if not self.low_vram_mode:
                     _GLOBAL_SHAPE_PIPELINE = shape_pipe
 
@@ -823,8 +823,8 @@ class Hunyuan3DGenerator:
                     str(Path(base_dir) / self.model_id)
                 )
 
-                if self.device == "cuda":
-                    paint_pipe.to("cuda")
+                if "cuda" in str(self.device):
+                    paint_pipe.to(self.device)
 
                 with torch.inference_mode():
                     textured_mesh = paint_pipe(mesh, image=image)
