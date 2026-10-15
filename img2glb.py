@@ -86,17 +86,17 @@ VRAM_PROFILES = {
         "low_vram": True,
         "low_vram_mode": True,
         "use_fp16": True,
-        "cpu_offload": True,
+        "cpu_offload": False,
         "default_octree": 256,
         "gc_after_step": True
     },
     "low_6gb": {
         "name": "6GB VRAM (Optimizado RTX 4050 Laptop / RTX 3050)",
-        "desc": "Perfil optimizado para 6GB: Activa CPU Offloading secuencial (DINOv2 -> DiT -> VAE), manteniendo el consumo bajo 5GB de VRAM.",
+        "desc": "Perfil nativo CUDA en fp16 con liberación inmediata de VRAM tras la inferencia para GPU de 6GB.",
         "low_vram": True,
         "low_vram_mode": True,
         "use_fp16": True,
-        "cpu_offload": True,
+        "cpu_offload": False,
         "default_octree": 256,
         "gc_after_step": True
     },
@@ -698,27 +698,15 @@ class Hunyuan3DGenerator:
                 print(" -> Reutilizando pipeline Hunyuan3D DiT ya cargado en VRAM.")
             else:
                 from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
-                pcfg = VRAM_PROFILES.get(self.vram_profile_key, {})
-                use_cpu_offload = (pcfg.get("cpu_offload", False) or self.vram_profile_key == "low_6gb") and self.device == "cuda"
-                load_device = "cpu" if use_cpu_offload else self.device
-
-                print(f" -> Cargando pesos DiT desde {self.model_id} [{self.shape_subfolder}] (Dispositivo inicial: {load_device})...")
+                print(f" -> Cargando pesos DiT desde {self.model_id} [{self.shape_subfolder}] a GPU NVIDIA ({self.device})...")
                 shape_pipe = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
                     self.model_id,
                     subfolder=self.shape_subfolder,
                     torch_dtype=self.dtype,
-                    device=load_device
+                    device=self.device
                 )
                 if self.device == "cuda":
-                    if use_cpu_offload:
-                        try:
-                            shape_pipe.enable_model_cpu_offload(device=self.device)
-                            print(" -> [VRAM 6GB] CPU Offloading secuencial activado: VRAM pico ~4.8GB (Optimizado RTX 4050).")
-                        except Exception as e_off:
-                            print(f" -> [Aviso CPU Offload] {e_off}. Asignando a cuda directo.")
-                            shape_pipe.to("cuda")
-                    else:
-                        shape_pipe.to("cuda")
+                    shape_pipe.to("cuda")
                 if not self.low_vram_mode:
                     _GLOBAL_SHAPE_PIPELINE = shape_pipe
 
