@@ -357,9 +357,9 @@ def preprocess_and_remove_background(
 
 def clean_mesh_floating_artifacts(
     mesh: trimesh.Trimesh,
-    min_face_ratio: float = 0.15,
-    min_volume_ratio: float = 0.05,
-    min_flatness: float = 0.08
+    min_face_ratio: float = 0.01,
+    min_volume_ratio: float = 0.002,
+    min_flatness: float = 0.04
 ) -> trimesh.Trimesh:
     """
     Elimina losas parásitas, láminas del suelo y motas flotantes en el espacio 3D.
@@ -424,7 +424,7 @@ def decimate_mesh_preserving_texture(
     al 100% las coordenadas UV, los atlas de textura PBR (albedo, normales) y el material original.
     """
     current_faces = len(mesh.faces)
-    if current_faces <= target_faces:
+    if target_faces is None or target_faces <= 0 or current_faces <= target_faces:
         return mesh
 
     print(f"\n[Paso C/D Textura] Simplificando malla PBR con textura: {current_faces:,} caras -> {target_faces:,} caras...")
@@ -478,13 +478,17 @@ def decimate_mesh_to_target_faces(
     Paso C: Simplifica la malla al número exacto de caras solicitado.
     Utiliza Decimación por Colapso de Bordes Cuádricos (QEM) para preservar
     rasgos, silueta y bordes nítidos ideales para Godot 4 en móviles.
-    Implementa un pipeline en cascada: PyMeshLab -> pyfqmr -> Trimesh nativo.
+    Si target_faces <= 0 o None, omite la decimación y conserva la malla HD completa al 100%.
     """
+    current_faces = len(mesh.faces)
+    if target_faces is None or target_faces <= 0:
+        print(f"\n[Paso C/D] Conservando Malla HD Original Completa ({current_faces:,} caras sin comprimir).")
+        return mesh
+
     has_texture = hasattr(mesh.visual, "material") and getattr(mesh.visual.material, "baseColorTexture", None) is not None
     if has_texture:
         return decimate_mesh_preserving_texture(mesh, target_faces=target_faces)
 
-    current_faces = len(mesh.faces)
     print(f"\n[Paso C/D] Simplificando malla: {current_faces:,} caras -> {target_faces:,} caras objetivo...")
     start_t = time.time()
 

@@ -175,10 +175,10 @@ else:
 
 
 PRESET_CONFIG_MAP = {
-    "Máxima Calidad HD (Malla Completa • Máximo Detalle)": {"faces": 0, "steps": 5, "octree": 320},
-    "Alta Calidad (30,000 caras • Detallado)": {"faces": 30000, "steps": 5, "octree": 320},
-    "Balanceado (10,000 caras • Suave)": {"faces": 10000, "steps": 5, "octree": 256},
-    "Móvil Low-Poly (4,000 caras • Juegos)": {"faces": 4000, "steps": 4, "octree": 256}
+    "Alta Calidad (50,000 caras • Curvas Suaves y Detalladas)": {"faces": 50000, "steps": 5, "octree": 256},
+    "Máxima Calidad HD (Malla Completa ~280k caras • Sin Comprimir)": {"faces": 0, "steps": 5, "octree": 256},
+    "Equilibrado (20,000 caras • Estándar 3D)": {"faces": 20000, "steps": 5, "octree": 256},
+    "Móvil Low-Poly (5,000 caras • Juegos Ligeros)": {"faces": 5000, "steps": 4, "octree": 256}
 }
 
 PRESET_FACES_MAP = {k: v["faces"] for k, v in PRESET_CONFIG_MAP.items()}
@@ -432,6 +432,7 @@ def _ui_generate_3d_impl(
 
         yield step_yield(render_progress_html(f"[2/4] Perfil VRAM: {profile_info['desc']}...", 25))
 
+        target_device = "cuda:0" if torch.cuda.is_available() else "cpu"
         try:
             generator = Hunyuan3DGenerator(
                 model_id="tencent/Hunyuan3D-2",
@@ -439,14 +440,15 @@ def _ui_generate_3d_impl(
                 paint_subfolder="hunyuan3d-paint-v2-0",
                 use_fp16=profile_info.get("use_fp16", True),
                 low_vram_mode=profile_info.get("low_vram_mode", profile_info.get("low_vram", True)),
-                vram_profile=active_profile_key
+                vram_profile=active_profile_key,
+                device=target_device
             )
         except Exception as e:
             yield step_yield(render_progress_html(f"Error al cargar Hunyuan3D-2: {e}", 0))
             return
 
         # ETAPA 3/4: Geometría 3D y Decimación Hunyuan3D
-        yield step_yield(render_progress_html("[3/4] Síntesis Geométrica: Iniciando inferencia en GPU...", 30))
+        yield step_yield(render_progress_html("[3/4] Síntesis Geométrica: Iniciando inferencia en GPU NVIDIA RTX...", 30))
 
         progress_q = queue.Queue()
         gen_result = {"mesh": None, "error": None}
@@ -456,6 +458,8 @@ def _ui_generate_3d_impl(
 
         def run_shape_worker():
             try:
+                if torch.cuda.is_available():
+                    torch.cuda.set_device(0)
                 m = generator.generate_shape(
                     clean_img,
                     steps=dit_steps,
@@ -2017,7 +2021,7 @@ with gr.Blocks(title=page_title) as demo:
                         
                         preset_radio = gr.Radio(
                             choices=list(PRESET_CONFIG_MAP.keys()),
-                            value="Máxima Calidad HD (Malla Completa • Máximo Detalle)",
+                            value="Alta Calidad (50,000 caras • Curvas Suaves y Detalladas)",
                             label="",
                             show_label=False,
                             elem_classes=["preset-radio-list"]

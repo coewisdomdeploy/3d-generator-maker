@@ -5,19 +5,21 @@ chcp 65001 >nul 2>&1
 cls
 
 echo ==============================================================================
-echo       3D AI STUDIO - INTERFAZ WEB GENERAL
-echo       Motor: Hunyuan3D-2 Turbo (NVIDIA GeForce RTX fp16)
-echo       Almacenamiento: 100%% en Disco D:\
+echo       3D AI STUDIO - MOTOR HUNYUAN3D-2 TURBO EN NVIDIA GEFORCE RTX
+echo       Almacenamiento y Modelos: 100%% en Disco D:\
 echo ==============================================================================
 echo.
 
 where nvidia-smi.exe >nul 2>&1
 if %errorlevel% equ 0 (
-    echo [DRIVER NVIDIA DETECTADO]:
+    echo [GPU DEDICADA DETECTADA]:
     nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
     echo.
 )
 
+:: Forzar exclusividad CUDA a la GPU NVIDIA (GPU 0)
+set CUDA_VISIBLE_DEVICES=0
+set NVIDIA_VISIBLE_DEVICES=all
 set HF_HOME=D:\AI_Models\huggingface
 set HUGGINGFACE_HUB_CACHE=D:\AI_Models\huggingface\hub
 set TORCH_HOME=D:\AI_Models\torch
@@ -30,9 +32,9 @@ set HY3DGEN_MODELS=D:\AI_Models
 set STUDIO_PROFILE=general
 
 set VENV_PY=
-if exist %~dp0.venv\Scripts\python.exe set VENV_PY=%~dp0.venv\Scripts\python.exe
-if not defined VENV_PY if exist D:\AI_Models\venv_3dgen\Scripts\python.exe set VENV_PY=D:\AI_Models\venv_3dgen\Scripts\python.exe
-if not defined VENV_PY if exist C:\AI_Models\venv_3dgen\Scripts\python.exe set VENV_PY=C:\AI_Models\venv_3dgen\Scripts\python.exe
+if exist "%~dp0.venv\Scripts\python.exe" set VENV_PY=%~dp0.venv\Scripts\python.exe
+if not defined VENV_PY if exist "D:\AI_Models\venv_3dgen\Scripts\python.exe" set VENV_PY=D:\AI_Models\venv_3dgen\Scripts\python.exe
+if not defined VENV_PY if exist "C:\AI_Models\venv_3dgen\Scripts\python.exe" set VENV_PY=C:\AI_Models\venv_3dgen\Scripts\python.exe
 
 if not defined VENV_PY (
     echo [ERROR] No se encontro el entorno virtual en .venv ni en D:\AI_Models\venv_3dgen.
@@ -41,7 +43,15 @@ if not defined VENV_PY (
 )
 
 :: Forzar a Windows a usar Alto Rendimiento (GPU NVIDIA Dedicada) para Python
-reg add HKEY_CURRENT_USER\Software\Microsoft\DirectX\UserGpuPreferences /v %VENV_PY% /t REG_SZ /d GpuPreference=2; /f >nul 2>&1
+reg add "HKEY_CURRENT_USER\Software\Microsoft\DirectX\UserGpuPreferences" /v "%VENV_PY%" /t REG_SZ /d "GpuPreference=2;" /f >nul 2>&1
+if exist "D:\AI_Models\venv_3dgen\Scripts\python.exe" (
+    reg add "HKEY_CURRENT_USER\Software\Microsoft\DirectX\UserGpuPreferences" /v "D:\AI_Models\venv_3dgen\Scripts\python.exe" /t REG_SZ /d "GpuPreference=2;" /f >nul 2>&1
+)
 
-%VENV_PY% webui.py --mode general
+echo [ASIGNACION DE HARDWARE]:
+echo   - GPU 0 (NVIDIA GeForce RTX): 100%% del calculo de Inteligencia Artificial
+echo   - GPU 1 (Intel Integrada): DESACTIVADA para procesos de IA
+echo.
+
+"%VENV_PY%" webui.py --mode general
 pause
