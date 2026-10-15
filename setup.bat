@@ -496,8 +496,16 @@ if "!GPU_OPT!"=="2" (
 "!VENV_PY!" -c "import torch; assert torch.cuda.is_available() and torch.version.cuda is not None" >nul 2>&1
 if !errorlevel! equ 0 goto :pytorch_ok
 
+rem Si PyTorch ya esta instalado pero sin CUDA, desinstalar version CPU para permitir reemplazo
+"!VENV_PY!" -c "import torch" >nul 2>&1
+if !errorlevel! equ 0 (
+    echo [INFO] Detectada instalacion previa de PyTorch sin soporte CUDA.
+    echo [INFO] Desinstalando version CPU previa para instalar la version oficial con soporte CUDA...
+    "!VENV_PY!" -m pip uninstall -y torch torchvision torchaudio >nul 2>&1
+)
+
 echo [INFO] Instalando PyTorch con aceleracion CUDA 12.4 para !DETECTED_GPU_NAME!...
-"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple --cache-dir "%PIP_CACHE_DIR%"
+"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple --trusted-host download.pytorch.org --trusted-host files.pythonhosted.org --trusted-host pypi.org --cache-dir "%PIP_CACHE_DIR%"
 "!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
 if !errorlevel! equ 0 (
     echo !GREEN![OK]!RESET! PyTorch con aceleracion CUDA 12.4 instalado con exito.
@@ -505,15 +513,23 @@ if !errorlevel! equ 0 (
 )
 
 echo [INFO] Reintentando con indice alternativo CUDA 12.1...
-"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple --cache-dir "%PIP_CACHE_DIR%"
+"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple --trusted-host download.pytorch.org --trusted-host files.pythonhosted.org --trusted-host pypi.org --cache-dir "%PIP_CACHE_DIR%"
 "!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
 if !errorlevel! equ 0 (
     echo !GREEN![OK]!RESET! PyTorch con aceleracion CUDA 12.1 instalado con exito.
     goto :pytorch_done
 )
 
+echo [INFO] Reintentando con indice alternativo CUDA 11.8...
+"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118 --extra-index-url https://pypi.org/simple --trusted-host download.pytorch.org --trusted-host files.pythonhosted.org --trusted-host pypi.org --cache-dir "%PIP_CACHE_DIR%"
+"!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
+if !errorlevel! equ 0 (
+    echo !GREEN![OK]!RESET! PyTorch con aceleracion CUDA 11.8 instalado con exito.
+    goto :pytorch_done
+)
+
 echo [INFO] Reintentando instalacion directa sin cache...
-"!VENV_PY!" -m pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/cu124 --no-cache-dir
+"!VENV_PY!" -m pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/cu124 --no-cache-dir --trusted-host download.pytorch.org
 "!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
 if !errorlevel! equ 0 (
     echo !GREEN![OK]!RESET! PyTorch instalado con exito.
@@ -522,23 +538,26 @@ if !errorlevel! equ 0 (
 
 :: Diagnostico detallado si la instalacion falla
 "!VENV_PY!" -c "import torch" >nul 2>&1
-if !errorlevel! neq 0 (
-    echo !RED![ERROR CRITICO EN DESCARGA DE PYTORCH]!RESET!
-    echo No se pudo descargar PyTorch con CUDA en el entorno virtual.
-    echo Revisa tu conexion a internet o posibles bloqueos de firewall hacia download.pytorch.org.
-    echo.
-    echo Presiona una tecla para continuar de todos modos o Ctrl+C para cancelar...
-    pause
-) else (
-    echo !YELLOW![AVISO]!RESET! PyTorch se instalo pero torch.cuda.is_available() reporto Falso.
-    where nvidia-smi.exe >nul 2>&1
-    if !errorlevel! neq 0 (
-        echo   - Causa: Falta el driver oficial de NVIDIA GeForce RTX.
-        echo     Instala los controladores mas recientes desde www.nvidia.com/drivers o GeForce Experience.
-    ) else (
-        echo   - Tarjeta NVIDIA detectada, pero los controladores requieren reinicio del equipo.
-    )
-)
+if !errorlevel! neq 0 goto :diag_torch_missing
+
+echo !YELLOW![AVISO]!RESET! PyTorch se encuentra instalado pero la aceleracion CUDA no esta activa.
+where nvidia-smi.exe >nul 2>&1
+if !errorlevel! neq 0 goto :diag_no_driver
+echo   - Tarjeta NVIDIA detectada, pero los controladores o el reinicio de Windows estan pendientes.
+goto :pytorch_done
+
+:diag_no_driver
+echo   - Causa: Falta el controlador oficial de NVIDIA GeForce RTX.
+echo     Instala el driver mas reciente desde www.nvidia.com/drivers o GeForce Experience.
+goto :pytorch_done
+
+:diag_torch_missing
+echo !RED![ERROR CRITICO EN DESCARGA DE PYTORCH]!RESET!
+echo No se pudo descargar PyTorch con CUDA en el entorno virtual.
+echo Revisa tu conexion a internet o posibles bloqueos de firewall hacia download.pytorch.org.
+echo.
+echo Presiona una tecla para continuar de todos modos o Ctrl+C para cancelar...
+pause
 goto :pytorch_done
 
 :pytorch_ok
