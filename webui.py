@@ -151,6 +151,7 @@ def get_initial_preview_model() -> Optional[str]:
     return None
 
 if torch.cuda.is_available():
+    torch.cuda.set_device(0)
     _gpu_name = torch.cuda.get_device_name(0).replace("NVIDIA GeForce ", "GeForce ").strip()
     _vram_gb = int(round(torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)))
     GPU_STATUS_TEXT = f"{_gpu_name} ({_vram_gb}GB VRAM) • ONLINE"

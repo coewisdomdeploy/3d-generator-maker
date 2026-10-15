@@ -637,14 +637,18 @@ class Hunyuan3DGenerator:
         use_fp16: bool = True,
         low_vram_mode: Optional[bool] = None,
         vram_profile: str = "auto",
-        device: str = "cuda" if torch.cuda.is_available() else "cpu"
+        device: Optional[str] = None
     ):
         self.model_id = model_id
         self.shape_subfolder = shape_subfolder
         self.paint_subfolder = paint_subfolder
         self.use_fp16 = use_fp16
-        self.device = device
-        self.dtype = torch.float16 if (use_fp16 and device == "cuda") else torch.float32
+        if torch.cuda.is_available() and device != "cpu":
+            torch.cuda.set_device(0)
+            self.device = "cuda:0"
+        else:
+            self.device = "cpu"
+        self.dtype = torch.float16 if (use_fp16 and "cuda" in self.device) else torch.float32
 
         # Resolver perfil de VRAM dinámicamente
         if vram_profile == "auto" or not vram_profile:
