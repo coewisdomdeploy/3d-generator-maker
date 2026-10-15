@@ -130,25 +130,26 @@ echo !GREEN![OK]!RESET! Espacio libre en unidad !TARGET_DRIVE!:\: !FREE_GB! GB -
 echo !GREEN![OK]!RESET! Directorio raiz de almacenamiento seleccionado: "!MODELS_ROOT!"
 echo.
 
-set "HF_HOME=%MODELS_ROOT%\huggingface"
-set "HUGGINGFACE_HUB_CACHE=%MODELS_ROOT%\huggingface\hub"
-set "TORCH_HOME=%MODELS_ROOT%\torch"
-set "U2NET_HOME=%MODELS_ROOT%\u2net"
-set "PIP_CACHE_DIR=%MODELS_ROOT%\pip_cache"
-set "TEMP=%MODELS_ROOT%\temp"
-set "TMP=%MODELS_ROOT%\temp"
-set "OUTPUT_DIR=%MODELS_ROOT%\output"
-set "REPOS_DIR=%MODELS_ROOT%\repos"
+set "HF_HOME=!MODELS_ROOT!\huggingface"
+set "HUGGINGFACE_HUB_CACHE=!MODELS_ROOT!\huggingface\hub"
+set "TORCH_HOME=!MODELS_ROOT!\torch"
+set "U2NET_HOME=!MODELS_ROOT!\u2net"
+set "PIP_CACHE_DIR=!MODELS_ROOT!\pip_cache"
+set "TEMP=!MODELS_ROOT!\temp"
+set "TMP=!MODELS_ROOT!\temp"
+set "TMPDIR=!MODELS_ROOT!\temp"
+set "OUTPUT_DIR=!MODELS_ROOT!\output"
+set "REPOS_DIR=!MODELS_ROOT!\repos"
 
 :: Verificar carpetas existentes o crearlas
 set "ALL_DIRS_EXIST=1"
-if not exist "%MODELS_ROOT%\huggingface" (set "ALL_DIRS_EXIST=0" & mkdir "%MODELS_ROOT%\huggingface" 2>nul)
-if not exist "%MODELS_ROOT%\torch" (set "ALL_DIRS_EXIST=0" & mkdir "%MODELS_ROOT%\torch" 2>nul)
-if not exist "%MODELS_ROOT%\u2net" (set "ALL_DIRS_EXIST=0" & mkdir "%MODELS_ROOT%\u2net" 2>nul)
-if not exist "%MODELS_ROOT%\pip_cache" (set "ALL_DIRS_EXIST=0" & mkdir "%MODELS_ROOT%\pip_cache" 2>nul)
-if not exist "%MODELS_ROOT%\temp" (set "ALL_DIRS_EXIST=0" & mkdir "%MODELS_ROOT%\temp" 2>nul)
-if not exist "%MODELS_ROOT%\output" (set "ALL_DIRS_EXIST=0" & mkdir "%MODELS_ROOT%\output" 2>nul)
-if not exist "%MODELS_ROOT%\repos" (set "ALL_DIRS_EXIST=0" & mkdir "%MODELS_ROOT%\repos" 2>nul)
+if not exist "!MODELS_ROOT!\huggingface" (set "ALL_DIRS_EXIST=0" & mkdir "!MODELS_ROOT!\huggingface" 2>nul)
+if not exist "!MODELS_ROOT!\torch" (set "ALL_DIRS_EXIST=0" & mkdir "!MODELS_ROOT!\torch" 2>nul)
+if not exist "!MODELS_ROOT!\u2net" (set "ALL_DIRS_EXIST=0" & mkdir "!MODELS_ROOT!\u2net" 2>nul)
+if not exist "!MODELS_ROOT!\pip_cache" (set "ALL_DIRS_EXIST=0" & mkdir "!MODELS_ROOT!\pip_cache" 2>nul)
+if not exist "!MODELS_ROOT!\temp" (set "ALL_DIRS_EXIST=0" & mkdir "!MODELS_ROOT!\temp" 2>nul)
+if not exist "!MODELS_ROOT!\output" (set "ALL_DIRS_EXIST=0" & mkdir "!MODELS_ROOT!\output" 2>nul)
+if not exist "!MODELS_ROOT!\repos" (set "ALL_DIRS_EXIST=0" & mkdir "!MODELS_ROOT!\repos" 2>nul)
 
 if "!ALL_DIRS_EXIST!"=="1" (
     echo !GREEN![OK]!RESET! Estructura de carpetas de almacenamiento y cache ya existente. Omitiendo creacion.
@@ -219,11 +220,11 @@ goto :find_direct_python
 
 :py_candidate_found
 set "PY_LAUNCHER=!PY_CANDIDATE!"
-!PY_LAUNCHER! -c "import sys; print(sys.executable)" > "%TEMP%\py_detected.txt" 2>nul
-if exist "%TEMP%\py_detected.txt" (
-    set /p "PY_CMD="<"%TEMP%\py_detected.txt"
-    del "%TEMP%\py_detected.txt" 2>nul
-)
+    !PY_LAUNCHER! -c "import sys; print(sys.executable)" > "!TEMP!\py_detected.txt" 2>nul
+    if exist "!TEMP!\py_detected.txt" (
+        set /p "PY_CMD="<"!TEMP!\py_detected.txt"
+        del "!TEMP!\py_detected.txt" 2>nul
+    )
 if defined PY_CMD (
     echo !GREEN![OK]!RESET! Lanzador '!PY_LAUNCHER!' validado y seleccionado en 64 bits: "!PY_CMD!"
     "!PY_CMD!" -c "import sys; print('     -> Version confirmada: Python ' + sys.version.split()[0] + ' 64-bit')"
@@ -334,10 +335,10 @@ echo.
 :: ==============================================================================
 echo [2/8] Configurando y validando entorno virtual (usando py / python 64-bit)...
 
-if /i "%MODELS_ROOT%"=="%~dp0AI_Models" (
+if /i "!MODELS_ROOT!"=="%~dp0AI_Models" (
     set "VENV_DIR=%~dp0.venv"
 ) else (
-    set "VENV_DIR=%MODELS_ROOT%\venv_3dgen"
+    set "VENV_DIR=!MODELS_ROOT!\venv_3dgen"
 )
 
 set "VENV_EXISTS=0"
@@ -489,7 +490,7 @@ if "!GPU_OPT!"=="2" (
     "!VENV_PY!" -c "import torch" >nul 2>&1
     if !errorlevel! equ 0 goto :pytorch_ok
     echo [INFO] Instalando PyTorch en modo CPU...
-    "!VENV_PY!" -m pip install torch torchvision --cache-dir "%PIP_CACHE_DIR%"
+    "!VENV_PY!" -m pip install torch torchvision --cache-dir "!PIP_CACHE_DIR!"
     goto :pytorch_done
 )
 
@@ -505,7 +506,7 @@ if !errorlevel! equ 0 (
 )
 
 echo [INFO] Instalando PyTorch con aceleracion CUDA 12.4 para !DETECTED_GPU_NAME!...
-"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple --trusted-host download.pytorch.org --trusted-host files.pythonhosted.org --trusted-host pypi.org --cache-dir "%PIP_CACHE_DIR%"
+"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --trusted-host download.pytorch.org --cache-dir "!PIP_CACHE_DIR!"
 "!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
 if !errorlevel! equ 0 (
     echo !GREEN![OK]!RESET! PyTorch con aceleracion CUDA 12.4 instalado con exito.
@@ -513,7 +514,7 @@ if !errorlevel! equ 0 (
 )
 
 echo [INFO] Reintentando con indice alternativo CUDA 12.1...
-"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple --trusted-host download.pytorch.org --trusted-host files.pythonhosted.org --trusted-host pypi.org --cache-dir "%PIP_CACHE_DIR%"
+"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --trusted-host download.pytorch.org --cache-dir "!PIP_CACHE_DIR!"
 "!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
 if !errorlevel! equ 0 (
     echo !GREEN![OK]!RESET! PyTorch con aceleracion CUDA 12.1 instalado con exito.
@@ -521,15 +522,15 @@ if !errorlevel! equ 0 (
 )
 
 echo [INFO] Reintentando con indice alternativo CUDA 11.8...
-"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118 --extra-index-url https://pypi.org/simple --trusted-host download.pytorch.org --trusted-host files.pythonhosted.org --trusted-host pypi.org --cache-dir "%PIP_CACHE_DIR%"
+"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118 --trusted-host download.pytorch.org --cache-dir "!PIP_CACHE_DIR!"
 "!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
 if !errorlevel! equ 0 (
     echo !GREEN![OK]!RESET! PyTorch con aceleracion CUDA 11.8 instalado con exito.
     goto :pytorch_done
 )
 
-echo [INFO] Reintentando instalacion directa sin cache...
-"!VENV_PY!" -m pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/cu124 --no-cache-dir --trusted-host download.pytorch.org
+echo [INFO] Reintentando instalacion con PyPI complementario...
+"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple --trusted-host download.pytorch.org --trusted-host files.pythonhosted.org --trusted-host pypi.org --cache-dir "!PIP_CACHE_DIR!"
 "!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
 if !errorlevel! equ 0 (
     echo !GREEN![OK]!RESET! PyTorch instalado con exito.
@@ -576,7 +577,7 @@ echo [4/8] Verificando librerias 3D base y utilidades...
 if !errorlevel! equ 0 goto :base_deps_ok
 
 echo [INFO] Instalando dependencias base desde requirements.txt (usando entorno virtual)...
-"!VENV_PY!" -m pip install -r requirements.txt --cache-dir "%PIP_CACHE_DIR%"
+"!VENV_PY!" -m pip install -r requirements.txt --cache-dir "!PIP_CACHE_DIR!"
 echo !GREEN![OK]!RESET! Dependencias base instaladas.
 goto :base_deps_done
 
@@ -652,9 +653,9 @@ if !errorlevel! equ 0 goto :hy3dgen_ok
 echo [INFO] hy3dgen no encontrado. Verificando Git para instalacion...
 where git.exe >nul 2>&1
 if !errorlevel! equ 0 (
-    "!VENV_PY!" -m pip install git+https://github.com/Tencent-Hunyuan/Hunyuan3D-2.git --cache-dir "%PIP_CACHE_DIR%"
+    "!VENV_PY!" -m pip install git+https://github.com/Tencent-Hunyuan/Hunyuan3D-2.git --cache-dir "!PIP_CACHE_DIR!"
 ) else (
-    "!VENV_PY!" -m pip install https://github.com/Tencent-Hunyuan/Hunyuan3D-2/archive/refs/heads/main.zip --cache-dir "%PIP_CACHE_DIR%"
+    "!VENV_PY!" -m pip install https://github.com/Tencent-Hunyuan/Hunyuan3D-2/archive/refs/heads/main.zip --cache-dir "!PIP_CACHE_DIR!"
 )
 goto :hy3dgen_weights_check
 
@@ -662,13 +663,13 @@ goto :hy3dgen_weights_check
 echo !GREEN![OK]!RESET! Modulo oficial hy3dgen ya instalado en el entorno.
 
 :hy3dgen_weights_check
-if exist "%MODELS_ROOT%\tencent\Hunyuan3D-2\hunyuan3d-dit-v2-0-turbo\model.fp16.safetensors" goto :hy_weights_local
-if exist "%HUGGINGFACE_HUB_CACHE%\models--tencent--Hunyuan3D-2" goto :hy_weights_cache
-echo [INFO] Los pesos DiT de Hunyuan3D-2 (~4.93 GB) se descargaran de forma automatica en el primer uso a Disco %TARGET_DRIVE%:\.
+if exist "!MODELS_ROOT!\tencent\Hunyuan3D-2\hunyuan3d-dit-v2-0-turbo\model.fp16.safetensors" goto :hy_weights_local
+if exist "!HUGGINGFACE_HUB_CACHE!\models--tencent--Hunyuan3D-2" goto :hy_weights_cache
+echo [INFO] Los pesos DiT de Hunyuan3D-2 (~4.93 GB) se descargaran de forma automatica en el primer uso a Disco !TARGET_DRIVE!:\.
 exit /b 0
 
 :hy_weights_local
-echo !GREEN![OK]!RESET! Pesos Hunyuan3D-2 Turbo detectados (~4.93 GB en %MODELS_ROOT%\tencent\Hunyuan3D-2). Omitiendo descarga.
+echo !GREEN![OK]!RESET! Pesos Hunyuan3D-2 Turbo detectados (~4.93 GB en !MODELS_ROOT!\tencent\Hunyuan3D-2). Omitiendo descarga.
 exit /b 0
 
 :hy_weights_cache
@@ -676,28 +677,28 @@ echo !GREEN![OK]!RESET! Pesos Hunyuan3D-2 Turbo detectados en cache HuggingFace.
 exit /b 0
 
 :check_and_install_sf3d
-if exist "%REPOS_DIR%\stable-fast-3d\run.py" goto :sf3d_repo_ok
-if exist "%REPOS_DIR%\stable-fast-3d\sf3d\system.py" goto :sf3d_repo_ok
+if exist "!REPOS_DIR!\stable-fast-3d\run.py" goto :sf3d_repo_ok
+if exist "!REPOS_DIR!\stable-fast-3d\sf3d\system.py" goto :sf3d_repo_ok
 
 echo [INFO] Clonando repositorio oficial de Stable Fast 3D...
 where git.exe >nul 2>&1
 if !errorlevel! equ 0 (
-    git clone https://github.com/Stability-AI/stable-fast-3d.git "%REPOS_DIR%\stable-fast-3d"
+    git clone https://github.com/Stability-AI/stable-fast-3d.git "!REPOS_DIR!\stable-fast-3d"
 ) else (
     echo [INFO] Descargando repositorio ZIP de Stable Fast 3D...
-    powershell -NoProfile -Command "Invoke-WebRequest -Uri 'https://github.com/Stability-AI/stable-fast-3d/archive/refs/heads/main.zip' -OutFile '%TEMP%\sf3d.zip'; Expand-Archive -Path '%TEMP%\sf3d.zip' -DestinationPath '%REPOS_DIR%'; Rename-Item '%REPOS_DIR%\stable-fast-3d-main' 'stable-fast-3d'; Remove-Item '%TEMP%\sf3d.zip'" 2>nul
+    powershell -NoProfile -Command "Invoke-WebRequest -Uri 'https://github.com/Stability-AI/stable-fast-3d/archive/refs/heads/main.zip' -OutFile '!TEMP!\sf3d.zip'; Expand-Archive -Path '!TEMP!\sf3d.zip' -DestinationPath '!REPOS_DIR!'; Rename-Item '!REPOS_DIR!\stable-fast-3d-main' 'stable-fast-3d'; Remove-Item '!TEMP!\sf3d.zip'" 2>nul
 )
 goto :sf3d_deps_check
 
 :sf3d_repo_ok
-echo !GREEN![OK]!RESET! Repositorio oficial de Stable Fast 3D presente en "%REPOS_DIR%\stable-fast-3d". Omitiendo clonacion.
+echo !GREEN![OK]!RESET! Repositorio oficial de Stable Fast 3D presente en "!REPOS_DIR!\stable-fast-3d". Omitiendo clonacion.
 
 :sf3d_deps_check
 "!VENV_PY!" -c "import jaxtyping, open_clip, gpytoolbox, pynanoinstantmeshes, numba, xatlas" >nul 2>&1
 if !errorlevel! equ 0 goto :sf3d_deps_ok
 
 echo [INFO] Instalando dependencias especializadas de SF3D...
-"!VENV_PY!" -m pip install jaxtyping open-clip-torch gpytoolbox pynanoinstantmeshes numba xatlas --cache-dir "%PIP_CACHE_DIR%"
+"!VENV_PY!" -m pip install jaxtyping open-clip-torch gpytoolbox pynanoinstantmeshes numba xatlas --cache-dir "!PIP_CACHE_DIR!"
 echo !GREEN![OK]!RESET! Dependencias especializadas de SF3D instaladas.
 goto :sf3d_token_check
 
@@ -785,22 +786,23 @@ echo chcp 65001 ^>nul >> "%~dp0webui.bat"
 echo echo ============================================================================== >> "%~dp0webui.bat"
 echo echo       3D AI STUDIO - INTERFAZ WEB GENERAL >> "%~dp0webui.bat"
 echo echo       Motor Predeterminado: Hunyuan3D-2 Turbo • Modo Arcilla / Sin Textura >> "%~dp0webui.bat"
-echo echo       Almacenamiento de Modelos y Cache: 100%%%% en Disco %TARGET_DRIVE%:\ >> "%~dp0webui.bat"
+echo echo       Almacenamiento de Modelos y Cache: 100%%%% en Disco !TARGET_DRIVE!:\ >> "%~dp0webui.bat"
 echo echo ============================================================================== >> "%~dp0webui.bat"
-echo set "CUDA_VISIBLE_DEVICES=%CUDA_VISIBLE_DEVICES%" >> "%~dp0webui.bat"
-echo set "HF_HOME=%HF_HOME%" >> "%~dp0webui.bat"
-echo set "HUGGINGFACE_HUB_CACHE=%HUGGINGFACE_HUB_CACHE%" >> "%~dp0webui.bat"
-echo set "TORCH_HOME=%TORCH_HOME%" >> "%~dp0webui.bat"
-echo set "U2NET_HOME=%U2NET_HOME%" >> "%~dp0webui.bat"
-echo set "PIP_CACHE_DIR=%PIP_CACHE_DIR%" >> "%~dp0webui.bat"
-echo set "TEMP=%TEMP%" >> "%~dp0webui.bat"
-echo set "TMP=%TMP%" >> "%~dp0webui.bat"
-echo set "HY3DGEN_MODELS=%MODELS_ROOT%" >> "%~dp0webui.bat"
+echo set "CUDA_VISIBLE_DEVICES=!CUDA_VISIBLE_DEVICES!" >> "%~dp0webui.bat"
+echo set "HF_HOME=!HF_HOME!" >> "%~dp0webui.bat"
+echo set "HUGGINGFACE_HUB_CACHE=!HUGGINGFACE_HUB_CACHE!" >> "%~dp0webui.bat"
+echo set "TORCH_HOME=!TORCH_HOME!" >> "%~dp0webui.bat"
+echo set "U2NET_HOME=!U2NET_HOME!" >> "%~dp0webui.bat"
+echo set "PIP_CACHE_DIR=!PIP_CACHE_DIR!" >> "%~dp0webui.bat"
+echo set "TEMP=!TEMP!" >> "%~dp0webui.bat"
+echo set "TMP=!TMP!" >> "%~dp0webui.bat"
+echo set "TMPDIR=!TEMP!" >> "%~dp0webui.bat"
+echo set "HY3DGEN_MODELS=!MODELS_ROOT!" >> "%~dp0webui.bat"
 echo set "STUDIO_PROFILE=general" >> "%~dp0webui.bat"
 echo if exist "%%~dp0.venv\Scripts\activate.bat" ( >> "%~dp0webui.bat"
 echo     call "%%~dp0.venv\Scripts\activate.bat" >> "%~dp0webui.bat"
-echo ) else if exist "%MODELS_ROOT%\venv_3dgen\Scripts\activate.bat" ( >> "%~dp0webui.bat"
-echo     call "%MODELS_ROOT%\venv_3dgen\Scripts\activate.bat" >> "%~dp0webui.bat"
+echo ) else if exist "!MODELS_ROOT!\venv_3dgen\Scripts\activate.bat" ( >> "%~dp0webui.bat"
+echo     call "!MODELS_ROOT!\venv_3dgen\Scripts\activate.bat" >> "%~dp0webui.bat"
 echo ) else ( >> "%~dp0webui.bat"
 echo     echo [ERROR] No se encontro el entorno virtual. Ejecuta setup.bat. >> "%~dp0webui.bat"
 echo     pause >> "%~dp0webui.bat"
@@ -817,22 +819,23 @@ echo chcp 65001 ^>nul >> "%~dp0webui-kambo.bat"
 echo echo ============================================================================== >> "%~dp0webui-kambo.bat"
 echo echo       KABOOMI 3D STUDIO - EDICION KABOOMI PARTY (GODOT 4) >> "%~dp0webui-kambo.bat"
 echo echo       Motor Predeterminado: Stable Fast 3D (SF3D) • Con Textura PBR Completa >> "%~dp0webui-kambo.bat"
-echo echo       Almacenamiento de Modelos y Cache: 100%%%% en Disco %TARGET_DRIVE%:\ >> "%~dp0webui-kambo.bat"
+echo echo       Almacenamiento de Modelos y Cache: 100%%%% en Disco !TARGET_DRIVE!:\ >> "%~dp0webui-kambo.bat"
 echo echo ============================================================================== >> "%~dp0webui-kambo.bat"
-echo set "CUDA_VISIBLE_DEVICES=%CUDA_VISIBLE_DEVICES%" >> "%~dp0webui-kambo.bat"
-echo set "HF_HOME=%HF_HOME%" >> "%~dp0webui-kambo.bat"
-echo set "HUGGINGFACE_HUB_CACHE=%HUGGINGFACE_HUB_CACHE%" >> "%~dp0webui-kambo.bat"
-echo set "TORCH_HOME=%TORCH_HOME%" >> "%~dp0webui-kambo.bat"
-echo set "U2NET_HOME=%U2NET_HOME%" >> "%~dp0webui-kambo.bat"
-echo set "PIP_CACHE_DIR=%PIP_CACHE_DIR%" >> "%~dp0webui-kambo.bat"
-echo set "TEMP=%TEMP%" >> "%~dp0webui-kambo.bat"
-echo set "TMP=%TMP%" >> "%~dp0webui-kambo.bat"
-echo set "HY3DGEN_MODELS=%MODELS_ROOT%" >> "%~dp0webui-kambo.bat"
+echo set "CUDA_VISIBLE_DEVICES=!CUDA_VISIBLE_DEVICES!" >> "%~dp0webui-kambo.bat"
+echo set "HF_HOME=!HF_HOME!" >> "%~dp0webui-kambo.bat"
+echo set "HUGGINGFACE_HUB_CACHE=!HUGGINGFACE_HUB_CACHE!" >> "%~dp0webui-kambo.bat"
+echo set "TORCH_HOME=!TORCH_HOME!" >> "%~dp0webui-kambo.bat"
+echo set "U2NET_HOME=!U2NET_HOME!" >> "%~dp0webui-kambo.bat"
+echo set "PIP_CACHE_DIR=!PIP_CACHE_DIR!" >> "%~dp0webui-kambo.bat"
+echo set "TEMP=!TEMP!" >> "%~dp0webui-kambo.bat"
+echo set "TMP=!TMP!" >> "%~dp0webui-kambo.bat"
+echo set "TMPDIR=!TEMP!" >> "%~dp0webui-kambo.bat"
+echo set "HY3DGEN_MODELS=!MODELS_ROOT!" >> "%~dp0webui-kambo.bat"
 echo set "STUDIO_PROFILE=kambo" >> "%~dp0webui-kambo.bat"
 echo if exist "%%~dp0.venv\Scripts\activate.bat" ( >> "%~dp0webui-kambo.bat"
 echo     call "%%~dp0.venv\Scripts\activate.bat" >> "%~dp0webui-kambo.bat"
-echo ) else if exist "%MODELS_ROOT%\venv_3dgen\Scripts\activate.bat" ( >> "%~dp0webui-kambo.bat"
-echo     call "%MODELS_ROOT%\venv_3dgen\Scripts\activate.bat" >> "%~dp0webui-kambo.bat"
+echo ) else if exist "!MODELS_ROOT!\venv_3dgen\Scripts\activate.bat" ( >> "%~dp0webui-kambo.bat"
+echo     call "!MODELS_ROOT!\venv_3dgen\Scripts\activate.bat" >> "%~dp0webui-kambo.bat"
 echo ) else ( >> "%~dp0webui-kambo.bat"
 echo     echo [ERROR] No se encontro el entorno virtual. Ejecuta setup.bat. >> "%~dp0webui-kambo.bat"
 echo     pause >> "%~dp0webui-kambo.bat"
@@ -859,26 +862,27 @@ echo call "%%~dp0webui-kambo.bat" >> "%~dp0run_webui_kambo.bat"
 echo @echo off > "%~dp0run_cli.bat"
 echo setlocal >> "%~dp0run_cli.bat"
 echo chcp 65001 ^>nul >> "%~dp0run_cli.bat"
-echo set "CUDA_VISIBLE_DEVICES=%CUDA_VISIBLE_DEVICES%" >> "%~dp0run_cli.bat"
-echo set "HF_HOME=%HF_HOME%" >> "%~dp0run_cli.bat"
-echo set "HUGGINGFACE_HUB_CACHE=%HUGGINGFACE_HUB_CACHE%" >> "%~dp0run_cli.bat"
-echo set "TORCH_HOME=%TORCH_HOME%" >> "%~dp0run_cli.bat"
-echo set "U2NET_HOME=%U2NET_HOME%" >> "%~dp0run_cli.bat"
-echo set "PIP_CACHE_DIR=%PIP_CACHE_DIR%" >> "%~dp0run_cli.bat"
-echo set "TEMP=%TEMP%" >> "%~dp0run_cli.bat"
-echo set "TMP=%TMP%" >> "%~dp0run_cli.bat"
-echo set "HY3DGEN_MODELS=%MODELS_ROOT%" >> "%~dp0run_cli.bat"
+echo set "CUDA_VISIBLE_DEVICES=!CUDA_VISIBLE_DEVICES!" >> "%~dp0run_cli.bat"
+echo set "HF_HOME=!HF_HOME!" >> "%~dp0run_cli.bat"
+echo set "HUGGINGFACE_HUB_CACHE=!HUGGINGFACE_HUB_CACHE!" >> "%~dp0run_cli.bat"
+echo set "TORCH_HOME=!TORCH_HOME!" >> "%~dp0run_cli.bat"
+echo set "U2NET_HOME=!U2NET_HOME!" >> "%~dp0run_cli.bat"
+echo set "PIP_CACHE_DIR=!PIP_CACHE_DIR!" >> "%~dp0run_cli.bat"
+echo set "TEMP=!TEMP!" >> "%~dp0run_cli.bat"
+echo set "TMP=!TMP!" >> "%~dp0run_cli.bat"
+echo set "TMPDIR=!TEMP!" >> "%~dp0run_cli.bat"
+echo set "HY3DGEN_MODELS=!MODELS_ROOT!" >> "%~dp0run_cli.bat"
 echo if exist "%%~dp0.venv\Scripts\activate.bat" ( >> "%~dp0run_cli.bat"
 echo     call "%%~dp0.venv\Scripts\activate.bat" >> "%~dp0run_cli.bat"
-echo ) else if exist "%MODELS_ROOT%\venv_3dgen\Scripts\activate.bat" ( >> "%~dp0run_cli.bat"
-echo     call "%MODELS_ROOT%\venv_3dgen\Scripts\activate.bat" >> "%~dp0run_cli.bat"
+echo ) else if exist "!MODELS_ROOT!\venv_3dgen\Scripts\activate.bat" ( >> "%~dp0run_cli.bat"
+echo     call "!MODELS_ROOT!\venv_3dgen\Scripts\activate.bat" >> "%~dp0run_cli.bat"
 echo ) else ( >> "%~dp0run_cli.bat"
 echo     echo [ERROR] No se encontro el entorno virtual. Ejecuta setup.bat. >> "%~dp0run_cli.bat"
 echo     exit /b 1 >> "%~dp0run_cli.bat"
 echo ) >> "%~dp0run_cli.bat"
 echo python img2glb.py %%* >> "%~dp0run_cli.bat"
 
-echo !GREEN![OK]!RESET! Todos los lanzadores actualizados y sincronizados con Disco %TARGET_DRIVE%:\ y GPU %CUDA_VISIBLE_DEVICES%.
+echo !GREEN![OK]!RESET! Todos los lanzadores actualizados y sincronizados con Disco !TARGET_DRIVE!:\ y GPU !CUDA_VISIBLE_DEVICES!.
 echo.
 
 :: ==============================================================================
@@ -887,7 +891,7 @@ echo.
 echo ==============================================================================
 echo  !GREEN!INSTALACION Y CONFIGURACION COMPLETADAS EXITOSAMENTE!RESET!
 echo ==============================================================================
-echo  Modelos y Cache:  %MODELS_ROOT% (100%%%% fuera de C:\)
+echo  Modelos y Cache:  !MODELS_ROOT! (100%%%% fuera de C:\)
 echo  Entorno Virtual:  !VENV_DIR!
 echo  Motor(es) Config: !ENGINE_CHOICE!
 echo.
