@@ -166,63 +166,60 @@ echo [1/8] Verificando interprete de Python (priorizando lanzador oficial 'py').
 set "PY_CMD="
 set "PY_LAUNCHER="
 
-:: 1. Comprobar si existe el lanzador oficial py.exe de Windows
 where py.exe >nul 2>&1
+if !errorlevel! neq 0 goto :skip_py_check
+echo [INFO] Lanzador de Windows 'py.exe' localizado. Verificando entornos 64-bit...
+py -3.11 -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
 if !errorlevel! equ 0 (
-    echo [INFO] Lanzador de Windows 'py.exe' localizado. Verificando entornos 64-bit...
-    
-    :: Priorizar py -3.11 en 64-bit
-    py -3.11 -c "import struct; exit(0 if struct.calcsize('P') == 8 else 1)" >nul 2>&1
-    if !errorlevel! equ 0 (
-        set "PY_LAUNCHER=py -3.11"
-        for /f "delims=" %%P in ('py -3.11 -c "import sys; print(sys.executable)"') do set "PY_CMD=%%P"
-        echo !GREEN![OK]!RESET! Lanzador '!PY_LAUNCHER!' validado en 64 bits: "!PY_CMD!"
-        goto :python_found
-    )
-    
-    :: Comprobar py -3.10 en 64-bit
-    py -3.10 -c "import struct; exit(0 if struct.calcsize('P') == 8 else 1)" >nul 2>&1
+    set "PY_LAUNCHER=py -3.11"
+    for /f "delims=" %%P in ('py -3.11 -c "import sys; print(sys.executable)"') do set "PY_CMD=%%P"
+)
+if not defined PY_CMD (
+    py -3.10 -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
     if !errorlevel! equ 0 (
         set "PY_LAUNCHER=py -3.10"
         for /f "delims=" %%P in ('py -3.10 -c "import sys; print(sys.executable)"') do set "PY_CMD=%%P"
-        echo !GREEN![OK]!RESET! Lanzador '!PY_LAUNCHER!' validado en 64 bits: "!PY_CMD!"
-        goto :python_found
     )
-    
-    :: Comprobar py -3 en 64-bit
-    py -3 -c "import struct; exit(0 if struct.calcsize('P') == 8 else 1)" >nul 2>&1
+)
+if not defined PY_CMD (
+    py -3 -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
     if !errorlevel! equ 0 (
         set "PY_LAUNCHER=py -3"
         for /f "delims=" %%P in ('py -3 -c "import sys; print(sys.executable)"') do set "PY_CMD=%%P"
-        echo !GREEN![OK]!RESET! Lanzador '!PY_LAUNCHER!' validado en 64 bits: "!PY_CMD!"
-        goto :python_found
     )
 )
+:skip_py_check
 
-:: 2. Comprobar si ya existe un entorno virtual previo valido de 64 bits
+if defined PY_CMD (
+    echo !GREEN![OK]!RESET! Lanzador '!PY_LAUNCHER!' validado en 64 bits: "!PY_CMD!"
+    goto :python_found
+)
+
+rem Comprobar si ya existe un entorno virtual previo valido de 64 bits
 if exist "%MODELS_ROOT%\venv_3dgen\Scripts\python.exe" (
-    "%MODELS_ROOT%\venv_3dgen\Scripts\python.exe" -c "import struct; exit(0 if struct.calcsize('P') == 8 else 1)" >nul 2>&1
-    if !errorlevel! equ 0 (
-        set "PY_CMD=%MODELS_ROOT%\venv_3dgen\Scripts\python.exe"
-        echo !GREEN![OK]!RESET! Detectado interprete de entorno virtual existente (64-bit): "!PY_CMD!"
-        goto :python_found
-    )
+    "%MODELS_ROOT%\venv_3dgen\Scripts\python.exe" -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+    if !errorlevel! equ 0 set "PY_CMD=%MODELS_ROOT%\venv_3dgen\Scripts\python.exe"
 )
-if exist "%~dp0.venv\Scripts\python.exe" (
-    "%~dp0.venv\Scripts\python.exe" -c "import struct; exit(0 if struct.calcsize('P') == 8 else 1)" >nul 2>&1
-    if !errorlevel! equ 0 (
-        set "PY_CMD=%~dp0.venv\Scripts\python.exe"
-        echo !GREEN![OK]!RESET! Detectado interprete de entorno virtual local (64-bit): "!PY_CMD!"
-        goto :python_found
-    )
+if defined PY_CMD (
+    echo !GREEN![OK]!RESET! Detectado interprete de entorno virtual existente 64 bits: "!PY_CMD!"
+    goto :python_found
 )
 
-:: 3. Si py no esta disponible, buscar ejecutables python.exe de 64 bits en el sistema
+if exist "%~dp0.venv\Scripts\python.exe" (
+    "%~dp0.venv\Scripts\python.exe" -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+    if !errorlevel! equ 0 set "PY_CMD=%~dp0.venv\Scripts\python.exe"
+)
+if defined PY_CMD (
+    echo !GREEN![OK]!RESET! Detectado interprete de entorno virtual local 64 bits: "!PY_CMD!"
+    goto :python_found
+)
+
+rem Si py no esta disponible, buscar ejecutables python.exe de 64 bits en el sistema
 for /f "delims=" %%I in ('where python.exe 2^>nul') do (
     if not defined PY_CMD (
         echo %%I | findstr /i "WindowsApps Inkscape" >nul
         if !errorlevel! neq 0 (
-            "%%I" -c "import struct; exit(0 if struct.calcsize('P') == 8 else 1)" >nul 2>&1
+            "%%I" -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
             if !errorlevel! equ 0 set "PY_CMD=%%I"
         )
     )
@@ -301,39 +298,38 @@ if /i "%MODELS_ROOT%"=="%~dp0AI_Models" (
     set "VENV_DIR=%MODELS_ROOT%\venv_3dgen"
 )
 
-:: Si ya existe un venv, comprobar rigurosamente que sea de 64 bits
+set "VENV_EXISTS=0"
 if exist "!VENV_DIR!\Scripts\python.exe" (
-    "!VENV_DIR!\Scripts\python.exe" -c "import struct; exit(0 if struct.calcsize('P') == 8 else 1)" >nul 2>&1
+    "!VENV_DIR!\Scripts\python.exe" -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
     if !errorlevel! equ 0 (
         echo !GREEN![OK]!RESET! Entorno virtual existente detectado y validado en 64 bits: "!VENV_DIR!"
-        goto :venv_ready
+        set "VENV_EXISTS=1"
     ) else (
-        echo !YELLOW![AVISO]!RESET! El entorno virtual previo en "!VENV_DIR!" es de 32 bits (incompatible).
-        echo [INFO] Recreando entorno virtual en 64 bits...
+        echo !YELLOW![AVISO]!RESET! El entorno virtual previo es incompatible o de 32 bits. Recreando en 64 bits...
         rmdir /s /q "!VENV_DIR!" 2>nul
     )
 )
 
-echo [INFO] Creando entorno virtual en "!VENV_DIR!"...
-if defined PY_LAUNCHER (
-    echo [INFO] Ejecutando: !PY_LAUNCHER! -m venv "!VENV_DIR!"
-    !PY_LAUNCHER! -m venv "!VENV_DIR!"
-) else (
-    echo [INFO] Ejecutando: "!PY_CMD!" -m venv "!VENV_DIR!"
-    "!PY_CMD!" -m venv "!VENV_DIR!"
-)
-
-if not exist "!VENV_DIR!\Scripts\python.exe" (
-    echo [INFO] Intentando crear entorno alternativo local en %~dp0.venv...
-    set "VENV_DIR=%~dp0.venv"
+if "!VENV_EXISTS!"=="0" (
+    echo [INFO] Creando nuevo entorno virtual en "!VENV_DIR!"...
     if defined PY_LAUNCHER (
+        echo [INFO] Ejecutando: !PY_LAUNCHER! -m venv "!VENV_DIR!"
         !PY_LAUNCHER! -m venv "!VENV_DIR!"
     ) else (
+        echo [INFO] Ejecutando: "!PY_CMD!" -m venv "!VENV_DIR!"
         "!PY_CMD!" -m venv "!VENV_DIR!"
+    )
+    if not exist "!VENV_DIR!\Scripts\python.exe" (
+        echo [INFO] Intentando crear entorno alternativo local en %~dp0.venv...
+        set "VENV_DIR=%~dp0.venv"
+        if defined PY_LAUNCHER (
+            !PY_LAUNCHER! -m venv "!VENV_DIR!"
+        ) else (
+            "!PY_CMD!" -m venv "!VENV_DIR!"
+        )
     )
 )
 
-:venv_ready
 set "VENV_PY=!VENV_DIR!\Scripts\python.exe"
 set "VENV_PIP=!VENV_DIR!\Scripts\python.exe -m pip"
 
@@ -343,13 +339,10 @@ if not exist "!VENV_PY!" (
     exit /b 1
 )
 
-:: VALIDACION RIGUROSA DEL PASO 2: Arquitectura y Version
 echo [INFO] Validando entorno virtual en paso 2...
-for /f "tokens=*" %%V in ('"!VENV_PY!" -c "import struct, sys; bits = struct.calcsize('P') * 8; print('Python ' + sys.version.split()[0] + ' (' + str(bits) + '-bit)')"') do (
-    echo !GREEN![OK]!RESET! Entorno Virtual Verificado: %%V
-)
+"!VENV_PY!" -c "import sys; bits = 64 if sys.maxsize > 2**32 else 32; print('     -> Interprete verificado: Python ' + sys.version.split()[0] + ' ' + str(bits) + '-bit')"
 
-"!VENV_PY!" -c "import struct; exit(0 if struct.calcsize('P') == 8 else 1)" >nul 2>&1
+"!VENV_PY!" -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
 if !errorlevel! neq 0 (
     echo !RED![ERROR FATAL EN PASO 2]!RESET!
     echo El entorno virtual sigue siendo de 32 bits.
@@ -359,17 +352,16 @@ if !errorlevel! neq 0 (
     exit /b 1
 )
 
-:: Enlace simbolico a .venv si se creo en otra ruta
+rem Enlace simbolico a .venv si se creo en otra ruta
 if /i "!VENV_DIR!" neq "%~dp0.venv" (
     if not exist "%~dp0.venv" mklink /J "%~dp0.venv" "!VENV_DIR!" >nul 2>&1
 )
 
-:: Activar el entorno para la sesion del script
+rem Activar el entorno para la sesion del script
 if exist "!VENV_DIR!\Scripts\activate.bat" (
     call "!VENV_DIR!\Scripts\activate.bat"
 )
 
-:: Asegurar pip actualizado
 echo [INFO] Actualizando pip en el entorno virtual...
 "!VENV_PIP!" install --upgrade pip >nul 2>&1
 echo !GREEN![OK]!RESET! Gestor pip del entorno verificado y actualizado.
@@ -431,12 +423,12 @@ if not "!GPU_OPT!"=="2" set "GPU_OPT=1"
 if "!GPU_OPT!"=="1" (
     set "CUDA_VISIBLE_DEVICES=0"
     set "STUDIO_DEVICE=cuda:0"
-    echo !GREEN![OK]!RESET! Asignada GPU NVIDIA: !DETECTED_GPU_NAME! (CUDA:0).
+    echo !GREEN![OK]!RESET! Asignada GPU NVIDIA: !DETECTED_GPU_NAME! [CUDA:0]
     
-    :: Forzar preferencia de Alto Rendimiento en el Registro de Windows (DirectX)
+    rem Forzar preferencia de Alto Rendimiento en el Registro de Windows
     reg add "HKCU\Software\Microsoft\DirectX\UserGpuPreferences" /v "!VENV_PY!" /t REG_SZ /d "GpuPreference=2;" /f >nul 2>&1
     if !errorlevel! equ 0 (
-        echo !GREEN![OK]!RESET! Configurado Windows: Asignado 'Alto Rendimiento (GPU Dedicada)' para "!VENV_PY!".
+        echo !GREEN![OK]!RESET! Configurado Windows: Asignado Alto Rendimiento para "!VENV_PY!"
     )
 ) else (
     set "CUDA_VISIBLE_DEVICES="
@@ -462,7 +454,7 @@ if "!GPU_OPT!"=="2" (
 "!VENV_PY!" -c "import torch; assert torch.cuda.is_available() and torch.version.cuda is not None" >nul 2>&1
 if !errorlevel! equ 0 goto :pytorch_ok
 
-echo [INFO] Instalando PyTorch con aceleracion CUDA 12.4 (Descarga optimizada para !DETECTED_GPU_NAME!)...
+echo [INFO] Instalando PyTorch con aceleracion CUDA 12.4 para !DETECTED_GPU_NAME!...
 "!VENV_PIP!" install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --cache-dir "%PIP_CACHE_DIR%"
 "!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
 if !errorlevel! equ 0 (
