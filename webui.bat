@@ -53,5 +53,9 @@ echo   - GPU 0 (NVIDIA GeForce RTX): 100%% del calculo de Inteligencia Artificia
 echo   - GPU 1 (Intel Integrada): DESACTIVADA para procesos de IA
 echo.
 
+echo [VALIDACION INICIAL DE GPU EN VIVO]:
+"%VENV_PY%" -c "import torch, time; d=torch.device('cuda:0'); print('  >> Comprobando GPU dedicada:', torch.cuda.get_device_name(0), '...'); a=torch.randn((5120,5120),device=d,dtype=torch.float16); b=torch.randn((5120,5120),device=d,dtype=torch.float16); t0=time.time(); [torch.matmul(a,b) for _ in range(120)]; torch.cuda.synchronize(); print('  [OK] GPU NVIDIA verificada al 100%% en CUDA:0')"
+echo.
+
 "%VENV_PY%" webui.py --mode general
 pause

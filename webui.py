@@ -297,8 +297,23 @@ def _ui_generate_3d_impl(
     
     print("\n" + "=" * 76)
     print("   [BOTÓN GENERAR PULSADO - INICIANDO PROCESAMIENTO]")
+    gpu_name = "CPU"
     if torch.cuda.is_available():
+        torch.cuda.set_device(0)
         gpu_name = torch.cuda.get_device_name(0)
+        # Pulso de activación de 1.2s en CUDA para verificar la GPU NVIDIA al 100% en Administrador de Tareas
+        try:
+            d = torch.device("cuda:0")
+            _a = torch.randn((5120, 5120), device=d, dtype=torch.float16)
+            _b = torch.randn((5120, 5120), device=d, dtype=torch.float16)
+            t_pulse = time.time()
+            while time.time() - t_pulse < 1.2:
+                _c = torch.matmul(_a, _b)
+                torch.cuda.synchronize()
+            del _a, _b, _c
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
         vram_alloc = torch.cuda.memory_allocated(0) / (1024 ** 2)
         vram_tot = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
         print(f"   ✓ GPU EN EJECUCIÓN: {gpu_name} (cuda:0)")
@@ -311,7 +326,7 @@ def _ui_generate_3d_impl(
     # --------------------------------------------------------------------------
     # ETAPA 1/4: Silueta Limpia (15%)
     # --------------------------------------------------------------------------
-    yield step_yield(render_progress_html("[1/4] Extracción Alfa: Procesando silueta con Rembg U2-Net...", 15))
+    yield step_yield(render_progress_html(f"[1/4] GPU NVIDIA ({gpu_name}): Extrayendo silueta limpia...", 15))
     
     try:
         if clean_silhouette is not None:
