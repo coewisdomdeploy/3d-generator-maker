@@ -70,6 +70,18 @@ import torch
 import trimesh
 import pygltflib
 
+# Desactivar OpenCL en OpenCV para evitar que utilice la GPU integrada Intel
+try:
+    import cv2
+    cv2.ocl.setUseOpenCL(False)
+except Exception:
+    pass
+
+if torch.cuda.is_available():
+    try:
+        torch.cuda.set_device(0)
+    except Exception:
+        pass
 
 DEFAULT_OUTPUT_DIR = Path("D:/AI_Models/output") if Path("D:/").exists() else Path("./outputs")
 DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

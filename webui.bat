@@ -31,5 +31,8 @@ if not defined VENV_PY (
     exit /b 1
 )
 
+:: Forzar a Windows a usar Alto Rendimiento (GPU NVIDIA Dedicada) para Python
+reg add HKEY_CURRENT_USER\Software\Microsoft\DirectX\UserGpuPreferences /v %VENV_PY% /t REG_SZ /d GpuPreference=2; /f >nul 2>&1
+
 %VENV_PY% webui.py --mode general
 pause

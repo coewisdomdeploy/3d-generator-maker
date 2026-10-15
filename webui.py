@@ -54,6 +54,12 @@ import rembg
 import torch
 import trimesh
 
+try:
+    import cv2
+    cv2.ocl.setUseOpenCL(False)
+except Exception:
+    pass
+
 
 from img2glb import (
     preprocess_and_remove_background,
