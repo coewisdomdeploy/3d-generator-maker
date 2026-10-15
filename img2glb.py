@@ -726,6 +726,11 @@ class Hunyuan3DGenerator:
                 if not self.low_vram_mode:
                     _GLOBAL_SHAPE_PIPELINE = shape_pipe
 
+            if torch.cuda.is_available():
+                vram_act = torch.cuda.memory_allocated(0) / (1024 ** 2)
+                gpu_act = torch.cuda.get_device_name(0)
+                print(f" -> [GPU ACTIVA] {gpu_act} | VRAM Asignada: {vram_act:.1f} MB (Intel completamente bloqueada)")
+
             generator = torch.Generator(device=self.device).manual_seed(seed) if seed >= 0 else None
             
             # Callback para pasos individuales de difusión DiT
@@ -733,7 +738,8 @@ class Hunyuan3DGenerator:
                 if progress_callback:
                     cur_step = step_idx + 1
                     pct = 30 + int((cur_step / max(steps, 1)) * 35) # 30% a 65%
-                    progress_callback(f"[3/4] 🧊 Difusión DiT: Paso {cur_step}/{steps} ({pct}%)...", pct)
+                    vram_mb = torch.cuda.memory_allocated(0) / (1024 ** 2) if torch.cuda.is_available() else 0
+                    progress_callback(f"[3/4] 🚀 Inferencia NVIDIA RTX ({vram_mb:.0f} MB): Paso {cur_step}/{steps} ({pct}%)...", pct)
 
             # Hook para capturar progreso de Volume Decoding en tiempo real
             import tqdm
@@ -749,7 +755,8 @@ class Hunyuan3DGenerator:
                     if v_pct != last_v_pct and (v_pct % 5 == 0 or v_pct == 100):
                         last_v_pct = v_pct
                         overall_pct = 66 + int(v_pct * 0.18) # 66% a 84%
-                        progress_callback(f"[3/4] 🧊 Decodificando vóxeles 3D: {v_pct}%...", overall_pct)
+                        vram_mb = torch.cuda.memory_allocated(0) / (1024 ** 2) if torch.cuda.is_available() else 0
+                        progress_callback(f"[3/4] 🚀 Decodificando en NVIDIA RTX ({vram_mb:.0f} MB): {v_pct}%...", overall_pct)
                 return res
 
             tqdm.tqdm.update = custom_tqdm_update

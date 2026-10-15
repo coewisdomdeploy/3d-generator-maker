@@ -2,12 +2,21 @@
 setlocal
 cd /d %~dp0
 chcp 65001 >nul 2>&1
+cls
 
 echo ==============================================================================
 echo       3D AI STUDIO - INTERFAZ WEB GENERAL
 echo       Motor: Hunyuan3D-2 Turbo (NVIDIA GeForce RTX fp16)
 echo       Almacenamiento: 100%% en Disco D:\
 echo ==============================================================================
+echo.
+
+where nvidia-smi.exe >nul 2>&1
+if %errorlevel% equ 0 (
+    echo [DRIVER NVIDIA DETECTADO]:
+    nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+    echo.
+)
 
 set HF_HOME=D:\AI_Models\huggingface
 set HUGGINGFACE_HUB_CACHE=D:\AI_Models\huggingface\hub

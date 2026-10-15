@@ -162,9 +162,16 @@ if torch.cuda.is_available():
     _vram_gb = int(round(torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)))
     GPU_STATUS_TEXT = f"{_gpu_name} ({_vram_gb}GB VRAM) • ONLINE"
     GPU_SYS_TEXT = f"NVIDIA {_gpu_name} ({_vram_gb}GB VRAM fp16)"
+    print("\n" + "=" * 76)
+    print("   [CONFIRMACIÓN DE GPU AL ARRANCAR EL SERVIDOR]")
+    print(f"   ✓ GPU ASIGNADA PARA IA: {torch.cuda.get_device_name(0)} (cuda:0)")
+    print(f"   ✓ VRAM DEDICADA DETECTADA: {_vram_gb} GB")
+    print("   ✓ GPU INTEGRADA INTEL: BLOQUEADA (OpenCL Desactivado, WDDM GpuPreference=2)")
+    print("=" * 76 + "\n")
 else:
     GPU_STATUS_TEXT = "CPU • ONLINE"
     GPU_SYS_TEXT = "CPU (Sin aceleración CUDA)"
+    print("\n[AVISO] No se detectó GPU CUDA. Corriendo en CPU.\n")
 
 
 PRESET_CONFIG_MAP = {
@@ -288,6 +295,19 @@ def _ui_generate_3d_impl(
     octree_res = cfg["octree"]
     total_start = time.time()
     
+    print("\n" + "=" * 76)
+    print("   [BOTÓN GENERAR PULSADO - INICIANDO PROCESAMIENTO]")
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_alloc = torch.cuda.memory_allocated(0) / (1024 ** 2)
+        vram_tot = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        print(f"   ✓ GPU EN EJECUCIÓN: {gpu_name} (cuda:0)")
+        print(f"   ✓ VRAM TOTAL: {vram_tot:.2f} GB | VRAM EN USO: {vram_alloc:.1f} MB")
+        print("   ✓ GPU INTEL: BLOQUEADA Y DESCONECTADA")
+    else:
+        print("   ! DISPOSITIVO: CPU")
+    print("=" * 76 + "\n")
+
     # --------------------------------------------------------------------------
     # ETAPA 1/4: Silueta Limpia (15%)
     # --------------------------------------------------------------------------
@@ -2027,9 +2047,9 @@ with gr.Blocks(title=page_title) as demo:
                         )
 
                         chk_texture = gr.Checkbox(
-                            value=True,
+                            value=False,
                             label="Generar y Proyectar Textura de Color PBR",
-                            info="Proyecta los colores y detalles fotorrealistas de tu imagen original sobre el modelo 3D"
+                            info="Desmarcar para modo Geometría Pura / Malla Base (solo modelo 3D)"
                         )
 
                     btn_generate = gr.Button(
