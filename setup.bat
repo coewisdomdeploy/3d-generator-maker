@@ -166,70 +166,112 @@ echo [1/8] Verificando interprete de Python (priorizando lanzador oficial 'py').
 set "PY_CMD="
 set "PY_LAUNCHER="
 
+rem Asegurar que las rutas oficiales del lanzador py esten en PATH
+if exist "%SystemRoot%\py.exe" set "PATH=%SystemRoot%;!PATH!"
+if exist "%LocalAppData%\Programs\Python\Launcher\py.exe" set "PATH=%LocalAppData%\Programs\Python\Launcher;!PATH!"
+
 where py.exe >nul 2>&1
-if !errorlevel! neq 0 goto :skip_py_check
-echo [INFO] Lanzador de Windows 'py.exe' localizado. Verificando entornos 64-bit...
-py -3.11 -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
-if !errorlevel! equ 0 (
-    set "PY_LAUNCHER=py -3.11"
-    for /f "delims=" %%P in ('py -3.11 -c "import sys; print(sys.executable)"') do set "PY_CMD=%%P"
+if !errorlevel! neq 0 (
+    echo [INFO] Lanzador 'py.exe' no encontrado en el sistema. Buscando python.exe directo...
+    goto :find_direct_python
 )
+
+echo [INFO] Lanzador de Windows 'py.exe' localizado. Validando entornos de 64 bits...
+
+set "PY_CANDIDATE=py -3.11-64"
+!PY_CANDIDATE! -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+if !errorlevel! equ 0 goto :py_candidate_found
+
+set "PY_CANDIDATE=py -3.11"
+!PY_CANDIDATE! -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+if !errorlevel! equ 0 goto :py_candidate_found
+
+set "PY_CANDIDATE=py -3.10-64"
+!PY_CANDIDATE! -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+if !errorlevel! equ 0 goto :py_candidate_found
+
+set "PY_CANDIDATE=py -3.10"
+!PY_CANDIDATE! -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+if !errorlevel! equ 0 goto :py_candidate_found
+
+set "PY_CANDIDATE=py -3.12-64"
+!PY_CANDIDATE! -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+if !errorlevel! equ 0 goto :py_candidate_found
+
+set "PY_CANDIDATE=py -3.12"
+!PY_CANDIDATE! -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+if !errorlevel! equ 0 goto :py_candidate_found
+
+set "PY_CANDIDATE=py -3-64"
+!PY_CANDIDATE! -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+if !errorlevel! equ 0 goto :py_candidate_found
+
+set "PY_CANDIDATE=py -3"
+!PY_CANDIDATE! -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+if !errorlevel! equ 0 goto :py_candidate_found
+
+set "PY_CANDIDATE=py"
+!PY_CANDIDATE! -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+if !errorlevel! equ 0 goto :py_candidate_found
+
+echo !YELLOW![AVISO]!RESET! 'py.exe' esta instalado pero no detecto versiones de 64 bits. Buscando python.exe directo...
+goto :find_direct_python
+
+:py_candidate_found
+set "PY_LAUNCHER=!PY_CANDIDATE!"
+!PY_LAUNCHER! -c "import sys; print(sys.executable)" > "%TEMP%\py_detected.txt" 2>nul
+if exist "%TEMP%\py_detected.txt" (
+    set /p "PY_CMD="<"%TEMP%\py_detected.txt"
+    del "%TEMP%\py_detected.txt" 2>nul
+)
+if defined PY_CMD (
+    echo !GREEN![OK]!RESET! Lanzador '!PY_LAUNCHER!' validado y seleccionado en 64 bits: "!PY_CMD!"
+    "!PY_CMD!" -c "import sys; print('     -> Version confirmada: Python ' + sys.version.split()[0] + ' 64-bit')"
+    goto :python_found
+)
+
+:find_direct_python
+rem Buscar ejecutables python.exe de 64 bits en rutas estandar del sistema
+if exist "%LocalAppData%\Programs\Python\Python311\python.exe" (
+    "%LocalAppData%\Programs\Python\Python311\python.exe" -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+    if !errorlevel! equ 0 set "PY_CMD=%LocalAppData%\Programs\Python\Python311\python.exe"
+)
+if not defined PY_CMD if exist "%ProgramFiles%\Python311\python.exe" (
+    "%ProgramFiles%\Python311\python.exe" -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+    if !errorlevel! equ 0 set "PY_CMD=%ProgramFiles%\Python311\python.exe"
+)
+if not defined PY_CMD if exist "%LocalAppData%\Programs\Python\Python310\python.exe" (
+    "%LocalAppData%\Programs\Python\Python310\python.exe" -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+    if !errorlevel! equ 0 set "PY_CMD=%LocalAppData%\Programs\Python\Python310\python.exe"
+)
+if not defined PY_CMD if exist "%ProgramFiles%\Python310\python.exe" (
+    "%ProgramFiles%\Python310\python.exe" -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+    if !errorlevel! equ 0 set "PY_CMD=%ProgramFiles%\Python310\python.exe"
+)
+if not defined PY_CMD if exist "%LocalAppData%\Programs\Python\Python312\python.exe" (
+    "%LocalAppData%\Programs\Python\Python312\python.exe" -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+    if !errorlevel! equ 0 set "PY_CMD=%LocalAppData%\Programs\Python\Python312\python.exe"
+)
+if not defined PY_CMD if exist "D:\Programas\Python311\python.exe" (
+    "D:\Programas\Python311\python.exe" -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+    if !errorlevel! equ 0 set "PY_CMD=D:\Programas\Python311\python.exe"
+)
+if not defined PY_CMD if exist "C:\Python311\python.exe" (
+    "C:\Python311\python.exe" -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+    if !errorlevel! equ 0 set "PY_CMD=C:\Python311\python.exe"
+)
+
 if not defined PY_CMD (
-    py -3.10 -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
-    if !errorlevel! equ 0 (
-        set "PY_LAUNCHER=py -3.10"
-        for /f "delims=" %%P in ('py -3.10 -c "import sys; print(sys.executable)"') do set "PY_CMD=%%P"
-    )
-)
-if not defined PY_CMD (
-    py -3 -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
-    if !errorlevel! equ 0 (
-        set "PY_LAUNCHER=py -3"
-        for /f "delims=" %%P in ('py -3 -c "import sys; print(sys.executable)"') do set "PY_CMD=%%P"
-    )
-)
-:skip_py_check
-
-if defined PY_CMD (
-    echo !GREEN![OK]!RESET! Lanzador '!PY_LAUNCHER!' validado en 64 bits: "!PY_CMD!"
-    goto :python_found
-)
-
-rem Comprobar si ya existe un entorno virtual previo valido de 64 bits
-if exist "%MODELS_ROOT%\venv_3dgen\Scripts\python.exe" (
-    "%MODELS_ROOT%\venv_3dgen\Scripts\python.exe" -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
-    if !errorlevel! equ 0 set "PY_CMD=%MODELS_ROOT%\venv_3dgen\Scripts\python.exe"
-)
-if defined PY_CMD (
-    echo !GREEN![OK]!RESET! Detectado interprete de entorno virtual existente 64 bits: "!PY_CMD!"
-    goto :python_found
-)
-
-if exist "%~dp0.venv\Scripts\python.exe" (
-    "%~dp0.venv\Scripts\python.exe" -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
-    if !errorlevel! equ 0 set "PY_CMD=%~dp0.venv\Scripts\python.exe"
-)
-if defined PY_CMD (
-    echo !GREEN![OK]!RESET! Detectado interprete de entorno virtual local 64 bits: "!PY_CMD!"
-    goto :python_found
-)
-
-rem Si py no esta disponible, buscar ejecutables python.exe de 64 bits en el sistema
-for /f "delims=" %%I in ('where python.exe 2^>nul') do (
-    if not defined PY_CMD (
-        echo %%I | findstr /i "WindowsApps Inkscape" >nul
-        if !errorlevel! neq 0 (
-            "%%I" -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
-            if !errorlevel! equ 0 set "PY_CMD=%%I"
+    for /f "delims=" %%I in ('where python.exe 2^>nul') do (
+        if not defined PY_CMD (
+            echo %%I | findstr /i "WindowsApps Inkscape" >nul
+            if !errorlevel! neq 0 (
+                "%%I" -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+                if !errorlevel! equ 0 set "PY_CMD=%%I"
+            )
         )
     )
 )
-
-if not defined PY_CMD if exist "%LocalAppData%\Programs\Python\Python311\python.exe" set "PY_CMD=%LocalAppData%\Programs\Python\Python311\python.exe"
-if not defined PY_CMD if exist "%LocalAppData%\Programs\Python\Python310\python.exe" set "PY_CMD=%LocalAppData%\Programs\Python\Python310\python.exe"
-if not defined PY_CMD if exist "%ProgramFiles%\Python311\python.exe" set "PY_CMD=%ProgramFiles%\Python311\python.exe"
-if not defined PY_CMD if exist "%ProgramFiles%\Python310\python.exe" set "PY_CMD=%ProgramFiles%\Python310\python.exe"
-if not defined PY_CMD if exist "D:\Programas\Python311\python.exe" set "PY_CMD=D:\Programas\Python311\python.exe"
 
 if defined PY_CMD (
     echo !GREEN![OK]!RESET! Interprete Python de 64 bits localizado con exito: "!PY_CMD!"
@@ -392,15 +434,15 @@ if !errorlevel! neq 0 (
 )
 
 where nvidia-smi.exe >nul 2>&1
-if !errorlevel! equ 0 (
-    for /f "tokens=1,2,3 delims=," %%A in ('nvidia-smi --query-gpu^=index^,name^,memory.total --format^=csv^,noheader^,nounits 2^>nul') do (
-        set "HAS_NVIDIA=1"
-        set "DETECTED_GPU_NAME=%%B"
-        set "DETECTED_VRAM=%%C"
-        echo Acelerador NVIDIA CUDA verificado:
-        echo   - Dispositivo [%%A]: %%B (%%C MB VRAM)
-    )
+if !errorlevel! neq 0 goto :skip_nvsmi_select
+for /f "tokens=1,2,3 delims=," %%A in ('nvidia-smi --query-gpu=index^,name^,memory.total --format=csv^,noheader^,nounits 2^>nul') do (
+    set "HAS_NVIDIA=1"
+    set "DETECTED_GPU_NAME=%%B"
+    set "DETECTED_VRAM=%%C"
+    echo Acelerador NVIDIA CUDA verificado:
+    echo   - Dispositivo [%%A]: %%B [%%C MB VRAM]
 )
+:skip_nvsmi_select
 
 echo.
 echo Selecciona la tarjeta grafica que usara el Generador 3D (para evitar que use la Intel UHD):
@@ -455,7 +497,7 @@ if "!GPU_OPT!"=="2" (
 if !errorlevel! equ 0 goto :pytorch_ok
 
 echo [INFO] Instalando PyTorch con aceleracion CUDA 12.4 para !DETECTED_GPU_NAME!...
-"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --cache-dir "%PIP_CACHE_DIR%"
+"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple --cache-dir "%PIP_CACHE_DIR%"
 "!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
 if !errorlevel! equ 0 (
     echo !GREEN![OK]!RESET! PyTorch con aceleracion CUDA 12.4 instalado con exito.
@@ -463,10 +505,18 @@ if !errorlevel! equ 0 (
 )
 
 echo [INFO] Reintentando con indice alternativo CUDA 12.1...
-"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --cache-dir "%PIP_CACHE_DIR%"
+"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple --cache-dir "%PIP_CACHE_DIR%"
 "!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
 if !errorlevel! equ 0 (
     echo !GREEN![OK]!RESET! PyTorch con aceleracion CUDA 12.1 instalado con exito.
+    goto :pytorch_done
+)
+
+echo [INFO] Reintentando instalacion directa sin cache...
+"!VENV_PY!" -m pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/cu124 --no-cache-dir
+"!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
+if !errorlevel! equ 0 (
+    echo !GREEN![OK]!RESET! PyTorch instalado con exito.
     goto :pytorch_done
 )
 
@@ -480,7 +530,7 @@ if !errorlevel! neq 0 (
     echo Presiona una tecla para continuar de todos modos o Ctrl+C para cancelar...
     pause
 ) else (
-    echo !YELLOW![AVISO]!RESET! PyTorch se instalo pero 'torch.cuda.is_available()' reporto Falso.
+    echo !YELLOW![AVISO]!RESET! PyTorch se instalo pero torch.cuda.is_available() reporto Falso.
     where nvidia-smi.exe >nul 2>&1
     if !errorlevel! neq 0 (
         echo   - Causa: Falta el driver oficial de NVIDIA GeForce RTX.
@@ -493,7 +543,7 @@ goto :pytorch_done
 
 :pytorch_ok
 echo !GREEN![OK]!RESET! PyTorch con aceleracion NVIDIA CUDA verificado y operativo:
-"!VENV_PY!" -c "import torch; print('     -> PyTorch ' + torch.__version__ + ' | CUDA ' + str(torch.version.cuda) + ' | ' + (torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'))"
+"!VENV_PY!" -c "import torch; d = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'; print('     -> PyTorch ' + torch.__version__ + ' - CUDA ' + str(torch.version.cuda) + ' - ' + d)"
 
 :pytorch_done
 echo.
@@ -650,7 +700,7 @@ echo ---------------------------------------------------------------------------
 set "INPUT_HF_TOKEN="
 set /p "INPUT_HF_TOKEN=Pega tu token de Hugging Face (o presiona Enter para configurarlo luego): "
 if not defined INPUT_HF_TOKEN goto :sf3d_token_skipped
-"!VENV_PY!" -c "import huggingface_hub; huggingface_hub.login(token='!INPUT_HF_TOKEN!', add_to_git_credential=False); print('Token guardado.')" 2>nul
+"!VENV_PY!" -c "import huggingface_hub; huggingface_hub.login(token=\"!INPUT_HF_TOKEN!\", add_to_git_credential=False); print(\"Token guardado.\")" 2>nul
 if !errorlevel! equ 0 echo !GREEN![OK]!RESET! Token de Hugging Face configurado con exito.
 exit /b 0
 
@@ -676,15 +726,23 @@ if !errorlevel! neq 0 (
 )
 
 where nvidia-smi.exe >nul 2>&1
-if !errorlevel! equ 0 (
-    for /f "tokens=*" %%G in ('nvidia-smi --query-gpu^=name^,memory.total --format^=csv^,noheader^,nounits 2^>nul') do (
-        echo !GREEN![OK]!RESET! Tarjeta Grafica Detectada: %%G MB VRAM
-    )
-) else (
-    echo !YELLOW![AVISO]!RESET! nvidia-smi no detecto tarjeta NVIDIA.
+if !errorlevel! neq 0 goto :skip_nvsmi_final
+for /f "tokens=*" %%G in ('nvidia-smi --query-gpu=name^,memory.total --format=csv^,noheader^,nounits 2^>nul') do (
+    echo !GREEN![OK]!RESET! Tarjeta Grafica Detectada: %%G MB VRAM
 )
+goto :nvsmi_final_done
 
-"!VENV_PY!" -c "import torch; d = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'; v = torch.cuda.get_device_properties(0).total_memory / (1024**3) if torch.cuda.is_available() else 0; print('>>> CUDA Activo: ' + str(torch.cuda.is_available()) + ' | Dispositivo: ' + d + ' | VRAM: ' + f'{v:.1f}' + ' GB')"
+:skip_nvsmi_final
+echo !YELLOW![AVISO]!RESET! nvidia-smi no detecto tarjeta NVIDIA.
+
+:nvsmi_final_done
+
+"!VENV_PY!" -c "import torch; c=torch.cuda.is_available(); d=torch.cuda.get_device_name(0) if c else 'CPU'; v=round(torch.cuda.get_device_properties(0).total_memory/(1024**3), 1) if c else 0; print('>>> CUDA Activo: ' + str(c) + ' - Dispositivo: ' + str(d) + ' - VRAM: ' + str(v) + ' GB')" >nul 2>&1
+if !errorlevel! equ 0 (
+    "!VENV_PY!" -c "import torch; c=torch.cuda.is_available(); d=torch.cuda.get_device_name(0) if c else 'CPU'; v=round(torch.cuda.get_device_properties(0).total_memory/(1024**3), 1) if c else 0; print('>>> CUDA Activo: ' + str(c) + ' - Dispositivo: ' + str(d) + ' - VRAM: ' + str(v) + ' GB')"
+) else (
+    echo !YELLOW![AVISO]!RESET! PyTorch no detectado en el entorno virtual.
+)
 echo.
 
 :: ==============================================================================
@@ -808,7 +866,7 @@ echo.
 :: RESUMEN FINAL Y GUIA DE USO
 :: ==============================================================================
 echo ==============================================================================
-echo  !GREEN!¡INSTALACION Y CONFIGURACION COMPLETADAS EXITOSAMENTE!!RESET!
+echo  !GREEN!INSTALACION Y CONFIGURACION COMPLETADAS EXITOSAMENTE!RESET!
 echo ==============================================================================
 echo  Modelos y Cache:  %MODELS_ROOT% (100%%%% fuera de C:\)
 echo  Entorno Virtual:  !VENV_DIR!
