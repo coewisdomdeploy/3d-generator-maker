@@ -44,3 +44,9 @@ pybind11>=2.12.0
 tqdm>=4.66.0
 psutil>=5.9.8
 python-dotenv>=1.0.1
+
+# Dependencias para Stable Fast 3D (SF3D - Stability AI)
+jaxtyping>=0.2.31
+open-clip-torch>=2.24.0
+gpytoolbox>=0.3.8
+pynanoinstantmeshes>=0.0.3

@@ -87,23 +87,38 @@ python img2glb.py --input foto.png --output ../Games/kaboomi-party/assets/models
 
 ---
 
-## 🌐 Interfaz Web Interactiva (`webui.py`)
+## 🌐 Interfaz Web Interactiva (WebUI)
 
-Para arrastrar imágenes en el navegador y generar modelos interactivamente:
+Dispones de dos versiones según tu flujo de trabajo:
 
-1. Ejecuta:
-   ```cmd
-   run_webui.bat
-   ```
-2. Se abrirá automáticamente tu navegador en **`http://127.0.0.1:7860`**.
-3. **Flujo de uso en 3 pasos:**
-   - **Paso 1:** Arrastra una imagen y pulsa *"Extraer Silueta Alfa"* si deseas previsualizar la silueta.
-   - **Paso 2:** Ajusta los triángulos (presets de 2K, 4K u 8K caras) y pulsa **"GENERAR MODELO 3D (GLB / STL / 3MF)"**.
-   - **Paso 3:** Inspecciona el modelo en el visor 3D interactivo con rotación de 360° y:
-     - **Descargar .GLB:** Con texturas PBR completas y normales (Godot 4, Unity, Web).
-     - **Descargar .STL:** Geometría triangular sólida optimizada para cualquier impresora 3D.
-     - **Descargar .3MF:** Formato moderno de manufactura aditiva con metadatos para Bambu Studio, OrcaSlicer y PrusaSlicer.
-     - O guárdalo directamente en el juego Godot 4 con 1 clic (`bombos/`, `bozis/`, `cosmetics/`).
+### 1. Versión General / Estudio 3D (`webui.bat`)
+Para cualquier proyecto (Godot, Unity, Unreal, Blender, Impresión 3D):
+```cmd
+webui.bat
+```
+*(O `python webui.py` / `run_webui.bat`)*
+- Interfaz neutral y profesional (3D AI Studio).
+- Biblioteca de modelos que lista y visualiza todos los `.glb` generados en la carpeta de salidas.
+- Permite exportar y copiar con 1 clic a cualquier carpeta o proyecto local que especifiques.
+
+### 2. Edición Kaboomi Party (`webui-kambo.bat`)
+Específica con la integración y biblioteca de Kaboomi Party:
+```cmd
+webui-kambo.bat
+```
+*(O `python webui_kambo.py` / `run_webui_kambo.bat`)*
+- Detección automática del proyecto `kaboomi-party`.
+- Guardado con 1 clic en `bombos/`, `bozis/` o `cosmetics/`.
+- Biblioteca integrada con los modelos existentes del juego.
+
+### 🎨 Flujo de Trabajo en 3 Pasos (Ambas Versiones):
+1. **Paso 1:** Arrastra una imagen y pulsa *"Extraer Silueta Alfa"* si deseas previsualizar la silueta.
+2. **Paso 2:** Ajusta los triángulos (presets de 2K, 4K u 8K caras) y pulsa **"GENERAR MODELO 3D (GLB / STL / 3MF)"**.
+3. **Paso 3:** Inspecciona el modelo en el visor 3D interactivo con rotación de 360° y:
+   - **Descargar .GLB:** Con texturas PBR completas y normales (Godot, Unity, Web).
+   - **Descargar .STL:** Geometría triangular sólida optimizada para cualquier impresora 3D.
+   - **Descargar .3MF:** Formato moderno de manufactura aditiva con metadatos para Bambu Studio, OrcaSlicer y PrusaSlicer.
+   - **Exportar directo a tu proyecto o juego.**
 
 ---
 
