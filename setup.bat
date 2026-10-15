@@ -506,15 +506,31 @@ if !errorlevel! equ 0 (
 )
 
 echo [INFO] Instalando PyTorch con aceleracion CUDA 12.4 para !DETECTED_GPU_NAME!...
-"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --trusted-host download.pytorch.org --cache-dir "!PIP_CACHE_DIR!"
+"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --trusted-host download.pytorch.org --trusted-host download-r2.pytorch.org --trusted-host files.pythonhosted.org --trusted-host pypi.org --cache-dir "!PIP_CACHE_DIR!"
 "!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
 if !errorlevel! equ 0 (
     echo !GREEN![OK]!RESET! PyTorch con aceleracion CUDA 12.4 instalado con exito.
     goto :pytorch_done
 )
 
+rem Obtener etiqueta de version de Python (ej: cp311, cp310, cp312)
+set "PY_TAG="
+for /f "tokens=1,2 delims=." %%A in ('"!VENV_PY!" -c "import sys; print(str(sys.version_info.major) + '.' + str(sys.version_info.minor))" 2^>nul') do (
+    set "PY_TAG=cp%%A%%B"
+)
+
+if defined PY_TAG (
+    echo [INFO] Reintentando instalacion con descarga directa de binario oficial (!PY_TAG!)...
+    "!VENV_PY!" -m pip install "https://download.pytorch.org/whl/cu124/torch-2.6.0%%2Bcu124-!PY_TAG!-!PY_TAG!-win_amd64.whl" "https://download.pytorch.org/whl/cu124/torchvision-0.21.0%%2Bcu124-!PY_TAG!-!PY_TAG!-win_amd64.whl" --trusted-host download.pytorch.org --trusted-host download-r2.pytorch.org --cache-dir "!PIP_CACHE_DIR!"
+    "!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
+    if !errorlevel! equ 0 (
+        echo !GREEN![OK]!RESET! PyTorch con aceleracion CUDA 12.4 instalado con exito por enlace directo.
+        goto :pytorch_done
+    )
+)
+
 echo [INFO] Reintentando con indice alternativo CUDA 12.1...
-"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --trusted-host download.pytorch.org --cache-dir "!PIP_CACHE_DIR!"
+"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --trusted-host download.pytorch.org --trusted-host download-r2.pytorch.org --trusted-host files.pythonhosted.org --trusted-host pypi.org --cache-dir "!PIP_CACHE_DIR!"
 "!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
 if !errorlevel! equ 0 (
     echo !GREEN![OK]!RESET! PyTorch con aceleracion CUDA 12.1 instalado con exito.
@@ -522,18 +538,10 @@ if !errorlevel! equ 0 (
 )
 
 echo [INFO] Reintentando con indice alternativo CUDA 11.8...
-"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118 --trusted-host download.pytorch.org --cache-dir "!PIP_CACHE_DIR!"
+"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118 --trusted-host download.pytorch.org --trusted-host download-r2.pytorch.org --trusted-host files.pythonhosted.org --trusted-host pypi.org --cache-dir "!PIP_CACHE_DIR!"
 "!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
 if !errorlevel! equ 0 (
     echo !GREEN![OK]!RESET! PyTorch con aceleracion CUDA 11.8 instalado con exito.
-    goto :pytorch_done
-)
-
-echo [INFO] Reintentando instalacion con PyPI complementario...
-"!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple --trusted-host download.pytorch.org --trusted-host files.pythonhosted.org --trusted-host pypi.org --cache-dir "!PIP_CACHE_DIR!"
-"!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
-if !errorlevel! equ 0 (
-    echo !GREEN![OK]!RESET! PyTorch instalado con exito.
     goto :pytorch_done
 )
 
