@@ -585,8 +585,7 @@ def center_and_orient_mesh(
 # 5. Generador Principal Hunyuan3D-2 (DiT Turbo + Paint en fp16)
 # ==============================================================================
 
-# Parche de tolerancia: evita errores 'Missing key in state_dict' causados por
-# diferencias menores de versiones en Transformers / DINOv2
+# Parche 1: Tolerancia de llaves en encoders visuales (evita 'Missing key in state_dict')
 try:
     from hy3dgen.shapegen.models.conditioner import SingleImageEncoder, DualImageEncoder
     _orig_single_encoder_load = SingleImageEncoder.load_state_dict
@@ -600,6 +599,25 @@ try:
 
     SingleImageEncoder.load_state_dict = _tolerant_single_encoder_load
     DualImageEncoder.load_state_dict = _tolerant_dual_encoder_load
+except Exception:
+    pass
+
+# Parche 2: Soporte nativo de components para CPU Offload en Hunyuan3D
+# Hunyuan3DDiTPipeline copió enable_model_cpu_offload pero omitió self.components,
+# provocando "'Hunyuan3DDiTFlowMatchingPipeline' object has no attribute 'components'".
+try:
+    from hy3dgen.shapegen.pipelines import Hunyuan3DDiTPipeline
+    if not hasattr(Hunyuan3DDiTPipeline, "components"):
+        @property
+        def _hunyuan_components(self):
+            return {
+                "vae": getattr(self, "vae", None),
+                "model": getattr(self, "model", None),
+                "conditioner": getattr(self, "conditioner", None),
+                "scheduler": getattr(self, "scheduler", None),
+                "image_processor": getattr(self, "image_processor", None),
+            }
+        Hunyuan3DDiTPipeline.components = _hunyuan_components
 except Exception:
     pass
 
@@ -680,17 +698,21 @@ class Hunyuan3DGenerator:
                 print(" -> Reutilizando pipeline Hunyuan3D DiT ya cargado en VRAM.")
             else:
                 from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
-                print(f" -> Cargando pesos DiT desde {self.model_id} [{self.shape_subfolder}] a VRAM...")
+                pcfg = VRAM_PROFILES.get(self.vram_profile_key, {})
+                use_cpu_offload = (pcfg.get("cpu_offload", False) or self.vram_profile_key == "low_6gb") and self.device == "cuda"
+                load_device = "cpu" if use_cpu_offload else self.device
+
+                print(f" -> Cargando pesos DiT desde {self.model_id} [{self.shape_subfolder}] (Dispositivo inicial: {load_device})...")
                 shape_pipe = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
                     self.model_id,
                     subfolder=self.shape_subfolder,
-                    torch_dtype=self.dtype
+                    torch_dtype=self.dtype,
+                    device=load_device
                 )
                 if self.device == "cuda":
-                    pcfg = VRAM_PROFILES.get(self.vram_profile_key, {})
-                    if pcfg.get("cpu_offload", False) or self.vram_profile_key == "low_6gb":
+                    if use_cpu_offload:
                         try:
-                            shape_pipe.enable_model_cpu_offload()
+                            shape_pipe.enable_model_cpu_offload(device=self.device)
                             print(" -> [VRAM 6GB] CPU Offloading secuencial activado: VRAM pico ~4.8GB (Optimizado RTX 4050).")
                         except Exception as e_off:
                             print(f" -> [Aviso CPU Offload] {e_off}. Asignando a cuda directo.")
