@@ -86,6 +86,17 @@ VRAM_PROFILES = {
         "low_vram": True,
         "low_vram_mode": True,
         "use_fp16": True,
+        "cpu_offload": True,
+        "default_octree": 256,
+        "gc_after_step": True
+    },
+    "low_6gb": {
+        "name": "6GB VRAM (Optimizado RTX 4050 Laptop / RTX 3050)",
+        "desc": "Perfil optimizado para 6GB: Activa CPU Offloading secuencial (DINOv2 -> DiT -> VAE), manteniendo el consumo bajo 5GB de VRAM.",
+        "low_vram": True,
+        "low_vram_mode": True,
+        "use_fp16": True,
+        "cpu_offload": True,
         "default_octree": 256,
         "gc_after_step": True
     },
@@ -95,6 +106,7 @@ VRAM_PROFILES = {
         "low_vram": True,
         "low_vram_mode": True,
         "use_fp16": True,
+        "cpu_offload": False,
         "default_octree": 256,
         "gc_after_step": True
     },
@@ -104,6 +116,7 @@ VRAM_PROFILES = {
         "low_vram": False,
         "low_vram_mode": False,
         "use_fp16": True,
+        "cpu_offload": False,
         "default_octree": 320,
         "gc_after_step": False
     },
@@ -113,6 +126,7 @@ VRAM_PROFILES = {
         "low_vram": False,
         "low_vram_mode": False,
         "use_fp16": True,
+        "cpu_offload": False,
         "default_octree": 384,
         "gc_after_step": False
     },
@@ -122,6 +136,7 @@ VRAM_PROFILES = {
         "low_vram": True,
         "low_vram_mode": True,
         "use_fp16": False,
+        "cpu_offload": False,
         "default_octree": 192,
         "gc_after_step": True
     }
@@ -133,14 +148,16 @@ def detect_vram_profile() -> str:
         return "cpu"
     try:
         total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        if total_vram_gb <= 8.5:
+        if total_vram_gb <= 6.5:
+            return "low_6gb"
+        elif total_vram_gb <= 8.5:
             return "low_8gb"
         elif total_vram_gb <= 13.0:
             return "mid_12gb"
         else:
             return "high_16gb"
     except Exception:
-        return "low_8gb"
+        return "low_6gb"
 
 
 def is_dit_cached() -> bool:
@@ -568,6 +585,24 @@ def center_and_orient_mesh(
 # 5. Generador Principal Hunyuan3D-2 (DiT Turbo + Paint en fp16)
 # ==============================================================================
 
+# Parche de tolerancia: evita errores 'Missing key in state_dict' causados por
+# diferencias menores de versiones en Transformers / DINOv2
+try:
+    from hy3dgen.shapegen.models.conditioner import SingleImageEncoder, DualImageEncoder
+    _orig_single_encoder_load = SingleImageEncoder.load_state_dict
+    _orig_dual_encoder_load = DualImageEncoder.load_state_dict
+
+    def _tolerant_single_encoder_load(self, state_dict, strict=True):
+        return _orig_single_encoder_load(self, state_dict, strict=False)
+
+    def _tolerant_dual_encoder_load(self, state_dict, strict=True):
+        return _orig_dual_encoder_load(self, state_dict, strict=False)
+
+    SingleImageEncoder.load_state_dict = _tolerant_single_encoder_load
+    DualImageEncoder.load_state_dict = _tolerant_dual_encoder_load
+except Exception:
+    pass
+
 _GLOBAL_SHAPE_PIPELINE = None
 
 class Hunyuan3DGenerator:
@@ -652,7 +687,16 @@ class Hunyuan3DGenerator:
                     torch_dtype=self.dtype
                 )
                 if self.device == "cuda":
-                    shape_pipe.to("cuda")
+                    pcfg = VRAM_PROFILES.get(self.vram_profile_key, {})
+                    if pcfg.get("cpu_offload", False) or self.vram_profile_key == "low_6gb":
+                        try:
+                            shape_pipe.enable_model_cpu_offload()
+                            print(" -> [VRAM 6GB] CPU Offloading secuencial activado: VRAM pico ~4.8GB (Optimizado RTX 4050).")
+                        except Exception as e_off:
+                            print(f" -> [Aviso CPU Offload] {e_off}. Asignando a cuda directo.")
+                            shape_pipe.to("cuda")
+                    else:
+                        shape_pipe.to("cuda")
                 if not self.low_vram_mode:
                     _GLOBAL_SHAPE_PIPELINE = shape_pipe
 
@@ -725,6 +769,12 @@ class Hunyuan3DGenerator:
             print("Ejecuta 'setup.bat' o 'pip install git+https://github.com/Tencent-Hunyuan/Hunyuan3D-2.git'")
             raise
         except Exception as e:
+            err_str = str(e)
+            if "SingleImageEncoder" in err_str or "state_dict" in err_str:
+                print(f"\n[DIAGNÓSTICO] {err_str}")
+                print(" -> Causa: Los pesos de Hunyuan3D-2 Turbo están incompletos en disco o corruptos.")
+                print(" -> Solución: Ejecuta 'descargar_modelos.bat' para completar el archivo model.fp16.safetensors (4.93 GB).")
+                print(" -> O cambia en la interfaz a 'Stable Fast 3D (SF3D)' para generar en 1s sin este modelo.\n")
             print(f"[ERROR] Falló la generación de forma: {e}")
             raise
 

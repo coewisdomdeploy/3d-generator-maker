@@ -170,6 +170,7 @@ PRESET_FACES_MAP = {k: v["faces"] for k, v in PRESET_CONFIG_MAP.items()}
 
 VRAM_PROFILE_CHOICES = [
     "Auto-detectar (Recomendado)",
+    "6GB VRAM (Optimizado RTX 4050 Laptop / RTX 3050)",
     "8GB VRAM (Optimizado RTX 4060 / Laptops)",
     "12GB VRAM (Equilibrado RTX 3060 / 4070)",
     "16GB+ VRAM (Máximo Rendimiento)",
@@ -178,6 +179,7 @@ VRAM_PROFILE_CHOICES = [
 
 VRAM_CHOICE_TO_KEY = {
     "Auto-detectar (Recomendado)": "auto",
+    "6GB VRAM (Optimizado RTX 4050 Laptop / RTX 3050)": "low_6gb",
     "8GB VRAM (Optimizado RTX 4060 / Laptops)": "low_8gb",
     "12GB VRAM (Equilibrado RTX 3060 / 4070)": "mid_12gb",
     "16GB+ VRAM (Máximo Rendimiento)": "high_16gb",
