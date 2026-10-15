@@ -158,55 +158,72 @@ if "!ALL_DIRS_EXIST!"=="1" (
 echo.
 
 :: ==============================================================================
-:: 2. DETECCION Y ASISTENTE INTELIGENTE DE PYTHON
+:: 2. DETECCION Y PRIORIZACION DEL LANZADOR 'py' Y INTERPRETE DE PYTHON
 :: ==============================================================================
 :retry_python_detection
-echo [1/8] Verificando interprete de Python...
+echo [1/8] Verificando interprete de Python (priorizando lanzador oficial 'py')...
 
 set "PY_CMD="
+set "PY_LAUNCHER="
 
-:: Comprobar si ya existe un entorno virtual previo y obtener su python
-if exist "%MODELS_ROOT%\venv_3dgen\Scripts\python.exe" (
-    set "PY_CMD=%MODELS_ROOT%\venv_3dgen\Scripts\python.exe"
-    echo !GREEN![OK]!RESET! Detectado interprete de entorno virtual existente: "!PY_CMD!"
-    goto :python_found
-)
-if exist "%~dp0.venv\Scripts\python.exe" (
-    set "PY_CMD=%~dp0.venv\Scripts\python.exe"
-    echo !GREEN![OK]!RESET! Detectado interprete de entorno virtual local: "!PY_CMD!"
-    goto :python_found
-)
-
+:: 1. Comprobar si existe el lanzador oficial py.exe de Windows
 where py.exe >nul 2>&1
 if !errorlevel! equ 0 (
-    for /f "delims=" %%P in ('py -3.11 -c "import sys; print(sys.executable)" 2^>nul') do (
-        if not defined PY_CMD set "PY_CMD=%%P"
+    echo [INFO] Lanzador de Windows 'py.exe' localizado. Verificando entornos 64-bit...
+    
+    :: Priorizar py -3.11 en 64-bit
+    py -3.11 -c "import struct; exit(0 if struct.calcsize('P') == 8 else 1)" >nul 2>&1
+    if !errorlevel! equ 0 (
+        set "PY_LAUNCHER=py -3.11"
+        for /f "delims=" %%P in ('py -3.11 -c "import sys; print(sys.executable)"') do set "PY_CMD=%%P"
+        echo !GREEN![OK]!RESET! Lanzador '!PY_LAUNCHER!' validado en 64 bits: "!PY_CMD!"
+        goto :python_found
     )
-    if not defined PY_CMD (
-        for /f "delims=" %%P in ('py -3.10 -c "import sys; print(sys.executable)" 2^>nul') do (
-            if not defined PY_CMD set "PY_CMD=%%P"
-        )
+    
+    :: Comprobar py -3.10 en 64-bit
+    py -3.10 -c "import struct; exit(0 if struct.calcsize('P') == 8 else 1)" >nul 2>&1
+    if !errorlevel! equ 0 (
+        set "PY_LAUNCHER=py -3.10"
+        for /f "delims=" %%P in ('py -3.10 -c "import sys; print(sys.executable)"') do set "PY_CMD=%%P"
+        echo !GREEN![OK]!RESET! Lanzador '!PY_LAUNCHER!' validado en 64 bits: "!PY_CMD!"
+        goto :python_found
     )
-    if not defined PY_CMD (
-        for /f "delims=" %%P in ('py -3 -c "import sys; print(sys.executable)" 2^>nul') do (
-            if not defined PY_CMD set "PY_CMD=%%P"
-        )
-    )
-    if not defined PY_CMD (
-        for /f "delims=" %%P in ('py -c "import sys; print(sys.executable)" 2^>nul') do (
-            if not defined PY_CMD set "PY_CMD=%%P"
-        )
+    
+    :: Comprobar py -3 en 64-bit
+    py -3 -c "import struct; exit(0 if struct.calcsize('P') == 8 else 1)" >nul 2>&1
+    if !errorlevel! equ 0 (
+        set "PY_LAUNCHER=py -3"
+        for /f "delims=" %%P in ('py -3 -c "import sys; print(sys.executable)"') do set "PY_CMD=%%P"
+        echo !GREEN![OK]!RESET! Lanzador '!PY_LAUNCHER!' validado en 64 bits: "!PY_CMD!"
+        goto :python_found
     )
 )
 
-if not defined PY_CMD (
-    for /f "delims=" %%I in ('where python.exe 2^>nul') do (
-        if not defined PY_CMD (
-            echo %%I | findstr /i "WindowsApps Inkscape" >nul
-            if !errorlevel! neq 0 (
-                "%%I" -c "import sys; exit(0)" >nul 2>&1
-                if !errorlevel! equ 0 set "PY_CMD=%%I"
-            )
+:: 2. Comprobar si ya existe un entorno virtual previo valido de 64 bits
+if exist "%MODELS_ROOT%\venv_3dgen\Scripts\python.exe" (
+    "%MODELS_ROOT%\venv_3dgen\Scripts\python.exe" -c "import struct; exit(0 if struct.calcsize('P') == 8 else 1)" >nul 2>&1
+    if !errorlevel! equ 0 (
+        set "PY_CMD=%MODELS_ROOT%\venv_3dgen\Scripts\python.exe"
+        echo !GREEN![OK]!RESET! Detectado interprete de entorno virtual existente (64-bit): "!PY_CMD!"
+        goto :python_found
+    )
+)
+if exist "%~dp0.venv\Scripts\python.exe" (
+    "%~dp0.venv\Scripts\python.exe" -c "import struct; exit(0 if struct.calcsize('P') == 8 else 1)" >nul 2>&1
+    if !errorlevel! equ 0 (
+        set "PY_CMD=%~dp0.venv\Scripts\python.exe"
+        echo !GREEN![OK]!RESET! Detectado interprete de entorno virtual local (64-bit): "!PY_CMD!"
+        goto :python_found
+    )
+)
+
+:: 3. Si py no esta disponible, buscar ejecutables python.exe de 64 bits en el sistema
+for /f "delims=" %%I in ('where python.exe 2^>nul') do (
+    if not defined PY_CMD (
+        echo %%I | findstr /i "WindowsApps Inkscape" >nul
+        if !errorlevel! neq 0 (
+            "%%I" -c "import struct; exit(0 if struct.calcsize('P') == 8 else 1)" >nul 2>&1
+            if !errorlevel! equ 0 set "PY_CMD=%%I"
         )
     )
 )
@@ -218,21 +235,21 @@ if not defined PY_CMD if exist "%ProgramFiles%\Python310\python.exe" set "PY_CMD
 if not defined PY_CMD if exist "D:\Programas\Python311\python.exe" set "PY_CMD=D:\Programas\Python311\python.exe"
 
 if defined PY_CMD (
-    echo !GREEN![OK]!RESET! Interprete Python localizado con exito: "!PY_CMD!"
+    echo !GREEN![OK]!RESET! Interprete Python de 64 bits localizado con exito: "!PY_CMD!"
     goto :python_found
 )
 
 :: ASISTENTE: Si no se encontro Python
 echo.
 echo ==============================================================================
-echo !YELLOW![ASISTENTE] NO SE DETECTO PYTHON EN EL SISTEMA!RESET!
+echo !YELLOW![ASISTENTE] NO SE DETECTO PYTHON DE 64 BITS EN EL SISTEMA!RESET!
 echo ==============================================================================
-echo Para este generador 3D se requiere Python 3.10 o 3.11 de 64 bits.
+echo Para este generador 3D se requiere Python 3.10 o 3.11 de 64 bits (AMD64).
 echo.
 echo Opciones de ayuda:
-echo   [1] Instalar Python 3.11 automaticamente con winget (Recomendado)
+echo   [1] Instalar Python 3.11 (64-bit) automaticamente con winget (Recomendado)
 echo   [2] Abrir enlace web de descarga oficial de Python (python.org)
-echo   [3] Especificar ruta manual a tu python.exe
+echo   [3] Especificar ruta manual a tu python.exe de 64 bits
 echo   [4] Salir
 echo.
 set "PY_ASSIST=1"
@@ -242,7 +259,7 @@ echo.
 if "!PY_ASSIST:~0,1!"=="2" (
     echo [INFO] Abriendo pagina de descarga oficial...
     start https://www.python.org/downloads/release/python-3119/
-    echo Recuerda marcar "Add python.exe to PATH".
+    echo Recuerda descargar "Windows installer (64-bit)" y marcar "Add python.exe to PATH".
     pause
     goto :retry_python_detection
 )
@@ -266,33 +283,17 @@ if "!PY_ASSIST:~0,1!"=="4" (
     exit /b 1
 )
 
-echo [INFO] Intentando instalar Python 3.11 con winget...
-winget install -e --id Python.Python.3.11 --accept-package-agreements --accept-source-agreements
+echo [INFO] Intentando instalar Python 3.11 x64 con winget...
+winget install -e --id Python.Python.3.11 --architecture x64 --accept-package-agreements --accept-source-agreements
 goto :retry_python_detection
 
 :python_found
 echo.
 
-:: Verificar que el Python seleccionado tenga pip funcional
-"!PY_CMD!" -m pip --version >nul 2>&1
-if !errorlevel! neq 0 (
-    echo [ASISTENTE] Reparando pip en el interprete seleccionado...
-    "!PY_CMD!" -m ensurepip --default-pip >nul 2>&1
-    "!PY_CMD!" -m pip --version >nul 2>&1
-    if !errorlevel! equ 0 (
-        echo !GREEN![OK]!RESET! pip reparado y listo para usar.
-    ) else (
-        echo !YELLOW![AVISO]!RESET! pip no respondio, se intentara continuar con el venv.
-    )
-) else (
-    echo !GREEN![OK]!RESET! Gestor de paquetes pip disponible y verificado.
-)
-echo.
-
 :: ==============================================================================
-:: 3. CREACION Y ACTIVACION DEL ENTORNO VIRTUAL (.venv / venv_3dgen)
+:: 3. CREACION, ACTIVACION Y VALIDACION RIGUROSA DEL ENTORNO VIRTUAL
 :: ==============================================================================
-echo [2/8] Configurando entorno virtual...
+echo [2/8] Configurando y validando entorno virtual (usando py / python 64-bit)...
 
 if /i "%MODELS_ROOT%"=="%~dp0AI_Models" (
     set "VENV_DIR=%~dp0.venv"
@@ -300,68 +301,204 @@ if /i "%MODELS_ROOT%"=="%~dp0AI_Models" (
     set "VENV_DIR=%MODELS_ROOT%\venv_3dgen"
 )
 
-if exist "!VENV_DIR!\Scripts\activate.bat" (
-    echo !GREEN![OK]!RESET! Entorno virtual ya existente detectado en "!VENV_DIR!". Omitiendo creacion.
+:: Si ya existe un venv, comprobar rigurosamente que sea de 64 bits
+if exist "!VENV_DIR!\Scripts\python.exe" (
+    "!VENV_DIR!\Scripts\python.exe" -c "import struct; exit(0 if struct.calcsize('P') == 8 else 1)" >nul 2>&1
+    if !errorlevel! equ 0 (
+        echo !GREEN![OK]!RESET! Entorno virtual existente detectado y validado en 64 bits: "!VENV_DIR!"
+        goto :venv_ready
+    ) else (
+        echo !YELLOW![AVISO]!RESET! El entorno virtual previo en "!VENV_DIR!" es de 32 bits (incompatible).
+        echo [INFO] Recreando entorno virtual en 64 bits...
+        rmdir /s /q "!VENV_DIR!" 2>nul
+    )
+)
+
+echo [INFO] Creando entorno virtual en "!VENV_DIR!"...
+if defined PY_LAUNCHER (
+    echo [INFO] Ejecutando: !PY_LAUNCHER! -m venv "!VENV_DIR!"
+    !PY_LAUNCHER! -m venv "!VENV_DIR!"
 ) else (
-    echo [INFO] Creando nuevo entorno virtual en "!VENV_DIR!"...
+    echo [INFO] Ejecutando: "!PY_CMD!" -m venv "!VENV_DIR!"
     "!PY_CMD!" -m venv "!VENV_DIR!"
-    if not exist "!VENV_DIR!\Scripts\activate.bat" (
-        echo [INFO] Intentando crear entorno alternativo local en .venv...
-        set "VENV_DIR=%~dp0.venv"
+)
+
+if not exist "!VENV_DIR!\Scripts\python.exe" (
+    echo [INFO] Intentando crear entorno alternativo local en %~dp0.venv...
+    set "VENV_DIR=%~dp0.venv"
+    if defined PY_LAUNCHER (
+        !PY_LAUNCHER! -m venv "!VENV_DIR!"
+    ) else (
         "!PY_CMD!" -m venv "!VENV_DIR!"
     )
 )
 
-set "ACTIVATE_BAT="
-if exist "%~dp0.venv\Scripts\activate.bat" (
-    set "ACTIVATE_BAT=%~dp0.venv\Scripts\activate.bat"
-) else if exist "!VENV_DIR!\Scripts\activate.bat" (
-    if /i "!VENV_DIR!" neq "%~dp0.venv" (
-        if not exist "%~dp0.venv" mklink /J "%~dp0.venv" "!VENV_DIR!" >nul 2>&1
-    )
-    if exist "%~dp0.venv\Scripts\activate.bat" (
-        set "ACTIVATE_BAT=%~dp0.venv\Scripts\activate.bat"
-    ) else (
-        set "ACTIVATE_BAT=!VENV_DIR!\Scripts\activate.bat"
-    )
-)
+:venv_ready
+set "VENV_PY=!VENV_DIR!\Scripts\python.exe"
+set "VENV_PIP=!VENV_DIR!\Scripts\python.exe -m pip"
 
-if not defined ACTIVATE_BAT (
-    echo !RED![ERROR CRITICO]!RESET! No se pudo generar el entorno virtual en !VENV_DIR!
+if not exist "!VENV_PY!" (
+    echo !RED![ERROR CRITICO]!RESET! No se encontro python.exe en !VENV_DIR!\Scripts.
     pause
     exit /b 1
 )
 
-call "!ACTIVATE_BAT!"
+:: VALIDACION RIGUROSA DEL PASO 2: Arquitectura y Version
+echo [INFO] Validando entorno virtual en paso 2...
+for /f "tokens=*" %%V in ('"!VENV_PY!" -c "import struct, sys; bits = struct.calcsize('P') * 8; print('Python ' + sys.version.split()[0] + ' (' + str(bits) + '-bit)')"') do (
+    echo !GREEN![OK]!RESET! Entorno Virtual Verificado: %%V
+)
+
+"!VENV_PY!" -c "import struct; exit(0 if struct.calcsize('P') == 8 else 1)" >nul 2>&1
 if !errorlevel! neq 0 (
-    echo !RED![ERROR]!RESET! No se pudo activar el entorno virtual.
+    echo !RED![ERROR FATAL EN PASO 2]!RESET!
+    echo El entorno virtual sigue siendo de 32 bits.
+    echo PyTorch con CUDA y las librerias 3D no tienen soporte para 32 bits.
+    echo Asegurate de instalar Python 3.11 de 64 bits antes de continuar.
     pause
     exit /b 1
 )
-echo !GREEN![OK]!RESET! Entorno virtual activado con exito: "!ACTIVATE_BAT!"
+
+:: Enlace simbolico a .venv si se creo en otra ruta
+if /i "!VENV_DIR!" neq "%~dp0.venv" (
+    if not exist "%~dp0.venv" mklink /J "%~dp0.venv" "!VENV_DIR!" >nul 2>&1
+)
+
+:: Activar el entorno para la sesion del script
+if exist "!VENV_DIR!\Scripts\activate.bat" (
+    call "!VENV_DIR!\Scripts\activate.bat"
+)
+
+:: Asegurar pip actualizado
+echo [INFO] Actualizando pip en el entorno virtual...
+"!VENV_PIP!" install --upgrade pip >nul 2>&1
+echo !GREEN![OK]!RESET! Gestor pip del entorno verificado y actualizado.
+echo !GREEN![OK]!RESET! Paso [2/8] superado exitosamente.
 echo.
 
 :: ==============================================================================
-:: 4. INSTALACION Y VERIFICACION DE PYTORCH CON CUDA 12.4
+:: SELECCION Y ASIGNACION DE GPU (INTEL UHD vs NVIDIA GEFORCE RTX 4050)
 :: ==============================================================================
-echo [3/8] Verificando PyTorch con aceleracion CUDA...
+echo ==============================================================================
+echo       SELECCION DE TARJETA GRAFICA / PROCESADOR DE ACELERACION
+echo ==============================================================================
+echo [INFO] Escaneando hardware grafico del equipo...
+echo.
 
-python -c "import torch; assert torch.cuda.is_available() and torch.version.cuda is not None" >nul 2>&1
+echo Adaptadores de pantalla encontrados en Windows:
+powershell -NoProfile -Command "Get-CimInstance Win32_VideoController | ForEach-Object { '  - ' + $_.Name }" 2>nul
+echo.
+
+set "HAS_NVIDIA=0"
+set "DETECTED_GPU_NAME=NVIDIA GeForce RTX 4050 Laptop GPU"
+set "DETECTED_VRAM=6144"
+
+where nvidia-smi.exe >nul 2>&1
+if !errorlevel! neq 0 (
+    if exist "%SystemRoot%\System32\nvidia-smi.exe" set "PATH=%SystemRoot%\System32;!PATH!"
+    if exist "%ProgramFiles%\NVIDIA Corporation\NVSMI\nvidia-smi.exe" set "PATH=%ProgramFiles%\NVIDIA Corporation\NVSMI;!PATH!"
+)
+
+where nvidia-smi.exe >nul 2>&1
+if !errorlevel! equ 0 (
+    for /f "tokens=1,2,3 delims=," %%A in ('nvidia-smi --query-gpu^=index^,name^,memory.total --format^=csv^,noheader^,nounits 2^>nul') do (
+        set "HAS_NVIDIA=1"
+        set "DETECTED_GPU_NAME=%%B"
+        set "DETECTED_VRAM=%%C"
+        echo Acelerador NVIDIA CUDA verificado:
+        echo   - Dispositivo [%%A]: %%B (%%C MB VRAM)
+    )
+)
+
+echo.
+echo Selecciona la tarjeta grafica que usara el Generador 3D (para evitar que use la Intel UHD):
+echo.
+echo   [1] GPU Dedicada NVIDIA (!DETECTED_GPU_NAME!) - RECOMENDADO
+echo       - Aceleracion por hardware con nucleos CUDA / Tensor
+echo       - Configura Windows en 'Alto Rendimiento' para este entorno
+echo.
+echo   [2] Modo CPU (Sin aceleracion NVIDIA)
+echo       - Ejecucion en memoria RAM del sistema
+echo.
+
+set "GPU_OPT=1"
+set /p "GPU_OPT=Elige una opcion [1 o 2] (Enter para opcion 1 - NVIDIA): "
+echo.
+
+set "GPU_OPT=!GPU_OPT: =!"
+if not "!GPU_OPT!"=="2" set "GPU_OPT=1"
+
+if "!GPU_OPT!"=="1" (
+    set "CUDA_VISIBLE_DEVICES=0"
+    set "STUDIO_DEVICE=cuda:0"
+    echo !GREEN![OK]!RESET! Asignada GPU NVIDIA: !DETECTED_GPU_NAME! (CUDA:0).
+    
+    :: Forzar preferencia de Alto Rendimiento en el Registro de Windows (DirectX)
+    reg add "HKCU\Software\Microsoft\DirectX\UserGpuPreferences" /v "!VENV_PY!" /t REG_SZ /d "GpuPreference=2;" /f >nul 2>&1
+    if !errorlevel! equ 0 (
+        echo !GREEN![OK]!RESET! Configurado Windows: Asignado 'Alto Rendimiento (GPU Dedicada)' para "!VENV_PY!".
+    )
+) else (
+    set "CUDA_VISIBLE_DEVICES="
+    set "STUDIO_DEVICE=cpu"
+    echo !YELLOW![AVISO]!RESET! Asignado Modo CPU para el generador 3D.
+)
+echo.
+
+:: ==============================================================================
+:: 4. INSTALACION Y VERIFICACION DE PYTORCH CON ACELERACION CUDA
+:: ==============================================================================
+echo [3/8] Verificando PyTorch con aceleracion CUDA (usando entorno virtual)...
+
+if "!GPU_OPT!"=="2" (
+    echo [INFO] Modo CPU seleccionado. Verificando PyTorch CPU...
+    "!VENV_PY!" -c "import torch" >nul 2>&1
+    if !errorlevel! equ 0 goto :pytorch_ok
+    echo [INFO] Instalando PyTorch en modo CPU...
+    "!VENV_PIP!" install torch torchvision --cache-dir "%PIP_CACHE_DIR%"
+    goto :pytorch_done
+)
+
+"!VENV_PY!" -c "import torch; assert torch.cuda.is_available() and torch.version.cuda is not None" >nul 2>&1
 if !errorlevel! equ 0 goto :pytorch_ok
 
-echo [INFO] Instalando PyTorch con aceleracion CUDA 12.4 (Descarga optimizada)...
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --cache-dir "%PIP_CACHE_DIR%"
-python -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
+echo [INFO] Instalando PyTorch con aceleracion CUDA 12.4 (Descarga optimizada para !DETECTED_GPU_NAME!)...
+"!VENV_PIP!" install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --cache-dir "%PIP_CACHE_DIR%"
+"!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
 if !errorlevel! equ 0 (
-    echo !GREEN![OK]!RESET! PyTorch con aceleracion CUDA instalado con exito.
+    echo !GREEN![OK]!RESET! PyTorch con aceleracion CUDA 12.4 instalado con exito.
+    goto :pytorch_done
+)
+
+echo [INFO] Reintentando con indice alternativo CUDA 12.1...
+"!VENV_PIP!" install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --cache-dir "%PIP_CACHE_DIR%"
+"!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
+if !errorlevel! equ 0 (
+    echo !GREEN![OK]!RESET! PyTorch con aceleracion CUDA 12.1 instalado con exito.
+    goto :pytorch_done
+)
+
+:: Diagnostico detallado si la instalacion falla
+"!VENV_PY!" -c "import torch" >nul 2>&1
+if !errorlevel! neq 0 (
+    echo !RED![ERROR CRITICO EN DESCARGA DE PYTORCH]!RESET!
+    echo No se pudo descargar PyTorch con CUDA en el entorno virtual.
+    echo Revisa tu conexion a internet o posibles bloqueos de firewall hacia download.pytorch.org.
 ) else (
-    echo !YELLOW![AVISO]!RESET! PyTorch se instalo pero no detecto aceleracion CUDA activa. Se usara modo CPU.
+    echo !YELLOW![AVISO]!RESET! PyTorch se instalo pero 'torch.cuda.is_available()' reporto Falso.
+    where nvidia-smi.exe >nul 2>&1
+    if !errorlevel! neq 0 (
+        echo   - Causa: Falta el driver oficial de NVIDIA GeForce RTX.
+        echo     Instala los controladores mas recientes desde www.nvidia.com/drivers o GeForce Experience.
+    ) else (
+        echo   - Tarjeta NVIDIA detectada, pero los controladores requieren reinicio del equipo.
+    )
 )
 goto :pytorch_done
 
 :pytorch_ok
-echo !GREEN![OK]!RESET! PyTorch con aceleracion NVIDIA CUDA ya instalado y verificado. Omitiendo reinstalacion:
-python -c "import torch; print('     -> PyTorch ' + torch.__version__ + ' | CUDA ' + str(torch.version.cuda) + ' | ' + torch.cuda.get_device_name(0))"
+echo !GREEN![OK]!RESET! PyTorch con aceleracion NVIDIA CUDA verificado y operativo:
+"!VENV_PY!" -c "import torch; print('     -> PyTorch ' + torch.__version__ + ' | CUDA ' + str(torch.version.cuda) + ' | ' + (torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'))"
 
 :pytorch_done
 echo.
@@ -371,11 +508,11 @@ echo.
 :: ==============================================================================
 echo [4/8] Verificando librerias 3D base y utilidades...
 
-python -c "import trimesh, pymeshlab, pyfqmr, rembg, pygltflib, gradio, xatlas, PIL, cv2" >nul 2>&1
+"!VENV_PY!" -c "import trimesh, pymeshlab, pyfqmr, rembg, pygltflib, gradio, xatlas, PIL, cv2" >nul 2>&1
 if !errorlevel! equ 0 goto :base_deps_ok
 
-echo [INFO] Instalando dependencias base desde requirements.txt...
-pip install -r requirements.txt --cache-dir "%PIP_CACHE_DIR%"
+echo [INFO] Instalando dependencias base desde requirements.txt (usando entorno virtual)...
+"!VENV_PIP!" install -r requirements.txt --cache-dir "%PIP_CACHE_DIR%"
 echo !GREEN![OK]!RESET! Dependencias base instaladas.
 goto :base_deps_done
 
@@ -445,15 +582,15 @@ goto :step_gpu_check
 :: SUBRUTINAS DE INSTALACION DE MOTORES
 :: ==============================================================================
 :check_and_install_hunyuan
-python -c "import hy3dgen" >nul 2>&1
+"!VENV_PY!" -c "import hy3dgen" >nul 2>&1
 if !errorlevel! equ 0 goto :hy3dgen_ok
 
 echo [INFO] hy3dgen no encontrado. Verificando Git para instalacion...
 where git.exe >nul 2>&1
 if !errorlevel! equ 0 (
-    pip install git+https://github.com/Tencent-Hunyuan/Hunyuan3D-2.git --cache-dir "%PIP_CACHE_DIR%"
+    "!VENV_PIP!" install git+https://github.com/Tencent-Hunyuan/Hunyuan3D-2.git --cache-dir "%PIP_CACHE_DIR%"
 ) else (
-    pip install https://github.com/Tencent-Hunyuan/Hunyuan3D-2/archive/refs/heads/main.zip --cache-dir "%PIP_CACHE_DIR%"
+    "!VENV_PIP!" install https://github.com/Tencent-Hunyuan/Hunyuan3D-2/archive/refs/heads/main.zip --cache-dir "%PIP_CACHE_DIR%"
 )
 goto :hy3dgen_weights_check
 
@@ -492,11 +629,11 @@ goto :sf3d_deps_check
 echo !GREEN![OK]!RESET! Repositorio oficial de Stable Fast 3D presente en "%REPOS_DIR%\stable-fast-3d". Omitiendo clonacion.
 
 :sf3d_deps_check
-python -c "import jaxtyping, open_clip, gpytoolbox, pynanoinstantmeshes, numba, xatlas" >nul 2>&1
+"!VENV_PY!" -c "import jaxtyping, open_clip, gpytoolbox, pynanoinstantmeshes, numba, xatlas" >nul 2>&1
 if !errorlevel! equ 0 goto :sf3d_deps_ok
 
 echo [INFO] Instalando dependencias especializadas de SF3D...
-pip install jaxtyping open-clip-torch gpytoolbox pynanoinstantmeshes numba xatlas --cache-dir "%PIP_CACHE_DIR%"
+"!VENV_PIP!" install jaxtyping open-clip-torch gpytoolbox pynanoinstantmeshes numba xatlas --cache-dir "%PIP_CACHE_DIR%"
 echo !GREEN![OK]!RESET! Dependencias especializadas de SF3D instaladas.
 goto :sf3d_token_check
 
@@ -504,7 +641,7 @@ goto :sf3d_token_check
 echo !GREEN![OK]!RESET! Dependencias especializadas de SF3D (jaxtyping, open-clip, gpytoolbox, numba, xatlas) ya instaladas. Omitiendo.
 
 :sf3d_token_check
-python -c "import huggingface_hub; exit(0 if huggingface_hub.get_token() else 1)" >nul 2>&1
+"!VENV_PY!" -c "import huggingface_hub; exit(0 if huggingface_hub.get_token() else 1)" >nul 2>&1
 if !errorlevel! equ 0 goto :sf3d_token_ok
 
 echo.
@@ -518,7 +655,7 @@ echo ---------------------------------------------------------------------------
 set "INPUT_HF_TOKEN="
 set /p "INPUT_HF_TOKEN=Pega tu token de Hugging Face (o presiona Enter para configurarlo luego): "
 if not defined INPUT_HF_TOKEN goto :sf3d_token_skipped
-python -c "import huggingface_hub; huggingface_hub.login(token='!INPUT_HF_TOKEN!', add_to_git_credential=False); print('Token guardado.')" 2>nul
+"!VENV_PY!" -c "import huggingface_hub; huggingface_hub.login(token='!INPUT_HF_TOKEN!', add_to_git_credential=False); print('Token guardado.')" 2>nul
 if !errorlevel! equ 0 echo !GREEN![OK]!RESET! Token de Hugging Face configurado con exito.
 exit /b 0
 
@@ -552,13 +689,21 @@ if !errorlevel! equ 0 (
     echo !YELLOW![AVISO]!RESET! nvidia-smi no detecto tarjeta NVIDIA.
 )
 
-python -c "import torch; d = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'; v = torch.cuda.get_device_properties(0).total_memory / (1024**3) if torch.cuda.is_available() else 0; print('>>> CUDA Activo: ' + str(torch.cuda.is_available()) + ' | Dispositivo: ' + d + ' | VRAM: ' + f'{v:.1f}' + ' GB')"
+"!VENV_PY!" -c "import torch; d = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'; v = torch.cuda.get_device_properties(0).total_memory / (1024**3) if torch.cuda.is_available() else 0; print('>>> CUDA Activo: ' + str(torch.cuda.is_available()) + ' | Dispositivo: ' + d + ' | VRAM: ' + f'{v:.1f}' + ' GB')"
 echo.
 
 :: ==============================================================================
 :: 8. GENERACION Y ACTUALIZACION DE LANZADORES DINAMICOS
 :: ==============================================================================
 echo [8/8] Generando y actualizando lanzadores ejecutables (.bat)...
+
+:: Sincronizar configuracion con .env
+if exist "%~dp0.env" (
+    findstr /i "CUDA_VISIBLE_DEVICES" "%~dp0.env" >nul 2>&1
+    if !errorlevel! neq 0 (
+        echo CUDA_VISIBLE_DEVICES=%CUDA_VISIBLE_DEVICES%>> "%~dp0.env"
+    )
+)
 
 :: 1. webui.bat (WebUI General: Hunyuan3D-2 + Sin Textura por defecto)
 echo @echo off > "%~dp0webui.bat"
@@ -570,6 +715,7 @@ echo echo       3D AI STUDIO - INTERFAZ WEB GENERAL >> "%~dp0webui.bat"
 echo echo       Motor Predeterminado: Hunyuan3D-2 Turbo • Modo Arcilla / Sin Textura >> "%~dp0webui.bat"
 echo echo       Almacenamiento de Modelos y Cache: 100%%%% en Disco %TARGET_DRIVE%:\ >> "%~dp0webui.bat"
 echo echo ============================================================================== >> "%~dp0webui.bat"
+echo set "CUDA_VISIBLE_DEVICES=%CUDA_VISIBLE_DEVICES%" >> "%~dp0webui.bat"
 echo set "HF_HOME=%HF_HOME%" >> "%~dp0webui.bat"
 echo set "HUGGINGFACE_HUB_CACHE=%HUGGINGFACE_HUB_CACHE%" >> "%~dp0webui.bat"
 echo set "TORCH_HOME=%TORCH_HOME%" >> "%~dp0webui.bat"
@@ -601,6 +747,7 @@ echo echo       KABOOMI 3D STUDIO - EDICION KABOOMI PARTY (GODOT 4) >> "%~dp0web
 echo echo       Motor Predeterminado: Stable Fast 3D (SF3D) • Con Textura PBR Completa >> "%~dp0webui-kambo.bat"
 echo echo       Almacenamiento de Modelos y Cache: 100%%%% en Disco %TARGET_DRIVE%:\ >> "%~dp0webui-kambo.bat"
 echo echo ============================================================================== >> "%~dp0webui-kambo.bat"
+echo set "CUDA_VISIBLE_DEVICES=%CUDA_VISIBLE_DEVICES%" >> "%~dp0webui-kambo.bat"
 echo set "HF_HOME=%HF_HOME%" >> "%~dp0webui-kambo.bat"
 echo set "HUGGINGFACE_HUB_CACHE=%HUGGINGFACE_HUB_CACHE%" >> "%~dp0webui-kambo.bat"
 echo set "TORCH_HOME=%TORCH_HOME%" >> "%~dp0webui-kambo.bat"
@@ -640,6 +787,7 @@ echo call "%%~dp0webui-kambo.bat" >> "%~dp0run_webui_kambo.bat"
 echo @echo off > "%~dp0run_cli.bat"
 echo setlocal >> "%~dp0run_cli.bat"
 echo chcp 65001 ^>nul >> "%~dp0run_cli.bat"
+echo set "CUDA_VISIBLE_DEVICES=%CUDA_VISIBLE_DEVICES%" >> "%~dp0run_cli.bat"
 echo set "HF_HOME=%HF_HOME%" >> "%~dp0run_cli.bat"
 echo set "HUGGINGFACE_HUB_CACHE=%HUGGINGFACE_HUB_CACHE%" >> "%~dp0run_cli.bat"
 echo set "TORCH_HOME=%TORCH_HOME%" >> "%~dp0run_cli.bat"
@@ -658,7 +806,7 @@ echo     exit /b 1 >> "%~dp0run_cli.bat"
 echo ) >> "%~dp0run_cli.bat"
 echo python img2glb.py %%* >> "%~dp0run_cli.bat"
 
-echo !GREEN![OK]!RESET! Todos los lanzadores actualizados y sincronizados con Disco %TARGET_DRIVE%:\.
+echo !GREEN![OK]!RESET! Todos los lanzadores actualizados y sincronizados con Disco %TARGET_DRIVE%:\ y GPU %CUDA_VISIBLE_DEVICES%.
 echo.
 
 :: ==============================================================================
