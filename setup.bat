@@ -177,45 +177,47 @@ if !errorlevel! neq 0 (
     goto :find_direct_python
 )
 
-echo [INFO] Lanzador de Windows 'py.exe' localizado. Validando entornos de 64 bits...
+echo [INFO] Lanzador de Windows 'py.exe' localizado. Buscando version compatible (Python 3.10 a 3.12 de 64 bits)...
 
 set "PY_CANDIDATE=py -3.11-64"
-!PY_CANDIDATE! -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+!PY_CANDIDATE! -c "import sys; sys.exit(0 if (sys.maxsize > 2**32 and sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12) else 1)" >nul 2>&1
 if !errorlevel! equ 0 goto :py_candidate_found
 
 set "PY_CANDIDATE=py -3.11"
-!PY_CANDIDATE! -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+!PY_CANDIDATE! -c "import sys; sys.exit(0 if (sys.maxsize > 2**32 and sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12) else 1)" >nul 2>&1
 if !errorlevel! equ 0 goto :py_candidate_found
 
 set "PY_CANDIDATE=py -3.10-64"
-!PY_CANDIDATE! -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+!PY_CANDIDATE! -c "import sys; sys.exit(0 if (sys.maxsize > 2**32 and sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12) else 1)" >nul 2>&1
 if !errorlevel! equ 0 goto :py_candidate_found
 
 set "PY_CANDIDATE=py -3.10"
-!PY_CANDIDATE! -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+!PY_CANDIDATE! -c "import sys; sys.exit(0 if (sys.maxsize > 2**32 and sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12) else 1)" >nul 2>&1
 if !errorlevel! equ 0 goto :py_candidate_found
 
 set "PY_CANDIDATE=py -3.12-64"
-!PY_CANDIDATE! -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+!PY_CANDIDATE! -c "import sys; sys.exit(0 if (sys.maxsize > 2**32 and sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12) else 1)" >nul 2>&1
 if !errorlevel! equ 0 goto :py_candidate_found
 
 set "PY_CANDIDATE=py -3.12"
-!PY_CANDIDATE! -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+!PY_CANDIDATE! -c "import sys; sys.exit(0 if (sys.maxsize > 2**32 and sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12) else 1)" >nul 2>&1
 if !errorlevel! equ 0 goto :py_candidate_found
 
 set "PY_CANDIDATE=py -3-64"
-!PY_CANDIDATE! -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+!PY_CANDIDATE! -c "import sys; sys.exit(0 if (sys.maxsize > 2**32 and sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12) else 1)" >nul 2>&1
 if !errorlevel! equ 0 goto :py_candidate_found
 
 set "PY_CANDIDATE=py -3"
-!PY_CANDIDATE! -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+!PY_CANDIDATE! -c "import sys; sys.exit(0 if (sys.maxsize > 2**32 and sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12) else 1)" >nul 2>&1
 if !errorlevel! equ 0 goto :py_candidate_found
 
 set "PY_CANDIDATE=py"
-!PY_CANDIDATE! -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+!PY_CANDIDATE! -c "import sys; sys.exit(0 if (sys.maxsize > 2**32 and sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12) else 1)" >nul 2>&1
 if !errorlevel! equ 0 goto :py_candidate_found
 
-echo !YELLOW![AVISO]!RESET! 'py.exe' esta instalado pero no detecto versiones de 64 bits. Buscando python.exe directo...
+rem Advertir al usuario si py solo tiene versiones incompatibles (como Python 3.13, 3.14 o 3.15)
+py -c "import sys; print('[AVISO] Se detecto Python ' + sys.version.split()[0] + '. PyTorch CUDA NO es compatible con versiones superiores a Python 3.12.')" 2>nul
+echo !YELLOW![AVISO]!RESET! Buscando instalacion directa de Python 3.11 / 3.10 de 64 bits en el equipo...
 goto :find_direct_python
 
 :py_candidate_found
@@ -226,8 +228,8 @@ set "PY_LAUNCHER=!PY_CANDIDATE!"
         del "!TEMP!\py_detected.txt" 2>nul
     )
 if defined PY_CMD (
-    echo !GREEN![OK]!RESET! Lanzador '!PY_LAUNCHER!' validado y seleccionado en 64 bits: "!PY_CMD!"
-    "!PY_CMD!" -c "import sys; print('     -> Version confirmada: Python ' + sys.version.split()[0] + ' 64-bit')"
+    echo !GREEN![OK]!RESET! Lanzador '!PY_LAUNCHER!' compatible seleccionado: "!PY_CMD!"
+    "!PY_CMD!" -c "import sys; print('     -> Version confirmada: Python ' + sys.version.split()[0] + ' 64-bit (Compatible con PyTorch CUDA)')"
     goto :python_found
 )
 
@@ -267,7 +269,7 @@ if not defined PY_CMD (
         if not defined PY_CMD (
             echo %%I | findstr /i "WindowsApps Inkscape" >nul
             if !errorlevel! neq 0 (
-                "%%I" -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+                "%%I" -c "import sys; sys.exit(0 if (sys.maxsize > 2**32 and sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12) else 1)" >nul 2>&1
                 if !errorlevel! equ 0 set "PY_CMD=%%I"
             )
         )
@@ -343,12 +345,12 @@ if /i "!MODELS_ROOT!"=="%~dp0AI_Models" (
 
 set "VENV_EXISTS=0"
 if exist "!VENV_DIR!\Scripts\python.exe" (
-    "!VENV_DIR!\Scripts\python.exe" -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+    "!VENV_DIR!\Scripts\python.exe" -c "import sys; sys.exit(0 if (sys.maxsize > 2**32 and sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12) else 1)" >nul 2>&1
     if !errorlevel! equ 0 (
-        echo !GREEN![OK]!RESET! Entorno virtual existente detectado y validado en 64 bits: "!VENV_DIR!"
+        echo !GREEN![OK]!RESET! Entorno virtual existente detectado y validado [Python 3.10-3.12 64-bit] en: "!VENV_DIR!"
         set "VENV_EXISTS=1"
     ) else (
-        echo !YELLOW![AVISO]!RESET! El entorno virtual previo es incompatible o de 32 bits. Recreando en 64 bits...
+        echo !YELLOW![AVISO]!RESET! El entorno virtual previo es incompatible [detectado 32-bit o Python incompatible]. Recreando...
         rmdir /s /q "!VENV_DIR!" 2>nul
     )
 )
@@ -383,14 +385,17 @@ if not exist "!VENV_PY!" (
 )
 
 echo [INFO] Validando entorno virtual en paso 2...
-"!VENV_PY!" -c "import sys; bits = 64 if sys.maxsize > 2**32 else 32; print('     -> Interprete verificado: Python ' + sys.version.split()[0] + ' ' + str(bits) + '-bit')"
+"!VENV_PY!" -c "import sys; bits = 64 if sys.maxsize > 2**32 else 32; ok = 'OK' if (sys.maxsize > 2**32 and sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12) else 'INCOMPATIBLE'; print('     -> Interprete verificado: Python ' + sys.version.split()[0] + ' ' + str(bits) + '-bit [' + ok + ']')"
 
-"!VENV_PY!" -c "import sys; sys.exit(0 if sys.maxsize > 2**32 else 1)" >nul 2>&1
+"!VENV_PY!" -c "import sys; sys.exit(0 if (sys.maxsize > 2**32 and sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12) else 1)" >nul 2>&1
 if !errorlevel! neq 0 (
-    echo !RED![ERROR FATAL EN PASO 2]!RESET!
-    echo El entorno virtual sigue siendo de 32 bits.
-    echo PyTorch con CUDA y las librerias 3D no tienen soporte para 32 bits.
-    echo Asegurate de instalar Python 3.11 de 64 bits antes de continuar.
+    echo !RED![ERROR FATAL EN PASO 2: VERSION DE PYTHON INCOMPATIBLE]!RESET!
+    "!VENV_PY!" -c "import sys; print('Tu entorno virtual esta usando Python ' + sys.version.split()[0] + '.')"
+    echo PyTorch con CUDA 12.4 NO existe para Python 3.13, 3.14 o 3.15 ni para 32 bits.
+    echo Se requiere estrictamente Python 3.11 o 3.10 de 64 bits.
+    echo.
+    echo Instala Python 3.11 de 64 bits ejecutando en CMD:
+    echo   winget install -e --id Python.Python.3.11 --architecture x64
     pause
     exit /b 1
 )
