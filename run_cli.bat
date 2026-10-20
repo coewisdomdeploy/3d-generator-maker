@@ -3,7 +3,6 @@ setlocal
 cd /d %~dp0
 chcp 65001 >nul 2>&1
 
-set CUDA_VISIBLE_DEVICES=0
 set NVIDIA_VISIBLE_DEVICES=all
 set HF_HOME=D:\AI_Models\huggingface
 set HUGGINGFACE_HUB_CACHE=D:\AI_Models\huggingface\hub

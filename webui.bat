@@ -17,8 +17,8 @@ if %errorlevel% equ 0 (
     echo.
 )
 
-:: Forzar exclusividad CUDA a la GPU NVIDIA (GPU 0)
-set CUDA_VISIBLE_DEVICES=0
+:: La GPU para la IA se elige al arrancar (gpu_select.py muestra un menu si hay 2+ tarjetas).
+:: Para fijarla sin menu: set STUDIO_GPU=0  (indice de nvidia-smi, o cpu)  o  webui.bat --gpu 1
 set NVIDIA_VISIBLE_DEVICES=all
 set HF_HOME=D:\AI_Models\huggingface
 set HUGGINGFACE_HUB_CACHE=D:\AI_Models\huggingface\hub
@@ -48,14 +48,6 @@ if exist "D:\AI_Models\venv_3dgen\Scripts\python.exe" (
     reg add "HKEY_CURRENT_USER\Software\Microsoft\DirectX\UserGpuPreferences" /v "D:\AI_Models\venv_3dgen\Scripts\python.exe" /t REG_SZ /d "GpuPreference=2;" /f >nul 2>&1
 )
 
-echo [ASIGNACION DE HARDWARE]:
-echo   - GPU 0 (NVIDIA GeForce RTX): 100%% del calculo de Inteligencia Artificial
-echo   - GPU 1 (Intel Integrada): DESACTIVADA para procesos de IA
-echo.
-
-echo [VALIDACION INICIAL DE GPU EN VIVO]:
-"%VENV_PY%" -c "import torch, time; d=torch.device('cuda:0'); print('  >> Comprobando GPU dedicada:', torch.cuda.get_device_name(0), '...'); a=torch.randn((5120,5120),device=d,dtype=torch.float16); b=torch.randn((5120,5120),device=d,dtype=torch.float16); t0=time.time(); [torch.matmul(a,b) for _ in range(120)]; torch.cuda.synchronize(); print('  [OK] GPU NVIDIA verificada al 100%% en CUDA:0')"
-echo.
-
-"%VENV_PY%" webui.py --mode general
+:: La validacion en vivo de la GPU (pulso) se hace en webui.py despues de elegir la tarjeta
+"%VENV_PY%" webui.py --mode general %*
 pause

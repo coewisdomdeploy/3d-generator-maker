@@ -64,10 +64,16 @@ def configure_environment_and_cache():
 
 configure_environment_and_cache()
 
+# Selección de GPU al usar la CLI directamente (en la WebUI ya se hizo antes de importar este módulo)
+if __name__ == "__main__":
+    from gpu_select import select_gpu
+    select_gpu()
+
 import numpy as np
 from PIL import Image
 import torch
 import trimesh
+import trimesh.smoothing
 import pygltflib
 
 # Desactivar OpenCL en OpenCV para evitar que utilice la GPU integrada Intel
@@ -85,6 +91,211 @@ if torch.cuda.is_available():
 
 DEFAULT_OUTPUT_DIR = Path("D:/AI_Models/output") if Path("D:/").exists() else Path("./outputs")
 DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ==============================================================================
+# 1. Función de Purga Estricta de Memoria VRAM (flush_vram)
+# ==============================================================================
+
+def flush_vram() -> None:
+    """
+    Purga estricta de memoria VRAM y recolección de basura para GPUs de 8 GB (RTX 4060):
+    Ejecuta gc.collect(), torch.cuda.empty_cache() y torch.cuda.ipc_collect().
+    Garantiza que ningún buffer intermedio, caché de PyTorch o residuo de tensores persista en VRAM.
+    """
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+
+def print_real_vram_status(stage_name: str = "") -> Tuple[float, float]:
+    """
+    Imprime en consola la memoria VRAM libre real reportada directamente por el driver
+    de NVIDIA mediante torch.cuda.mem_get_info().
+    """
+    if torch.cuda.is_available():
+        free_bytes, total_bytes = torch.cuda.mem_get_info(0)
+        free_mb = free_bytes / (1024 ** 2)
+        total_mb = total_bytes / (1024 ** 2)
+        used_mb = total_mb - free_mb
+        prefix = f"[{stage_name}] " if stage_name else ""
+        print(f" -> {prefix}VRAM Libre Real (NVIDIA Driver): {free_mb:.1f} MB libres de {total_mb:.1f} MB (Ocupado: {used_mb:.1f} MB)")
+        return free_mb, total_mb
+    return 0.0, 0.0
+
+
+# Variables globales de referencia a pipelines para descarga cruzada total
+_GLOBAL_SF3D_MODEL = None
+_GLOBAL_SHAPE_PIPELINE = None
+_GLOBAL_PAINT_PIPELINE = None
+
+
+def unload_sf3d() -> None:
+    """Descarga total y purga estricta de SF3D de GPU a CPU para liberar VRAM."""
+    global _GLOBAL_SF3D_MODEL
+    if _GLOBAL_SF3D_MODEL is not None:
+        print(" -> [VRAM Guard] Descargando SF3D de GPU a CPU...")
+        try:
+            if hasattr(_GLOBAL_SF3D_MODEL, "to"):
+                _GLOBAL_SF3D_MODEL.to("cpu")
+        except Exception:
+            pass
+        del _GLOBAL_SF3D_MODEL
+        _GLOBAL_SF3D_MODEL = None
+    flush_vram()
+
+
+def unload_hunyuan() -> None:
+    """Descarga total y purga estricta de pipelines Hunyuan3D de GPU a CPU para liberar VRAM."""
+    global _GLOBAL_SHAPE_PIPELINE, _GLOBAL_PAINT_PIPELINE
+    if _GLOBAL_SHAPE_PIPELINE is not None:
+        print(" -> [VRAM Guard] Descargando Hunyuan3D Shape Pipeline de GPU a CPU...")
+        try:
+            if hasattr(_GLOBAL_SHAPE_PIPELINE, "to"):
+                _GLOBAL_SHAPE_PIPELINE.to("cpu")
+        except Exception:
+            pass
+        del _GLOBAL_SHAPE_PIPELINE
+        _GLOBAL_SHAPE_PIPELINE = None
+    if _GLOBAL_PAINT_PIPELINE is not None:
+        print(" -> [VRAM Guard] Descargando Hunyuan3D Paint Pipeline de GPU a CPU...")
+        try:
+            if hasattr(_GLOBAL_PAINT_PIPELINE, "to"):
+                _GLOBAL_PAINT_PIPELINE.to("cpu")
+        except Exception:
+            pass
+        del _GLOBAL_PAINT_PIPELINE
+        _GLOBAL_PAINT_PIPELINE = None
+    flush_vram()
+
+
+def unload_all_models() -> None:
+    """Descarga total de todos los modelos residentes en GPU."""
+    unload_sf3d()
+    unload_hunyuan()
+    flush_vram()
+
+# ==============================================================================
+# Aceleradores Numéricos Numba para UV y Reproyección Frontal (0 MB VRAM)
+# ==============================================================================
+
+try:
+    from numba import njit, prange
+    _HAS_NUMBA = True
+
+    @njit(fastmath=True)
+    def _numba_rasterize_projected_buffer(
+        uvs,             # (V, 2) float32
+        faces,           # (F_active, 3) int32
+        vert_weights,    # (V,) float32 - Pesos continuos por vértice calculados en 3D
+        proj_verts,      # (V, 2) float32 [u, v]
+        vert_depth,      # (V,) float32 - Profundidad exacta (camera_dist - verts[:, 2]), menor = más cerca
+        ref_img,         # (H_ref, W_ref, 4) uint8
+        res_w,
+        res_h
+    ):
+        """
+        Rasterizador de atlas UV en CPU acelerado con Numba (0 MB VRAM, ~30-50 ms).
+        - Interpolación baricéntrica exacta de pesos por vértice (w0*vw0 + w1*vw1 + w2*vw2) para eliminar escalonamiento.
+        - Z-buffer con convención física correcta: menor profundidad = más cerca de la cámara.
+        - Muestreo bilineal exacto con interpolación de canal alfa de la ilustración 2D.
+        """
+        proj_rgb = np.zeros((res_h, res_w, 3), dtype=np.float32)
+        blend_mask = np.zeros((res_h, res_w), dtype=np.float32)
+        z_buf = np.full((res_h, res_w), 1e9, dtype=np.float32)
+
+        num_faces = faces.shape[0]
+        h_ref, w_ref = ref_img.shape[:2]
+
+        for f in range(num_faces):
+            i0, i1, i2 = faces[f, 0], faces[f, 1], faces[f, 2]
+            vw0, vw1, vw2 = vert_weights[i0], vert_weights[i1], vert_weights[i2]
+
+            # Si los tres vértices tienen peso cero, omitir el triángulo por completo
+            if vw0 <= 0.0 and vw1 <= 0.0 and vw2 <= 0.0:
+                continue
+
+            u0, v0 = uvs[i0, 0], uvs[i0, 1]
+            u1, v1 = uvs[i1, 0], uvs[i1, 1]
+            u2, v2 = uvs[i2, 0], uvs[i2, 1]
+
+            x0, y0 = u0 * res_w, (1.0 - v0) * res_h
+            x1, y1 = u1 * res_w, (1.0 - v1) * res_h
+            x2, y2 = u2 * res_w, (1.0 - v2) * res_h
+
+            min_x = max(0, int(min(x0, x1, x2)))
+            max_x = min(res_w - 1, int(max(x0, x1, x2)) + 1)
+            min_y = max(0, int(min(y0, y1, y2)))
+            max_y = min(res_h - 1, int(max(y0, y1, y2)) + 1)
+
+            denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+            if abs(denom) < 1e-9:
+                continue
+            inv_denom = 1.0 / denom
+
+            # Profundidad exacta (distancia física a la cámara): menor profundidad = más frontal
+            z0, z1, z2 = vert_depth[i0], vert_depth[i1], vert_depth[i2]
+            pu0, pv0 = proj_verts[i0, 0], proj_verts[i0, 1]
+            pu1, pv1 = proj_verts[i1, 0], proj_verts[i1, 1]
+            pu2, pv2 = proj_verts[i2, 0], proj_verts[i2, 1]
+
+            for py in range(min_y, max_y + 1):
+                for px in range(min_x, max_x + 1):
+                    p_x = px + 0.5
+                    p_y = py + 0.5
+                    w0 = ((y1 - y2) * (p_x - x2) + (x2 - x1) * (p_y - y2)) * inv_denom
+                    w1 = ((y2 - y0) * (p_x - x2) + (x0 - x2) * (p_y - y2)) * inv_denom
+                    w2 = 1.0 - w0 - w1
+
+                    if w0 >= -1e-4 and w1 >= -1e-4 and w2 >= -1e-4:
+                        pz = w0 * z0 + w1 * z1 + w2 * z2
+                        if pz < z_buf[py, px]:
+                            u_img = w0 * pu0 + w1 * pu1 + w2 * pu2
+                            v_img = w0 * pv0 + w1 * pv1 + w2 * pv2
+
+                            if 0.0 <= u_img <= 1.0 and 0.0 <= v_img <= 1.0:
+                                fx = u_img * (w_ref - 1)
+                                fy = v_img * (h_ref - 1)
+                                ix0 = int(fx)
+                                iy0 = int(fy)
+                                ix1 = min(ix0 + 1, w_ref - 1)
+                                iy1 = min(iy0 + 1, h_ref - 1)
+                                dx = fx - ix0
+                                dy = fy - iy0
+
+                                a00 = float(ref_img[iy0, ix0, 3])
+                                a10 = float(ref_img[iy0, ix1, 3])
+                                a01 = float(ref_img[iy0, ix1, 3])
+                                a11 = float(ref_img[iy1, ix1, 3])
+                                alpha = (1.0 - dy) * ((1.0 - dx) * a00 + dx * a10) + dy * ((1.0 - dx) * a01 + dx * a11)
+                                alpha_norm = alpha / 255.0
+
+                                # Interpolación baricéntrica suave de pesos de vértices calculados en 3D
+                                w_interp = w0 * vw0 + w1 * vw1 + w2 * vw2
+                                eff_w = w_interp * alpha_norm
+                                if eff_w > 0.0:
+                                    z_buf[py, px] = pz
+                                    blend_mask[py, px] = eff_w
+
+                                    for c in range(3):
+                                        c00 = float(ref_img[iy0, ix0, c])
+                                        c10 = float(ref_img[iy0, ix1, c])
+                                        c01 = float(ref_img[iy1, ix0, c])
+                                        c11 = float(ref_img[iy1, ix1, c])
+                                        orig_c = (1.0 - dy) * ((1.0 - dx) * c00 + dx * c10) + dy * ((1.0 - dx) * c01 + dx * c11)
+                                        proj_rgb[py, px, c] = orig_c
+
+        return proj_rgb, blend_mask
+
+except Exception:
+    _HAS_NUMBA = False
+    _numba_rasterize_projected_buffer = None
+
+_numba_rasterize = None
+
 
 
 # ==============================================================================
@@ -238,9 +449,393 @@ def resolve_target_path(output_path_str: str) -> Path:
 
 
 # ==============================================================================
-# 2. Preprocesamiento y Eliminación de Fondo (rembg)
+# 2. Preprocesamiento, Silueta, Inpainting y Frontal Projection Blending
 # ==============================================================================
 
+def inpaint_edge_padding(
+    image: Union[str, Path, Image.Image, np.ndarray],
+    dilation_pixels: int = 10,
+    alpha_threshold: int = 25,
+    method: str = "telea"
+) -> Image.Image:
+    """
+    Técnica 1: Inpainting y Extensión de Borde 2D (Anti-Halos y Anti-Color Bleeding).
+    Toma el canal de color RGB y propaga ("estira") los colores del contorno hacia el área
+    transparente exterior (6 a 12 píxeles, por defecto 10px) usando cv2.inpaint
+    (algoritmo Telea) o dilatación de bordes mediante Scipy distance_transform_edt.
+    
+    Evita que el recorte de la máscara alfa o el antialiasing introduzcan halos oscuros
+    o grises en bordes finos como cuernos, pies, extremidades y orejas al proyectarse en 3D.
+    """
+    if isinstance(image, (str, Path)):
+        img = Image.open(image).convert("RGBA")
+        arr = np.array(img)
+    elif isinstance(image, Image.Image):
+        arr = np.array(image.convert("RGBA"))
+    else:
+        arr = np.array(image)
+
+    if arr.ndim != 3 or arr.shape[2] != 4:
+        raise ValueError("La imagen para inpaint_edge_padding debe ser RGBA de 4 canales.")
+
+    rgb = arr[:, :, :3].copy()
+    alpha = arr[:, :, 3].copy()
+
+    clean_alpha = np.where(alpha < alpha_threshold, 0, alpha).astype(np.uint8)
+    fg_mask = (clean_alpha > 0).astype(np.uint8) * 255
+
+    if fg_mask.sum() == 0 or fg_mask.sum() == fg_mask.size * 255:
+        return Image.fromarray(arr, "RGBA")
+
+    pad_px = max(1, min(int(dilation_pixels), 32))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    dilated_mask = cv2.dilate(fg_mask, kernel, iterations=pad_px)
+    inpaint_band = cv2.subtract(dilated_mask, fg_mask)
+
+    inpainted_rgb = rgb.copy()
+    inpaint_success = False
+
+    if method.lower() == "telea":
+        try:
+            inpainted_rgb = cv2.inpaint(
+                rgb,
+                inpaint_band,
+                inpaintRadius=3,
+                flags=cv2.INPAINT_TELEA
+            )
+            inpaint_success = True
+        except Exception as e_inpaint:
+            print(f" -> [Aviso Telea] Falló cv2.inpaint ({e_inpaint}). Usando dilatación Scipy...")
+
+    if not inpaint_success:
+        try:
+            from scipy import ndimage
+            dist, (idx_y, idx_x) = ndimage.distance_transform_edt(
+                fg_mask == 0, return_distances=True, return_indices=True
+            )
+            bleed_mask = (dist > 0) & (dist <= pad_px)
+            inpainted_rgb[bleed_mask] = rgb[idx_y[bleed_mask], idx_x[bleed_mask]]
+            inpaint_success = True
+        except Exception:
+            pass
+
+    # Los píxeles transparentes más allá de la banda de padding se fijan en gris neutro (128)
+    inpainted_rgb[dilated_mask == 0] = 128
+
+    result_arr = np.dstack([inpainted_rgb, clean_alpha])
+    return Image.fromarray(result_arr, "RGBA")
+
+
+def preprocess_image_for_sf3d(
+    image: Union[str, Path, Image.Image],
+    foreground_ratio: float = 0.82,
+    edge_dilation_pixels: int = 10,
+    target_resolution: int = 1024,
+    alpha_threshold: int = 25
+) -> Image.Image:
+    """
+    Preprocesamiento especializado para Stable Fast 3D (SF3D) anti-color bleeding y anti-halos:
+    1. Asegura que los píxeles transparentes no contengan negro (0,0,0) ni manchas oscuras de fondo.
+    2. Aplica Inpainting y Extensión de Borde 2D (Telea / Scipy de 10px hacia afuera) extendiendo el color
+       del contorno hacia la zona transparente antes de entrar al remuestreo o proyección UV.
+    3. Rellena el fondo exterior lejano con gris neutro (128, 128, 128) con alfa 0.
+    4. Ajusta el foreground_ratio exactamente a 0.82 (fijo) para garantizar que cuernos, colas,
+       orejas y extremidades tengan margen suficiente sin colisionar con los límites del volumen 3D.
+    5. Redimensiona preservando los canales RGB y Alfa por separado con filtro Lanczos.
+    """
+    if isinstance(image, (str, Path)):
+        img = Image.open(image).convert("RGBA")
+    else:
+        img = image.convert("RGBA")
+
+    arr = np.array(img)
+    alpha = arr[:, :, 3]
+
+    clean_alpha = np.where(alpha < alpha_threshold, 0, alpha).astype(np.uint8)
+    non_zero = np.argwhere(clean_alpha > 0)
+    if non_zero.size == 0:
+        return img
+
+    y0, x0 = non_zero.min(axis=0)
+    y1, x1 = non_zero.max(axis=0) + 1
+
+    cropped_arr = arr[y0:y1, x0:x1].copy()
+    ch, cw = cropped_arr.shape[:2]
+    max_dim = max(ch, cw)
+
+    # Encuadre óptimo centrado con foreground_ratio = 0.82 fijo
+    canvas_dim = int(np.ceil(max_dim / float(foreground_ratio)))
+    canvas_arr = np.zeros((canvas_dim, canvas_dim, 4), dtype=np.uint8)
+    # Fondo gris neutro en píxeles transparentes (evita negro 0,0,0)
+    canvas_arr[:, :, :3] = 128
+    canvas_arr[:, :, 3] = 0
+
+    off_y = (canvas_dim - ch) // 2
+    off_x = (canvas_dim - cw) // 2
+    canvas_arr[off_y:off_y + ch, off_x:off_x + cw] = cropped_arr
+
+    # Aplicar Inpainting y Extensión de Bordes 2D (10px hacia afuera)
+    padded_img = inpaint_edge_padding(
+        canvas_arr,
+        dilation_pixels=edge_dilation_pixels,
+        alpha_threshold=alpha_threshold,
+        method="telea"
+    )
+    result_arr = np.array(padded_img)
+
+    if target_resolution and (result_arr.shape[1] != target_resolution or result_arr.shape[0] != target_resolution):
+        # Redimensionar RGB y Alfa por separado para evitar que Pillow fuerce RGB a (0,0,0) en pixeles transparentes
+        rgb_part = Image.fromarray(result_arr[:, :, :3], "RGB").resize((target_resolution, target_resolution), Image.Resampling.LANCZOS)
+        alpha_part = Image.fromarray(result_arr[:, :, 3], "L").resize((target_resolution, target_resolution), Image.Resampling.LANCZOS)
+        res_img = Image.merge("RGBA", (*rgb_part.split(), alpha_part))
+    else:
+        res_img = Image.fromarray(result_arr, "RGBA")
+
+    return res_img
+
+
+def apply_taubin_smoothing(
+    mesh: trimesh.Trimesh,
+    lamb: float = 0.53,
+    nu: float = -0.55,
+    iterations: int = 5
+) -> trimesh.Trimesh:
+    """
+    Técnica 3: Filtro de Suavizado Geométrico Taubin (Anti-Plastilina / Anti-Grumos).
+    Aplica suavizado Taubin no restrictivo de curvatura (lamb=0.53, nu=-0.55, 3-5 iteraciones)
+    que elimina el ruido de alta frecuencia, picos y deformidades de Marching Cubes/DMTet
+    y decimation sin encoger el volumen ni perder definición en curvas anatómicas.
+    Fuerza el recálculo de normales suaves de vértices y caras.
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return mesh
+
+    print(f" -> [Taubin Smoothing] Suavizando geometría ({len(mesh.faces):,} caras, lamb={lamb}, nu={nu}, {iterations} iters)...")
+    try:
+        smoothed = trimesh.smoothing.filter_taubin(
+            mesh,
+            lamb=float(lamb),
+            nu=float(nu),
+            iterations=int(iterations)
+        )
+        smoothed.fix_normals()
+        _ = smoothed.vertex_normals
+        _ = smoothed.face_normals
+        return smoothed
+    except Exception as e_taubin:
+        print(f" -> [Aviso Taubin Smoothing] {e_taubin}. Recalculando normales estándar...")
+        try:
+            mesh.fix_normals()
+            _ = mesh.vertex_normals
+            _ = mesh.face_normals
+        except Exception:
+            pass
+        return mesh
+def blend_frontal_projection_texture(
+    mesh: trimesh.Trimesh,
+    highres_image: Union[str, Path, Image.Image],
+    blend_start: float = 0.50,
+    blend_full: float = 0.80,
+    camera_distance: float = 1.6,
+    fovy_deg: float = 40.0,
+    foreground_ratio: float = 0.82,
+    blur_sigma: float = 2.5,
+    feather_kernel_size: int = 15,
+    enable_raycast_occlusion: bool = True
+) -> trimesh.Trimesh:
+    """
+    Técnica 2: Proyección Frontal de Alta Resolución con Interpolación Baricéntrica 3D,
+    Oclusión por Distancia de Rayo y Dilatación Continua de Costuras UV.
+    1. Pesos Continuos por Vértice e Interpolación Baricéntrica (Fix Dientes de Sierra):
+       - Calcula el ángulo y smoothstep en cada vértice con suavizado Laplaciano en el grafo 3D.
+       - La transición sobre la superficie es suave C1 y sin escalonamiento facetado.
+    2. Corrección del Z-Buffer (Fix Inversión de Profundidad):
+       - vert_depth = camera_dist - verts[:, 2]. Menor valor = más cerca de la cámara.
+    3. Raycasting con Umbral Seguro de Distancia (Fix Huecos Falsos en Pliegues y Costuras UV):
+       - Calcula la distancia analítica al impacto e ignora colisiones a distancia menor a 0.03 * escala.
+    4. Dilatación Simultánea de Color y Blend Mask (Fix Seam Bleeding en Costuras UV):
+       - Dilata tanto proj_rgb como blend_mask hacia afuera de las islas UV ANTES del Gaussian Blur.
+       - Las costuras UV mantienen peso 1.0 sin sangrar contra el fondo vacío 0.0.
+    """
+    if mesh is None or not hasattr(mesh, "visual") or mesh.visual is None:
+        return mesh
+    mat = getattr(mesh.visual, "material", None)
+    if mat is None or getattr(mat, "baseColorTexture", None) is None:
+        return mesh
+
+    print(f" -> [Frontal Projection] Iniciando reproyección 2D (Vértices 3D, Culling dot > {blend_start}, Raycast={enable_raycast_occlusion})...")
+    start_t = time.time()
+
+    cur_tex = mat.baseColorTexture.convert("RGB")
+    ai_tex_np = np.array(cur_tex, dtype=np.float32)
+    res_h, res_w = ai_tex_np.shape[:2]
+
+    if isinstance(highres_image, (str, Path)):
+        ref_pil = Image.open(highres_image).convert("RGBA")
+    else:
+        ref_pil = highres_image.convert("RGBA")
+
+    target_res = max(res_w, ref_pil.width, ref_pil.height)
+    ref_prep = preprocess_image_for_sf3d(
+        ref_pil,
+        foreground_ratio=foreground_ratio,
+        edge_dilation_pixels=10,
+        target_resolution=target_res
+    )
+    ref_arr = np.array(ref_prep, dtype=np.uint8)
+
+    # 1. Proyección perspectiva de los vértices a coordenadas normalizadas [0, 1] y cálculo de profundidad real
+    verts = mesh.vertices.astype(np.float32)
+    dist = float(camera_distance)
+    tan_half = float(np.tan(np.deg2rad(fovy_deg) / 2.0))
+
+    # Fix 3: Profundidad exacta desde la cámara (menor valor = más cerca de la cámara)
+    vert_depth = (dist - verts[:, 2]).astype(np.float32)
+    z_dist = np.maximum(vert_depth, 0.05)
+
+    x_proj = verts[:, 0] / (z_dist * tan_half)
+    y_proj = verts[:, 1] / (z_dist * tan_half)
+    u_proj = 0.5 + 0.5 * x_proj
+    v_proj = 0.5 - 0.5 * y_proj
+    proj_verts = np.column_stack([u_proj, v_proj]).astype(np.float32)
+
+    # 2. Fix 2: Backface Culling y Transición Soft-Threshold Calculada por VÉRTICE en 3D
+    mesh.fix_normals()
+    vn = mesh.vertex_normals.astype(np.float32)
+    cam_pos = np.array([0.0, 0.0, dist], dtype=np.float32)
+
+    dirs_v = cam_pos - verts
+    dist_to_cam = np.linalg.norm(dirs_v, axis=1, keepdims=True)
+    dirs_v /= np.maximum(dist_to_cam, 1e-6)
+    dot_v = np.sum(vn * dirs_v, axis=1)
+
+    # Smoothstep cúbico por vértice entre blend_start (0.50) y blend_full (0.80)
+    t = np.clip((dot_v - float(blend_start)) / (float(blend_full) - float(blend_start)), 0.0, 1.0)
+    vert_weights = t * t * (3.0 - 2.0 * t)
+
+    # 3. Fix 4: Oclusión por Raycasting con Umbral Seguro de Distancia (Previene falsos positivos en costuras y pliegues)
+    if enable_raycast_occlusion and hasattr(mesh, "ray"):
+        try:
+            cand_v = np.where(vert_weights > 0.0)[0]
+            if len(cand_v) > 0:
+                cand_pos = verts[cand_v]
+                cand_normals = vn[cand_v]
+                ray_origins = cand_pos + cand_normals * 1e-4
+                ray_dirs = cam_pos - ray_origins
+                dist_cand = np.linalg.norm(ray_dirs, axis=1)
+                ray_dirs /= np.maximum(dist_cand[:, None], 1e-6)
+
+                hits = mesh.ray.intersects_first(
+                    ray_origins.astype(np.float64),
+                    ray_dirs.astype(np.float64)
+                )
+                hit_mask = (hits != -1)
+                if np.any(hit_mask):
+                    hit_sub_idx = np.where(hit_mask)[0]
+                    # Umbral seguro basado en la escala del objeto 3D
+                    min_occlusion_dist = 0.03 * float(mesh.scale)
+
+                    # Distancia analítica exacta a la cara intersectada
+                    tri_v0 = verts[mesh.faces[hits[hit_sub_idx], 0]]
+                    tri_norm = mesh.face_normals[hits[hit_sub_idx]]
+                    denom = np.sum(ray_dirs[hit_sub_idx] * tri_norm, axis=1)
+                    denom = np.where(np.abs(denom) < 1e-6, 1e-6, denom)
+                    t_hit = np.sum((tri_v0 - ray_origins[hit_sub_idx]) * tri_norm, axis=1) / denom
+
+                    # Solo descartar si la colisión está claramente separada (oclusión real por otro miembro)
+                    real_occlusion = (t_hit >= min_occlusion_dist) & (t_hit < dist_cand[hit_sub_idx] - 1e-3)
+                    occluded_verts = cand_v[hit_sub_idx[real_occlusion]]
+                    vert_weights[occluded_verts] = 0.0
+
+                    occluded_count = len(occluded_verts)
+                    if occluded_count > 0:
+                        print(f" -> [Raycasting Occlusion] Se protegieron {occluded_count:,} vértices con oclusión real frontal.")
+        except Exception as e_ray:
+            print(f" -> [Aviso Raycasting] Error en cálculo de visibilidad ({e_ray}). Continuando con culling por normales.")
+
+    # 4. Fix 2 & 4: Suavizado Laplaciano de Pesos en el Grafo de Adyacencia 3D
+    # Elimina completamente los saltos dentados y cicatriza posibles huecos aislados de raycast
+    try:
+        import scipy.sparse as sp
+        edges = mesh.edges_unique
+        v_count = len(verts)
+        adj_mat = sp.csr_matrix(
+            (np.ones(len(edges), dtype=np.float32), (edges[:, 0], edges[:, 1])),
+            shape=(v_count, v_count)
+        )
+        adj_mat = adj_mat + adj_mat.T
+        deg = np.array(adj_mat.sum(axis=1)).flatten()
+        deg[deg == 0] = 1.0
+        inv_deg = sp.diags(1.0 / deg)
+        norm_adj = inv_deg.dot(adj_mat)
+
+        for _ in range(3):
+            vert_weights = 0.5 * vert_weights + 0.5 * norm_adj.dot(vert_weights)
+    except Exception as e_smooth:
+        print(f" -> [Aviso Laplacian] {e_smooth}. Omitiendo suavizado Laplaciano en grafo 3D.")
+
+    # Filtrar caras activas: aquellas que tengan al menos 1 vértice con peso mayor a cero
+    faces = mesh.faces.astype(np.int32)
+    active_mask = (vert_weights[faces[:, 0]] > 0.0) | (vert_weights[faces[:, 1]] > 0.0) | (vert_weights[faces[:, 2]] > 0.0)
+    if not np.any(active_mask):
+        print(" -> [Frontal Projection] Ninguna cara activa tras oclusión. Conservando textura IA nativa.")
+        return mesh
+
+    active_faces = faces[active_mask]
+    uvs = mesh.visual.uv.astype(np.float32)
+
+    # 5. Rasterización del Mapa UV con Pesos Interpolados Baricéntricamente
+    try:
+        if globals().get("_HAS_NUMBA", False) and _numba_rasterize_projected_buffer is not None:
+            proj_rgb, blend_mask = _numba_rasterize_projected_buffer(
+                uvs,
+                active_faces,
+                vert_weights,
+                proj_verts,
+                vert_depth,
+                ref_arr,
+                res_w,
+                res_h
+            )
+        else:
+            proj_rgb = np.zeros((res_h, res_w, 3), dtype=np.float32)
+            blend_mask = np.zeros((res_h, res_w), dtype=np.float32)
+
+        # 6. Fix 1: Dilatación Simultánea de Color Y Blend Mask hacia Afuera de las Islas UV
+        # Al dilatar blend_mask replicando el valor de frontera antes del blur, los píxeles adyacentes
+        # a las costuras UV mantienen 1.0 en todo su vecindario y NUNCA caen a ~0.5.
+        known_mask = (blend_mask > 0.001).astype(np.uint8)
+        if np.any(known_mask):
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            dilated_rgb = proj_rgb.copy()
+            dilated_mask = blend_mask.copy()
+            for _ in range(5):
+                expanded = cv2.dilate(known_mask, kernel)
+                edge = (expanded > 0) & (known_mask == 0)
+                for c in range(3):
+                    dil_c = cv2.dilate(dilated_rgb[:, :, c], kernel)
+                    dilated_rgb[edge, c] = dil_c[edge]
+                dil_m = cv2.dilate(dilated_mask, kernel)
+                dilated_mask[edge] = dil_m[edge]
+                known_mask = expanded
+
+            # 7. Feathering Progresivo: Desenfoque Gaussiano sobre la máscara ya dilatada
+            ksize = int(feather_kernel_size) if int(feather_kernel_size) % 2 == 1 else int(feather_kernel_size) + 1
+            blurred_mask = cv2.GaussianBlur(dilated_mask, (ksize, ksize), float(blur_sigma))
+            blurred_mask_3d = np.clip(blurred_mask[:, :, None], 0.0, 1.0)
+
+            # 8. Composición final suave (Alpha Blend entre ilustración 2D y textura IA)
+            final_tex = (1.0 - blurred_mask_3d) * ai_tex_np + blurred_mask_3d * dilated_rgb
+            final_tex = np.clip(final_tex, 0.0, 255.0).astype(np.uint8)
+
+            blended_pil = Image.fromarray(final_tex, "RGB")
+            blended_pil.format = "PNG"
+            mat.baseColorTexture = blended_pil
+            print(f" -> [Frontal Projection Blending] Mezcla exitosa en {time.time() - start_t:.3f}s. Costuras UV sin sangrado, transiciones continuas.")
+    except Exception as e_blend:
+        print(f" -> [Aviso Frontal Projection] Error en reproyección UV ({e_blend}). Se conserva textura horneada.")
+
+    return mesh
 def preprocess_and_remove_background(
     input_image_path: Union[str, Path, Image.Image],
     padding_ratio: float = 0.12,
@@ -270,12 +865,11 @@ def preprocess_and_remove_background(
 
     if not has_transparency or force_rembg:
         try:
-            from rembg import remove
-            print(" -> Ejecutando rembg (U2-Net / ONNX) para extraer silueta limpia...")
-            if session is not None:
-                img = remove(img, session=session)
-            else:
-                img = remove(img)
+            from rembg import remove, new_session
+            print(" -> Ejecutando rembg (U2-Net / ONNX en CPU) para extraer silueta limpia (0 MB VRAM)...")
+            if session is None:
+                session = new_session("u2net", providers=['CPUExecutionProvider'])
+            img = remove(img, session=session)
         except Exception as e:
             print(f" -> [Aviso] Error al llamar a rembg directo ({e}). Intentando hy3dgen BackgroundRemover...")
             try:
@@ -415,6 +1009,97 @@ def clean_mesh_floating_artifacts(
         print(f" -> [Aviso Limpieza 3D] Error al filtrar componentes ({e}). Se conserva malla original.")
         return mesh
 
+def inpaint_uv_atlas_texture(
+    mesh: trimesh.Trimesh,
+    dilation_radius: int = 48
+) -> trimesh.Trimesh:
+    """
+    Detecta los píxeles vacíos/negros de fondo del atlas UV y los rellena mediante
+    dilatación morfológica amplia e inpainting de color continuo.
+    Garantiza que ningún triángulo simplificado por decimation o filtrado de mipmaps
+    en Godot 4 muestree fondo negro u oscuro en los bordes de las costuras UV.
+    """
+    if not hasattr(mesh, "visual") or mesh.visual is None:
+        return mesh
+    
+    mat = getattr(mesh.visual, "material", None)
+    if mat is None:
+        return mesh
+
+    tex_img = getattr(mat, "baseColorTexture", None)
+    if tex_img is None:
+        tex_img = getattr(mat, "image", None)
+    if tex_img is None or not isinstance(tex_img, Image.Image):
+        return mesh
+
+    try:
+        orig_img = tex_img.convert("RGB")
+        img_np = np.array(orig_img, dtype=np.uint8)
+        h, w = img_np.shape[:2]
+
+        # 1. Píxeles que contienen color válido (no fondo negro o casi negro)
+        valid_color = np.any(img_np > 5, axis=-1)
+
+        # 2. Si la malla tiene UVs válidos, rasterizar triángulos para proteger detalles oscuros del modelo
+        if hasattr(mesh.visual, "uv") and mesh.visual.uv is not None and len(mesh.visual.uv) > 0 and len(mesh.faces) > 0:
+            uvs = mesh.visual.uv
+            faces = mesh.faces
+            geom_mask = np.zeros((h, w), dtype=np.uint8)
+            u_px = np.clip(uvs[:, 0], 0.0, 1.0) * (w - 1)
+            v_px = np.clip(1.0 - uvs[:, 1], 0.0, 1.0) * (h - 1)
+            pts = np.zeros((len(faces), 3, 2), dtype=np.int32)
+            pts[:, 0, 0] = u_px[faces[:, 0]]
+            pts[:, 0, 1] = v_px[faces[:, 0]]
+            pts[:, 1, 0] = u_px[faces[:, 1]]
+            pts[:, 1, 1] = v_px[faces[:, 1]]
+            pts[:, 2, 0] = u_px[faces[:, 2]]
+            pts[:, 2, 1] = v_px[faces[:, 2]]
+            cv2.fillPoly(geom_mask, pts, 255)
+            valid_mask = (geom_mask > 0) | valid_color
+        else:
+            valid_mask = valid_color
+
+        valid_count = np.count_nonzero(valid_mask)
+        if valid_count == 0 or valid_count == h * w:
+            return mesh
+
+        # 3. Dilatación morfológica en capas (push-pull) desde los bordes de las islas UV
+        work_img = img_np.copy()
+        current_mask = valid_mask.astype(np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        
+        num_steps = max(12, min(dilation_radius // 2, 32))
+        for _ in range(num_steps):
+            dilated_mask = cv2.dilate(current_mask, kernel, iterations=1)
+            new_pixels = (dilated_mask > 0) & (current_mask == 0)
+            if not np.any(new_pixels):
+                break
+            dilated_img = cv2.dilate(work_img, kernel, iterations=1)
+            work_img[new_pixels] = dilated_img[new_pixels]
+            current_mask = dilated_mask
+
+        # 4. Inpainting / Difusión de fondo para el espacio vacío restante (elimina 100% de fondo negro para mipmaps)
+        empty_pixels = (current_mask == 0)
+        if np.any(empty_pixels):
+            small_w, small_h = max(32, w // 16), max(32, h // 16)
+            bg_low = cv2.resize(work_img, (small_w, small_h), interpolation=cv2.INTER_AREA)
+            bg_smooth = cv2.resize(bg_low, (w, h), interpolation=cv2.INTER_LINEAR)
+            work_img[empty_pixels] = bg_smooth[empty_pixels]
+
+        # Actualizar la textura base en el material
+        filled_pil = Image.fromarray(work_img, mode="RGB")
+        filled_pil.format = "JPEG"
+        mat.baseColorTexture = filled_pil
+        if hasattr(mat, "image"):
+            mat.image = filled_pil
+
+        print(f" -> [Inpainting Atlas UV] Atlas UV protegido con {num_steps} iteraciones de dilatación morfológica (anti-bleeding y anti-seams).")
+        return mesh
+    except Exception as e_inp:
+        print(f" -> [Aviso Inpainting UV] Error en dilatación UV ({e_inp}). Se conserva textura original.")
+        return mesh
+
+
 def decimate_mesh_preserving_texture(
     mesh: trimesh.Trimesh,
     target_faces: int = 4000
@@ -422,53 +1107,64 @@ def decimate_mesh_preserving_texture(
     """
     Decima una malla 3D simplificando la topología al objetivo de caras mientras preserva
     al 100% las coordenadas UV, los atlas de textura PBR (albedo, normales) y el material original.
+    Utiliza meshing_decimation_quadric_edge_collapse_with_texture de PyMeshLab blindando las costuras
+    con boundaryweight=100.0 y extratcoordw=50.0 para evitar distorsión o colapso de bordes UV.
     """
     current_faces = len(mesh.faces)
     if target_faces is None or target_faces <= 0 or current_faces <= target_faces:
+        print(f"\n[Paso C/D Textura] Malla con {current_faces:,} caras (dentro del objetivo <= {target_faces if target_faces else 'HD':,} caras). Conservando topología original.")
         return mesh
 
     print(f"\n[Paso C/D Textura] Simplificando malla PBR con textura: {current_faces:,} caras -> {target_faces:,} caras...")
     start_t = time.time()
 
+    # 0. Blindar el atlas UV con inpainting y dilatación morfológica antes de exportar a OBJ para PyMeshLab
+    mesh = inpaint_uv_atlas_texture(mesh, dilation_radius=48)
+
     import tempfile
     try:
         import pymeshlab
         with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_glb = Path(tmpdir) / "mesh_for_decimation.glb"
-            mesh.export(str(tmp_glb), file_type="glb")
+            tmp_obj = Path(tmpdir) / "mesh_in.obj"
+            tmp_out_obj = Path(tmpdir) / "mesh_out.obj"
+            mesh.export(str(tmp_obj), file_type="obj")
 
             ms = pymeshlab.MeshSet()
-            ms.load_new_mesh(str(tmp_glb))
+            ms.load_new_mesh(str(tmp_obj))
             ms.meshing_decimation_quadric_edge_collapse_with_texture(
                 targetfacenum=int(target_faces),
-                preservenormal=True
+                qualitythr=0.5,
+                preserveboundary=True,
+                boundaryweight=100.0,
+                preservenormal=True,
+                extratcoordw=50.0,
+                planarquadric=True
             )
-            m = ms.current_mesh()
-            v = m.vertex_matrix()
-            f = m.face_matrix()
-            uvs = m.wedge_tex_coord_matrix()
+            ms.save_current_mesh(str(tmp_out_obj))
 
-            unrolled_v = v[f.flatten()]
-            unrolled_uv = uvs
-            combo = np.hstack([unrolled_v, unrolled_uv])
-            _, u_idx, inv = np.unique(combo, axis=0, return_index=True, return_inverse=True)
+            loaded = trimesh.load(str(tmp_out_obj), process=False)
+            if isinstance(loaded, trimesh.Scene):
+                geoms = list(loaded.geometry.values())
+                decimated_mesh = geoms[0] if len(geoms) == 1 else trimesh.util.concatenate(geoms)
+            else:
+                decimated_mesh = loaded
 
             orig_mat = getattr(mesh.visual, "material", None)
-            decimated_mesh = trimesh.Trimesh(
-                vertices=unrolled_v[u_idx],
-                faces=inv.reshape(f.shape),
-                visual=trimesh.visual.texture.TextureVisuals(
-                    uv=unrolled_uv[u_idx],
-                    material=orig_mat
-                ),
-                process=False
-            )
+            if orig_mat is not None:
+                decimated_mesh.visual.material = orig_mat
+
+            if hasattr(decimated_mesh.visual, "material") and decimated_mesh.visual.material is not None:
+                decimated_mesh.visual.material.metallicFactor = 0.0
+                decimated_mesh.visual.material.roughnessFactor = 0.90
+                decimated_mesh.visual.material.doubleSided = True
+
             reduction = (1.0 - (len(decimated_mesh.faces) / current_faces)) * 100.0
             print(f" -> [PyMeshLab Textura] Éxito: {len(decimated_mesh.faces):,} caras ({reduction:.1f}% reducción), {len(decimated_mesh.vertices):,} vértices en {time.time() - start_t:.2f}s")
             return decimated_mesh
     except Exception as e:
-        print(f" -> [Aviso Decimación Textura] No se pudo decimar con textura ({e}). Se conserva malla original.")
+        print(f" -> [Aviso Decimación Textura] No se pudo decimar con textura ({e}). Conservando malla actual...")
         return mesh
+
 
 def decimate_mesh_to_target_faces(
     mesh: trimesh.Trimesh,
@@ -478,22 +1174,28 @@ def decimate_mesh_to_target_faces(
     Paso C: Simplifica la malla al número exacto de caras solicitado.
     Utiliza Decimación por Colapso de Bordes Cuádricos (QEM) para preservar
     rasgos, silueta y bordes nítidos ideales para Godot 4 en móviles.
-    Si target_faces <= 0 o None, omite la decimación y conserva la malla HD completa al 100%.
+    Si target_faces <= 0 o None, omite la decimación y conserva la malla HD completa.
+    NOTA: Se eliminó el Taubin Smoothing duplicado interno para evitar correr 5 iters + 5 iters.
     """
     current_faces = len(mesh.faces)
     if target_faces is None or target_faces <= 0:
         print(f"\n[Paso C/D] Conservando Malla HD Original Completa ({current_faces:,} caras sin comprimir).")
         return mesh
 
-    has_texture = hasattr(mesh.visual, "material") and getattr(mesh.visual.material, "baseColorTexture", None) is not None
-    if has_texture:
+    # Si la malla tiene textura o coordenadas UV, enrutar obligatoriamente a decimate_mesh_preserving_texture
+    has_uv = hasattr(mesh.visual, "uv") and mesh.visual.uv is not None and len(mesh.visual.uv) > 0
+    has_texture = hasattr(mesh.visual, "material") and (
+        getattr(mesh.visual.material, "baseColorTexture", None) is not None or
+        getattr(mesh.visual.material, "image", None) is not None
+    )
+    if has_uv or has_texture:
         return decimate_mesh_preserving_texture(mesh, target_faces=target_faces)
 
     print(f"\n[Paso C/D] Simplificando malla: {current_faces:,} caras -> {target_faces:,} caras objetivo...")
     start_t = time.time()
 
     if current_faces <= target_faces:
-        print(f" -> La malla ya tiene menos caras que el objetivo ({current_faces} <= {target_faces}). Sin cambios.")
+        print(f" -> La malla ya tiene menos caras que el objetivo ({current_faces} <= {target_faces}). Conservando geometría...")
         return mesh
 
     # Intento 1: PyMeshLab (Algoritmo de Garland-Heckbert de grado industrial)
@@ -637,13 +1339,19 @@ try:
 except Exception:
     pass
 
+try:
+    from hy3dgen.shapegen import Hunyuan3DShapePipeline
+except ImportError:
+    from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline as Hunyuan3DShapePipeline
+
 _GLOBAL_SHAPE_PIPELINE = None
 
 class Hunyuan3DGenerator:
     """
-    Motor integral de generación de modelos 3D con perfiles adaptativos de hardware.
-    Gestiona la carga en fp16 de Hunyuan3D-DiT-v2-0-Turbo y Hunyuan3D-Paint-v2-0
-    con optimizaciones específicas para 8GB, 12GB, 16GB+ o CPU.
+    Motor integral de generación de modelos 3D secuencial en 2 etapas:
+    Etapa 1: Geometría con Hunyuan3D-DiT (Hunyuan3DShapePipeline) -> Decimación previa + Taubin -> Purga total VRAM
+    Etapa 2: Texturizado Nativo Multivista con Hunyuan3D-Paint en modo Low-VRAM (1024x1024) -> Purga total VRAM
+    Garantiza que ambos pipelines nunca coexistan en VRAM para estabilidad total en GPUs de 8 GB (RTX 4060).
     """
     def __init__(
         self,
@@ -681,18 +1389,15 @@ class Hunyuan3DGenerator:
         if "cuda" in str(self.device):
             gpu_name = torch.cuda.get_device_name(0)
             vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-            print(f"[Hunyuan3D] GPU: {gpu_name} ({vram_gb:.1f} GB VRAM) -> Low VRAM: {'Activado (Optimizado 8GB)' if self.low_vram_mode else 'Desactivado (Residente en VRAM)'}")
+            print(f"[Hunyuan3D] GPU: {gpu_name} ({vram_gb:.1f} GB VRAM) -> Pipeline Secuencial 2 Etapas (Low-VRAM 8GB Activo)")
             
             # Ajustes de aceleración CUDA
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
 
     def _clean_vram(self):
-        """Libera VRAM y recolecta basura para evitar fragmentación o desbordamiento en memoria compartida."""
-        gc.collect()
-        if "cuda" in str(self.device):
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
+        """Purga estricta de VRAM delegada a flush_vram()."""
+        flush_vram()
 
     def generate_shape(
         self,
@@ -700,40 +1405,97 @@ class Hunyuan3DGenerator:
         steps: int = 5,
         octree_resolution: int = 256,
         seed: int = 42,
+        target_faces: int = 40000,
         progress_callback: Optional[Callable[[str, int], None]] = None
     ) -> trimesh.Trimesh:
         """
-        Paso B: Genera la geometría 3D usando el transformer Hunyuan3D-DiT-v2-0-Turbo.
-        En modo Turbo, 5 pasos de inferencia entregan calidad equivalente a 50 pasos del modelo base.
+        Etapa 1 - Generación de Geometría (Hunyuan3D-DiT) y Decimación Previa:
+        1. Purga total de VRAM obligatoria antes de iniciar.
+        2. Preprocesamiento con Inpainting de bordes en el canal alfa (cv2.inpaint) para evitar halos oscuros.
+        3. Carga únicamente Hunyuan3DShapePipeline en precisión torch.float16.
+        4. Inferencia DiT de geometría pura (sin textura).
+        5. Reducción de polígonos previa (según target_faces o tope seguro de 40,000 caras para 8 GB)
+           y filtro de suavizado Taubin ANTES de pasar a la Etapa 2 para no saturar xatlas ni rasterizador.
+        6. Guarda la malla en memoria RAM (CPU), mueve el pipeline a CPU, lo elimina y purga VRAM.
         """
-        global _GLOBAL_SHAPE_PIPELINE
-        print(f"\n[Paso B/D] Generando geometría 3D con Hunyuan3D-2 ({self.shape_subfolder})...")
-        print(f" -> Pasos de inferencia DiT: {steps} | Octree: {octree_resolution} | Semilla: {seed}")
+        print(f"\n[Etapa 1/2] Generando geometría 3D pura con Hunyuan3D-DiT ({self.shape_subfolder})...")
+        print(f" -> Pasos DiT: {steps} | Octree: {octree_resolution} | Semilla: {seed} | Objetivo caras: {target_faces:,}")
         start_t = time.time()
-        self._clean_vram()
 
+        # 1. Asegurar descarga total previa de SF3D y purga estricta
+        unload_sf3d()
+        flush_vram()
+        print_real_vram_status("Pre-Carga Hunyuan3D-DiT")
+
+        shape_pipe = None
         try:
-            if _GLOBAL_SHAPE_PIPELINE is not None:
-                shape_pipe = _GLOBAL_SHAPE_PIPELINE
-                print(" -> Reutilizando pipeline Hunyuan3D DiT ya cargado en VRAM.")
-            else:
-                from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
-                print(f" -> Cargando pesos DiT desde {self.model_id} [{self.shape_subfolder}] a GPU NVIDIA ({self.device})...")
-                shape_pipe = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-                    self.model_id,
-                    subfolder=self.shape_subfolder,
-                    torch_dtype=self.dtype,
-                    device=self.device
-                )
-                if "cuda" in str(self.device):
-                    shape_pipe.to(self.device)
-                if not self.low_vram_mode:
-                    _GLOBAL_SHAPE_PIPELINE = shape_pipe
+            # Preprocesamiento con Inpainting de bordes en canal alfa (cv2.inpaint)
+            prep_image = inpaint_edge_padding(image, dilation_pixels=10, alpha_threshold=25)
 
-            if torch.cuda.is_available():
-                vram_act = torch.cuda.memory_allocated(0) / (1024 ** 2)
-                gpu_act = torch.cuda.get_device_name(0)
-                print(f" -> [GPU ACTIVA] {gpu_act} | VRAM Asignada: {vram_act:.1f} MB (Intel completamente bloqueada)")
+            # Cargar únicamente Hunyuan3DShapePipeline en float16
+            base_models = os.environ.get("HY3DGEN_MODELS", "D:/AI_Models")
+            local_shape_dir = Path(base_models) / "tencent" / "Hunyuan3D-2"
+            if (local_shape_dir / self.shape_subfolder).exists():
+                model_source = str(local_shape_dir)
+            else:
+                model_source = self.model_id
+
+            print(f" -> Cargando Hunyuan3DShapePipeline desde {model_source} [{self.shape_subfolder}] en float16...")
+            shape_pipe = Hunyuan3DShapePipeline.from_pretrained(
+                model_source,
+                subfolder=self.shape_subfolder,
+                torch_dtype=self.dtype,
+                device=self.device
+            )
+
+            # 1. FlashVDM: Aceleración de Volume Decoding para reducir tiempo a segundos
+            if hasattr(shape_pipe, "enable_flashvdm"):
+                try:
+                    shape_pipe.enable_flashvdm(enabled=True)
+                    print(" -> [FlashVDM] FlashVDM activado exitosamente en Hunyuan3DShapePipeline.")
+                except Exception as e_fvdm:
+                    try:
+                        shape_pipe.enable_flashvdm(enabled=True, replace_vae=False)
+                        print(" -> [FlashVDM] FlashVDM activado (sin reemplazo de VAE).")
+                    except Exception as e_fvdm2:
+                        print(f" -> [FlashVDM] Aviso: FlashVDM no disponible ({e_fvdm} / {e_fvdm2}). Continuando con VAE estándar.")
+
+            # 2. Model CPU Offload en Hunyuan3D-DiT para GPUs de 8GB
+            if hasattr(shape_pipe, "enable_model_cpu_offload"):
+                try:
+                    shape_pipe.enable_model_cpu_offload()
+                    print(" -> [Model CPU Offload] enable_model_cpu_offload() activado en Hunyuan3DShapePipeline.")
+                except Exception as e_off:
+                    if "cuda" in str(self.device):
+                        shape_pipe.to(self.device)
+            elif "cuda" in str(self.device):
+                shape_pipe.to(self.device)
+
+            # 3. Hook crítico: Descargar pesos de DiT y Conditioner a CPU antes del Volume Decoding
+            # para que el VAE tenga el 100% de la VRAM (evita paging de 4.7 GB a Shared GPU Memory)
+            orig_export = shape_pipe._export
+
+            def offload_and_export(*args, **kwargs):
+                print("\n" + "-"*65)
+                print(" [Volume Decoding Optimization] Descargando pesos de DiT y Conditioner a CPU...")
+                if hasattr(shape_pipe, "model") and shape_pipe.model is not None:
+                    try:
+                        shape_pipe.model.to("cpu")
+                    except Exception:
+                        pass
+                if hasattr(shape_pipe, "conditioner") and shape_pipe.conditioner is not None:
+                    try:
+                        shape_pipe.conditioner.to("cpu")
+                    except Exception:
+                        pass
+                flush_vram()
+                print_real_vram_status("Inicio Volume Decoding (VAE en GPU limpia)")
+                print("-"*65 + "\n")
+                return orig_export(*args, **kwargs)
+
+            shape_pipe._export = offload_and_export
+
+            print_real_vram_status("Post-Carga Hunyuan3D-DiT Pipeline")
 
             generator = torch.Generator(device=self.device).manual_seed(seed) if seed >= 0 else None
             
@@ -765,12 +1527,18 @@ class Hunyuan3DGenerator:
 
             tqdm.tqdm.update = custom_tqdm_update
 
+            # Resolución octree controlada (192 o 256) y num_chunks=32000 para reducir iteraciones de decodificación
+            safe_octree = min(int(octree_resolution), 256) if octree_resolution else 256
+            safe_chunks = 32000
+            print(f" -> [Inferencia DiT] Octree: {safe_octree} | Chunks: {safe_chunks} | Pasos: {steps}")
+
             try:
                 with torch.inference_mode():
                     outputs = shape_pipe(
-                        image=image,
+                        image=prep_image,
                         num_inference_steps=steps,
-                        octree_resolution=octree_resolution,
+                        octree_resolution=safe_octree,
+                        num_chunks=safe_chunks,
                         generator=generator,
                         callback=dit_step_callback,
                         callback_steps=1,
@@ -781,25 +1549,35 @@ class Hunyuan3DGenerator:
                 
             raw_mesh = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
 
-            # Hunyuan3D-2 DiT genera la geometría directamente en formato vertical Y-up canónico
-            # (Pies en -Y, cabeza en +Y, X horizontal, Z profundidad)
             try:
                 raw_mesh.fix_normals()
             except Exception as e_orient:
                 print(f" -> [Aviso Normales] {e_orient}")
 
             # Depuración de geometría: eliminar islas parásitas y losas flotantes
-            raw_mesh = clean_mesh_floating_artifacts(raw_mesh)
+            cleaned_mesh = clean_mesh_floating_artifacts(raw_mesh)
 
-            # Descargar de VRAM solo si está en modo low_vram (esencial en 8GB para no desbordar memoria)
-            if self.low_vram_mode:
-                del shape_pipe
-                _GLOBAL_SHAPE_PIPELINE = None
-                self._clean_vram()
-                print(" -> Pipeline DiT descargado de VRAM (Perfil Low VRAM / RTX 4060).")
+            # MUY IMPORTANTE PARA 8 GB DE VRAM: Reducción de polígonos previa y suavizado Taubin
+            # ANTES de pasar a la Etapa 2. No se pasa una malla de 280,000 caras a Hunyuan3D-Paint.
+            if target_faces and target_faces > 0:
+                safe_faces = min(int(target_faces), 40000)
+            else:
+                safe_faces = 40000  # Límite máximo seguro para preset HD en 8GB de VRAM
 
-            print(f" -> Malla generada (Y-up vertical erguida): {len(raw_mesh.vertices):,} vértices, {len(raw_mesh.faces):,} caras en {time.time() - start_t:.2f}s")
-            return raw_mesh
+            if len(cleaned_mesh.faces) > safe_faces:
+                print(f" -> [Etapa 1/2] Decimando malla de {len(cleaned_mesh.faces):,} a {safe_faces:,} caras (Protección 8GB VRAM)...")
+                decimated_mesh = decimate_mesh_to_target_faces(cleaned_mesh, target_faces=safe_faces)
+            else:
+                decimated_mesh = cleaned_mesh
+
+            print(f" -> [Etapa 1/2] Aplicando filtro de suavizado Taubin ({len(decimated_mesh.faces):,} caras)...")
+            smoothed_mesh = apply_taubin_smoothing(decimated_mesh, lamb=0.53, nu=-0.55, iterations=5)
+
+            # Guardar malla procesada en memoria RAM del sistema (CPU)
+            cpu_mesh = smoothed_mesh.copy()
+
+            print(f" -> [Etapa 1/2 Completada] Geometría optimizada: {len(cpu_mesh.vertices):,} vértices, {len(cpu_mesh.faces):,} caras en {time.time() - start_t:.2f}s")
+            return cpu_mesh
 
         except ImportError as e:
             print(f"[ERROR CRÍTICO] La librería hy3dgen no está instalada: {e}")
@@ -814,6 +1592,17 @@ class Hunyuan3DGenerator:
                 print(" -> O cambia en la interfaz a 'Stable Fast 3D (SF3D)' para generar en 1s sin este modelo.\n")
             print(f"[ERROR] Falló la generación de forma: {e}")
             raise
+        finally:
+            # Mover pipeline de geometría a CPU, eliminarlo con del y purgar VRAM completamente
+            if shape_pipe is not None:
+                if hasattr(shape_pipe, "to"):
+                    try:
+                        shape_pipe.to("cpu")
+                    except Exception:
+                        pass
+                del shape_pipe
+            flush_vram()
+            print(" -> [Etapa 1/2] Pipeline DiT descargado de VRAM y purga estricta completada.")
 
     def paint_and_texture_mesh(
         self,
@@ -821,58 +1610,116 @@ class Hunyuan3DGenerator:
         image: Image.Image
     ) -> trimesh.Trimesh:
         """
-        Paso D: Hornea y sintetiza la textura de color sobre la malla decimada
-        utilizando Hunyuan3D-Paint-v2-0.
-        Si las extensiones C++ de rasterización no estuviesen compiladas,
-        proporciona un mecanismo de textura UV proyectiva de respaldo para nunca fallar.
+        Etapa 2 - Texturizado Nativo Multivista (Hunyuan3D-Paint) en modo Low-VRAM (8 GB):
+        1. Con la VRAM completamente libre, carga Hunyuan3DPaintPipeline en torch.float16.
+        2. Activa optimizaciones de memoria en diffusers (enable_model_cpu_offload, enable_vae_slicing, enable_vae_tiling).
+        3. Configura resolución segura para 8 GB (render_size/texture_size en 1024x1024 y vistas controladas).
+        4. Envuelve la inferencia en try/except torch.cuda.OutOfMemoryError con contingencia garantizada.
+        5. Destruye inmediatamente el pipeline de pintura (del paint_pipeline) y ejecuta flush_vram().
+        6. Configura acabado PBR mate/limpio (metallicFactor=0.0, roughnessFactor=0.9).
         """
-        print(f"\n[Paso D/D] Sintetizando y horneando textura sobre la malla con {self.paint_subfolder}...")
+        print(f"\n[Etapa 2/2] Texturizado Nativo Multivista con Hunyuan3D-Paint en modo Low-VRAM...")
         start_t = time.time()
-        self._clean_vram()
+        unload_sf3d()
+        unload_hunyuan()
+        flush_vram()
+        print_real_vram_status("Pre-Carga Hunyuan3D-Paint")
 
+        base_dir = os.environ.get('HY3DGEN_MODELS', 'D:/AI_Models')
+        local_model_dir = Path(base_dir) / "tencent" / "Hunyuan3D-2"
+        if (local_model_dir / "hunyuan3d-delight-v2-0").exists() and (local_model_dir / self.paint_subfolder).exists():
+            paint_source = str(local_model_dir)
+        else:
+            paint_source = self.model_id
+
+        paint_pipeline = None
         textured_mesh = None
 
-        # Intento oficial: Hunyuan3DPaintPipeline (solo si los modelos existen localmente en D:)
-        base_dir = os.environ.get('HY3DGEN_MODELS', 'D:/AI_Models')
-        local_delight = Path(base_dir) / self.model_id / "hunyuan3d-delight-v2-0"
-        local_paint = Path(base_dir) / self.model_id / self.paint_subfolder
-
-        if local_delight.exists() and local_paint.exists():
-            try:
-                from hy3dgen.texgen import Hunyuan3DPaintPipeline
-                print(f" -> Cargando pipeline de texturizado local desde {self.model_id}...")
-                
-                paint_pipe = Hunyuan3DPaintPipeline.from_pretrained(
-                    str(Path(base_dir) / self.model_id)
-                )
-
-                if "cuda" in str(self.device):
-                    paint_pipe.to(self.device)
-
-                with torch.inference_mode():
-                    textured_mesh = paint_pipe(mesh, image=image)
-
-                if self.low_vram_mode:
-                    del paint_pipe
-                    self._clean_vram()
-
-                print(f" -> Texturizado oficial completado en {time.time() - start_t:.2f}s")
-                return textured_mesh
-
-            except Exception as e:
-                print(f" -> [Aviso] El motor de render nativo arrojó: {e}")
-                print(" -> Activando motor de horneado y mapeo UV inteligente de contingencia...")
-        else:
-            print(" -> Usando motor de horneado UV ultra-rápido de alta fidelidad.")
-
-        # Contingencia Robusta: Mapeo UV y horneado de textura ortográfica frontal/trasera con Trimesh y Pillow
         try:
+            from hy3dgen.texgen import Hunyuan3DPaintPipeline
+            from hy3dgen.texgen.differentiable_renderer.mesh_render import MeshRender
+
+            print(f" -> Cargando Hunyuan3DPaintPipeline ({paint_source}) en float16...")
+            paint_pipeline = Hunyuan3DPaintPipeline.from_pretrained(paint_source)
+
+            # Configuración segura para 8 GB VRAM: 1024x1024 y 6 vistas controladas
+            if hasattr(paint_pipeline, "config"):
+                paint_pipeline.config.render_size = 1024
+                paint_pipeline.config.texture_size = 1024
+                paint_pipeline.config.candidate_camera_azims = [0, 90, 180, 270, 0, 180]
+                paint_pipeline.config.candidate_camera_elevs = [0, 0, 0, 0, 90, -90]
+                paint_pipeline.config.candidate_view_weights = [1.0, 0.1, 0.5, 0.1, 0.05, 0.05]
+
+            # Reconfigurar MeshRender a resolución segura 1024x1024
+            paint_pipeline.render = MeshRender(
+                default_resolution=1024,
+                texture_size=1024,
+                device="cuda" if torch.cuda.is_available() else "cpu"
+            )
+
+            # Activar optimizaciones de ahorro de memoria en diffusers
+            if hasattr(paint_pipeline, "enable_model_cpu_offload"):
+                try:
+                    paint_pipeline.enable_model_cpu_offload()
+                    print(" -> [Paint Low-VRAM] Model CPU Offload activado en Hunyuan3D-Paint.")
+                except Exception as e_off:
+                    print(f" -> [Paint Low-VRAM] GPU direct mode ({e_off})")
+                    if "cuda" in str(self.device):
+                        paint_pipeline.to(self.device)
+            elif "cuda" in str(self.device):
+                paint_pipeline.to(self.device)
+
+            # Habilitar VAE Slicing y VAE Tiling en los componentes internos de difusión
+            if hasattr(paint_pipeline, "models"):
+                for m_name in ["delight_model", "multiview_model"]:
+                    if m_name in paint_pipeline.models:
+                        sub_p = getattr(paint_pipeline.models[m_name], "pipeline", None)
+                        if sub_p is not None:
+                            if hasattr(sub_p, "enable_vae_slicing"):
+                                try:
+                                    sub_p.enable_vae_slicing()
+                                except Exception:
+                                    pass
+                            if hasattr(sub_p, "enable_vae_tiling"):
+                                try:
+                                    sub_p.enable_vae_tiling()
+                                except Exception:
+                                    pass
+
+            print(f" -> Pintando malla de {len(mesh.faces):,} caras con Hunyuan3D-Paint...")
+            with torch.inference_mode():
+                textured_mesh = paint_pipeline(mesh, image=image)
+
+            print(f" -> [Hunyuan3D-Paint] Texturizado multivista completado con éxito en {time.time() - start_t:.2f}s.")
+
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e_oom:
+            print(f" -> [Aviso CUDA OOM en Hunyuan3D-Paint] {e_oom}. Liberando VRAM y recurriendo a horneado UV de contingencia...")
+            flush_vram()
             textured_mesh = self._fallback_texture_bake(mesh, image)
-            print(f" -> Horneado UV de contingencia aplicado con éxito en {time.time() - start_t:.2f}s")
-            return textured_mesh
-        except Exception as e_fb:
-            print(f" -> [Advertencia] Error en horneado de contingencia ({e_fb}). Exportando modelo con material PBR base.")
-            return mesh
+        except Exception as e_tex:
+            print(f" -> [Aviso Hunyuan3D-Paint] {e_tex}. Recurriendo a horneado UV de contingencia...")
+            flush_vram()
+            textured_mesh = self._fallback_texture_bake(mesh, image)
+        finally:
+            if paint_pipeline is not None:
+                try:
+                    if hasattr(paint_pipeline, "to"):
+                        paint_pipeline.to("cpu")
+                except Exception:
+                    pass
+                del paint_pipeline
+            flush_vram()
+            print_real_vram_status("Post-Hunyuan Paint Unload")
+            print(" -> [Etapa 2/2] Pipeline de pintura destruido y VRAM purgada al 100%.")
+
+        # Ajuste de material PBR mate/limpio (metallicFactor=0.0, roughnessFactor=0.90)
+        if textured_mesh is not None and hasattr(textured_mesh, "visual") and hasattr(textured_mesh.visual, "material") and textured_mesh.visual.material is not None:
+            mat = textured_mesh.visual.material
+            mat.metallicFactor = 0.0
+            mat.roughnessFactor = 0.90
+            mat.doubleSided = True
+
+        return textured_mesh if textured_mesh is not None else mesh
 
     def _fallback_texture_bake(self, mesh: trimesh.Trimesh, image: Image.Image) -> trimesh.Trimesh:
         """
@@ -1038,11 +1885,11 @@ class Hunyuan3DGenerator:
             mesh_copy.visual = trimesh.visual.TextureVisuals(uv=uv, image=tex_pil)
             final_mesh = mesh_copy
 
-        # 6. Material PBR estándar de doble cara para Godot 4 / WebGL
+        # 6. Material PBR estándar mate limpio (metallicFactor=0.0, roughnessFactor=0.90)
         material = trimesh.visual.material.PBRMaterial(
             baseColorTexture=tex_pil,
-            metallicFactor=0.05,
-            roughnessFactor=0.60,
+            metallicFactor=0.0,
+            roughnessFactor=0.90,
             doubleSided=True
         )
         final_mesh.visual.material = material
@@ -1115,12 +1962,29 @@ def _ensure_sf3d_shims(repo_dir: Optional[Path] = None):
                 def forward(self, v_pos, v_nrm, t_pos_idx, island_padding=0.02):
                     try:
                         import xatlas
-                        v_np = v_pos.detach().cpu().numpy()
-                        f_np = t_pos_idx.detach().cpu().numpy()
-                        vmapping, indices, uvs = xatlas.parametrize(v_np, f_np)
+                        v_np = v_pos.detach().cpu().numpy().astype(np.float32)
+                        f_np = t_pos_idx.detach().cpu().numpy().astype(np.uint32)
+
+                        # Configurar Unwrap para mantener parches (charts) continuos y amplios sin fragmentación
+                        atlas = xatlas.Atlas()
+                        atlas.add_mesh(v_np, f_np)
+
+                        chart_options = xatlas.ChartOptions()
+                        chart_options.max_cost = 4.0               # Mayor tolerancia para formar parches grandes y continuos
+                        chart_options.normal_deviation_weight = 1.0 # Menor penalización por curvatura en transiciones
+                        chart_options.normal_seam_weight = 1.0      # Evita partir en costuras innecesarias en laterales
+                        chart_options.max_iterations = 4            # Calidad de relajación de atlas UV
+
+                        pack_options = xatlas.PackOptions()
+                        pack_options.padding = int(max(2, island_padding * 512)) # Margen entre islas para evitar bleeding
+                        pack_options.resolution = 1024
+
+                        atlas.generate(chart_options, pack_options)
+                        vmapping, indices, uvs = atlas.get_mesh(0)
+
                         return (
                             torch.from_numpy(uvs).to(v_pos.device, dtype=torch.float32),
-                            torch.from_numpy(indices).to(t_pos_idx.device, dtype=torch.int64)
+                            torch.from_numpy(indices.astype(np.int64)).to(t_pos_idx.device, dtype=torch.int64)
                         )
                     except Exception:
                         nv = v_pos.shape[0]
@@ -1135,11 +1999,13 @@ def _ensure_sf3d_shims(repo_dir: Optional[Path] = None):
     # 2. texture_baker
     cur_tb = sys.modules.get("texture_baker")
     if cur_tb is None or not hasattr(cur_tb, "TextureBaker"):
-        # Intentar rasterizador acelerado con Numba
+        # Rasterizador de textura UV ultrarrápido con Numba (CPU multihilo, 0 MB VRAM)
+        _numba_rast_fn = None
         try:
             from numba import njit, prange
+
             @njit(parallel=True, fastmath=True)
-            def _numba_rasterize(uvs, faces, res):
+            def _numba_rasterize_sf3d(uvs, faces, res):
                 rast = np.zeros((res, res, 4), dtype=np.float32)
                 rast[:, :, 3] = -1.0
                 num_faces = faces.shape[0]
@@ -1172,9 +2038,11 @@ def _ensure_sf3d_shims(repo_dir: Optional[Path] = None):
                                 rast[py, px, 2] = w2
                                 rast[py, px, 3] = float(f)
                 return rast
-            _has_numba_rasterizer = True
-        except Exception:
-            _has_numba_rasterizer = False
+
+            _numba_rast_fn = _numba_rasterize_sf3d
+        except Exception as e_nb:
+            print(f" -> [Aviso SF3D Baker] Numba no disponible: {e_nb}")
+            _numba_rast_fn = None
 
         class FastTextureBaker(torch.nn.Module):
             def __init__(self):
@@ -1183,10 +2051,10 @@ def _ensure_sf3d_shims(repo_dir: Optional[Path] = None):
             def rasterize(self, uv: torch.Tensor, face_indices: torch.Tensor, bake_resolution: int) -> torch.Tensor:
                 device = uv.device
                 res = int(bake_resolution)
-                if _has_numba_rasterizer:
+                if _numba_rast_fn is not None:
                     uv_np = uv.detach().cpu().numpy().astype(np.float32)
                     faces_np = face_indices.detach().cpu().numpy().astype(np.int32)
-                    rast_np = _numba_rasterize(uv_np, faces_np, res)
+                    rast_np = _numba_rast_fn(uv_np, faces_np, res)
                     return torch.from_numpy(rast_np).to(device)
                 else:
                     rast = torch.zeros((res, res, 4), dtype=torch.float32, device=device)
@@ -1239,6 +2107,11 @@ class SF3DGenerator:
         self.model = None
 
     def _load_model(self):
+        # 1. Asegurar descarga total de Hunyuan3D y purga de VRAM
+        unload_hunyuan()
+        flush_vram()
+        print_real_vram_status("Pre-Carga SF3D")
+
         global _GLOBAL_SF3D_MODEL
         if _GLOBAL_SF3D_MODEL is not None:
             self.model = _GLOBAL_SF3D_MODEL
@@ -1310,28 +2183,61 @@ class SF3DGenerator:
     def generate_mesh(
         self,
         image: Image.Image,
-        texture_resolution: int = 1024,
+        texture_resolution: int = 2048,
         generate_texture: bool = True,
+        foreground_ratio: float = 0.82,
         progress_callback: Optional[Callable[[str, int], None]] = None
     ) -> trimesh.Trimesh:
         self._load_model()
         if progress_callback:
-            progress_callback("⚡ SF3D: Procesando imagen y esculpiendo 3D instantáneo...", 50)
+            progress_callback("⚡ SF3D: Preprocesando silueta (Anti-Color Bleeding y Padding 0.82)...", 35)
 
-        rgba_img = image.convert("RGBA")
+        # 1. Preprocesamiento Inpainting 2D Anti-Halos y encuadre con foreground_ratio=0.82 fijo
+        rgba_img = preprocess_image_for_sf3d(
+            image,
+            foreground_ratio=foreground_ratio,
+            edge_dilation_pixels=10
+        )
+
         temp_dir = Path(os.environ.get("TEMP", "D:/AI_Models/temp"))
         temp_dir.mkdir(parents=True, exist_ok=True)
         temp_glb = temp_dir / f"sf3d_tmp_{int(time.time()*1000)}.glb"
 
         try:
             from contextlib import nullcontext
+            if progress_callback:
+                progress_callback("⚡ SF3D: Inferencia base y horneado de textura en GPU...", 55)
+
+            # Limpieza preventiva de VRAM antes de inferencia y horneado
+            flush_vram()
+            print_real_vram_status("Pre-Inferencia SF3D")
+
+            target_res = texture_resolution
+            mesh_out = None
+
             with torch.inference_mode():
                 with torch.autocast(device_type=self.device, dtype=torch.bfloat16) if "cuda" in self.device else nullcontext():
-                    mesh_out, _ = self.model.run_image(
-                        [rgba_img],
-                        bake_resolution=texture_resolution,
-                        remesh="none"
-                    )
+                    try:
+                        print(f" -> [SF3D Inferencia] Generando modelo 3D con textura a {target_res}x{target_res}...")
+                        mesh_out, _ = self.model.run_image(
+                            [rgba_img],
+                            bake_resolution=target_res,
+                            remesh="none"
+                        )
+                    except (torch.cuda.OutOfMemoryError, RuntimeError) as e_oom:
+                        err_str = str(e_oom).lower()
+                        if ("out of memory" in err_str or "cuda" in err_str) and target_res > 1024:
+                            print(f" -> [SF3D VRAM Fallback] VRAM insuficiente para textura {target_res}x{target_res} en 8GB. "
+                                  f"Liberando caché y reintentando automáticamente a 1024x1024...")
+                            flush_vram()
+                            target_res = 1024
+                            mesh_out, _ = self.model.run_image(
+                                [rgba_img],
+                                bake_resolution=target_res,
+                                remesh="none"
+                            )
+                        else:
+                            raise e_oom
 
             mesh_out.export(str(temp_glb), include_normals=True)
             loaded_mesh = trimesh.load(str(temp_glb), process=False)
@@ -1345,11 +2251,32 @@ class SF3DGenerator:
             else:
                 final_mesh = loaded_mesh
 
+            # 2. Suavizado Taubin post-baking ELIMINADO:
+            # Desplazar vértices 3D después del UV unwrap desalinea la geometría respecto a la textura
+            # y agrava el desfase en las costuras. SF3D ya aplica Taubin smoothing antes del UV unwrap en sf3d/system.py.
+
+            # 3. TEXTURA NATIVA SF3D: Dilatación e inpainting de fondo para eliminar costuras UV y texture bleeding
+            if generate_texture:
+                final_mesh = inpaint_uv_atlas_texture(final_mesh, dilation_radius=48)
+                if progress_callback:
+                    progress_callback("🎨 SF3D: Textura PBR y atlas UV protegidos...", 80)
+
+            # 4. Ajuste de material PBR anti-glare / mate limpio
+            # - metallicFactor forzado a 0.0 (evita reflejos metálicos/plásticos)
+            # - roughnessFactor configurado en 0.90 (acabado mate limpio y estilizado)
+            # - doubleSided = True
+            if generate_texture and hasattr(final_mesh, "visual") and hasattr(final_mesh.visual, "material"):
+                mat = final_mesh.visual.material
+                if mat is not None:
+                    mat.metallicFactor = 0.0
+                    mat.roughnessFactor = 0.90
+                    mat.doubleSided = True
+
             if not generate_texture:
                 neutral_mat = trimesh.visual.material.PBRMaterial(
                     baseColorFactor=[0.82, 0.84, 0.88, 1.0],
-                    metallicFactor=0.08,
-                    roughnessFactor=0.55,
+                    metallicFactor=0.0,
+                    roughnessFactor=0.90,
                     doubleSided=True
                 )
                 final_mesh.visual.material = neutral_mat
@@ -1362,6 +2289,26 @@ class SF3DGenerator:
                     temp_glb.unlink()
                 except Exception:
                     pass
+            # Descarga total de SF3D para no dejarlo residente en VRAM
+            if self.model is not None:
+                try:
+                    if hasattr(self.model, "to"):
+                        self.model.to("cpu")
+                except Exception:
+                    pass
+                del self.model
+                self.model = None
+            global _GLOBAL_SF3D_MODEL
+            if _GLOBAL_SF3D_MODEL is not None:
+                try:
+                    if hasattr(_GLOBAL_SF3D_MODEL, "to"):
+                        _GLOBAL_SF3D_MODEL.to("cpu")
+                except Exception:
+                    pass
+                del _GLOBAL_SF3D_MODEL
+                _GLOBAL_SF3D_MODEL = None
+            flush_vram()
+            print_real_vram_status("Post-SF3D Unload")
 
 
 # ==============================================================================
@@ -1377,6 +2324,7 @@ def postprocess_and_validate_glb(
     Inspecciona y valida el archivo binario .glb con pygltflib:
     - Asegura que todos los materiales tengan doubleSided = True (evita caras invisibles).
     - Configura baseColorFactor PBR estándar [1.0, 1.0, 1.0, 1.0].
+    - Aplica parámetros anti-glare / anti-grasa (metallicFactor=0.0, roughnessFactor=0.90).
     - Inyecta metadatos de exportación para Godot 4.
     """
     try:
@@ -1384,7 +2332,7 @@ def postprocess_and_validate_glb(
         if gltf.asset is None:
             gltf.asset = pygltflib.Asset()
             
-        gltf.asset.generator = "Kaboomi Party 3D Generator (Tencent Hunyuan3D-2)"
+        gltf.asset.generator = "Kaboomi Party 3D Generator (SF3D + Hunyuan3D-2)"
         gltf.asset.copyright = "Kaboomi Party / Mastermind"
         
         # Habilitar doubleSided en todos los materiales para que nunca se vuelvan invisibles
@@ -1393,10 +2341,10 @@ def postprocess_and_validate_glb(
                 mat.doubleSided = True
                 if mat.pbrMetallicRoughness:
                     mat.pbrMetallicRoughness.baseColorFactor = [1.0, 1.0, 1.0, 1.0]
-                    if mat.pbrMetallicRoughness.roughnessFactor is None:
-                        mat.pbrMetallicRoughness.roughnessFactor = 0.6
-                    if mat.pbrMetallicRoughness.metallicFactor is None:
-                        mat.pbrMetallicRoughness.metallicFactor = 0.05
+                    # Parámetros PBR anti-glare / anti-grasa:
+                    # metallicFactor = 0.0 (difuso mate puro) y roughnessFactor alto (0.90)
+                    mat.pbrMetallicRoughness.metallicFactor = 0.0
+                    mat.pbrMetallicRoughness.roughnessFactor = 0.90
 
         # Metadatos embebidos en el asset glTF
         gltf.asset.extras = {
@@ -1562,17 +2510,26 @@ def generate_model_pipeline(
             vram_profile=resolved_profile
         )
 
+    # Purga estricta inicial de VRAM antes de iniciar el pipeline
+    unload_all_models()
+    flush_vram()
+    print_real_vram_status("CLI Inicio Inferencia")
+
     # 3. Generación y texturizado según el motor seleccionado
     if "sf3d" in model_type.lower():
         if step_callback:
             step_callback(2, "⚡ Inicializando Stable Fast 3D en GPU...")
+        unload_hunyuan()
+        flush_vram()
+        print_real_vram_status("CLI Pre-SF3D")
         sf3d_gen = SF3DGenerator()
         if step_callback:
             step_callback(3, "⚡ SF3D: Generando geometría y texturas PBR instantáneas...")
         raw_mesh = sf3d_gen.generate_mesh(
             clean_image,
-            texture_resolution=1024,
-            generate_texture=generate_texture
+            texture_resolution=2048,
+            generate_texture=generate_texture,
+            foreground_ratio=0.82
         )
         if target_faces and target_faces < len(raw_mesh.faces):
             decimated_mesh = decimate_mesh_preserving_texture(raw_mesh, target_faces=target_faces)
@@ -1584,36 +2541,52 @@ def generate_model_pipeline(
             align_floor=align_bottom,
             normalize_scale=normalize_scale
         )
+
+        if hasattr(final_textured_mesh, "visual") and hasattr(final_textured_mesh.visual, "material") and final_textured_mesh.visual.material is not None:
+            final_textured_mesh.visual.material.metallicFactor = 0.0
+            final_textured_mesh.visual.material.roughnessFactor = 0.90
+            final_textured_mesh.visual.material.doubleSided = True
+
         if not generate_texture:
             neutral_mat = trimesh.visual.material.PBRMaterial(
                 baseColorFactor=[0.82, 0.84, 0.88, 1.0],
-                metallicFactor=0.08,
-                roughnessFactor=0.55,
+                metallicFactor=0.0,
+                roughnessFactor=0.90,
                 doubleSided=True
             )
             final_textured_mesh.visual.material = neutral_mat
+        
+        unload_sf3d()
+        flush_vram()
+        print_real_vram_status("CLI Post-SF3D")
     else:
+        # Etapa 1: Geometría Hunyuan3D-DiT con Decimación Previa (máx 40,000 caras) y Taubin Smoothing
         if step_callback:
-            step_callback(3, f"🧊 Esculpiendo geometría 3D y optimizando a {target_faces:,} triángulos...")
+            step_callback(3, f"🧊 [Etapa 1/2] Esculpiendo geometría 3D y optimizando topología...")
+        unload_sf3d()
+        flush_vram()
+        print_real_vram_status("CLI Pre-Hunyuan DiT")
         raw_mesh = generator.generate_shape(
             clean_image,
             steps=steps,
             octree_resolution=octree_resolution,
-            seed=seed
+            seed=seed,
+            target_faces=target_faces
         )
-        cleaned_mesh = clean_mesh_floating_artifacts(raw_mesh)
-        decimated_mesh = decimate_mesh_to_target_faces(cleaned_mesh, target_faces=target_faces)
-        decimated_mesh = clean_mesh_floating_artifacts(decimated_mesh)
         aligned_mesh = center_and_orient_mesh(
-            decimated_mesh,
+            raw_mesh,
             align_floor=align_bottom,
             normalize_scale=normalize_scale
         )
 
-        # 4. Sintetizar Textura o Aplicar Material PBR Neutro
+        # Purga total de VRAM entre Etapa 1 y Etapa 2
+        flush_vram()
+        print_real_vram_status("CLI Entre Etapa 1 y 2")
+
+        # Etapa 2: Texturizado Nativo Multivista (Hunyuan3D-Paint en Low-VRAM) o Material PBR Neutro
         if generate_texture:
             if step_callback:
-                step_callback(4, "🎨 Pintando texturas y empaquetando archivo .GLB...")
+                step_callback(4, "🎨 [Etapa 2/2] Horneando textura multivista con Hunyuan3D-Paint...")
             final_textured_mesh = generator.paint_and_texture_mesh(aligned_mesh, clean_image)
             final_textured_mesh = center_and_orient_mesh(
                 final_textured_mesh,
@@ -1622,15 +2595,21 @@ def generate_model_pipeline(
             )
         else:
             if step_callback:
-                step_callback(4, "⚡ Aplicando material neutro y empaquetando archivo .GLB...")
-            print("\n[Paso D/D] Generando modelo con material PBR base estándar...")
+                step_callback(4, "⚡ Aplicando material neutro mate y empaquetando archivo .GLB...")
+            print("\n[Paso D/D] Generando modelo con material PBR base estándar mate...")
             neutral_mat = trimesh.visual.material.PBRMaterial(
                 baseColorFactor=[0.82, 0.84, 0.88, 1.0],
-                metallicFactor=0.08,
-                roughnessFactor=0.55
+                metallicFactor=0.0,
+                roughnessFactor=0.90,
+                doubleSided=True
             )
             aligned_mesh.visual.material = neutral_mat
             final_textured_mesh = aligned_mesh
+
+        # Purga total de VRAM tras concluir Etapa 2
+        unload_all_models()
+        flush_vram()
+        print_real_vram_status("CLI Fin Generación")
 
     # 5. Exportación Multi-Formato (.GLB, .STL, .3MF)
     req_formats = list(export_formats) if export_formats else []
@@ -1648,6 +2627,9 @@ def generate_model_pipeline(
         formats=req_formats,
         target_faces=target_faces
     )
+
+    # Purga estricta final de VRAM
+    flush_vram()
 
     elapsed = time.time() - total_start
     main_file = exported_map.get("glb") or (list(exported_map.values())[0] if exported_map else dest_path)
@@ -1757,6 +2739,11 @@ def main():
         "--export-3mf",
         action="store_true",
         help="Exportar también en formato 3MF (.3mf) para slicers de manufactura aditiva (Bambu, Prusa)"
+    )
+    parser.add_argument(
+        "--gpu",
+        default=None,
+        help="GPU para la IA: índice de nvidia-smi (0, 1...), 'cpu' o 'ask' (se aplica en gpu_select.py antes de importar torch)"
     )
 
     args = parser.parse_args()

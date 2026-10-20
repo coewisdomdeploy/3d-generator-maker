@@ -36,3 +36,6 @@ Python
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Ultima GPU elegida en el selector de arranque
+.gpu_choice

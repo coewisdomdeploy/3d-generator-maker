@@ -48,6 +48,10 @@ if Path("D:/").exists():
 OUTPUT_DIR = Path("D:/AI_Models/output") if Path("D:/").exists() else Path("./outputs")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# Selección de GPU (debe ocurrir antes de importar torch / gradio / rembg)
+from gpu_select import select_gpu
+select_gpu()
+
 import gradio as gr
 from PIL import Image
 import rembg
@@ -62,15 +66,24 @@ except Exception:
 
 
 from img2glb import (
+    flush_vram,
+    print_real_vram_status,
+    unload_sf3d,
+    unload_hunyuan,
+    unload_all_models,
+    apply_taubin_smoothing,
+    inpaint_edge_padding,
     preprocess_and_remove_background,
     clean_mesh_floating_artifacts,
     decimate_mesh_to_target_faces,
     decimate_mesh_preserving_texture,
+    inpaint_uv_atlas_texture,
     center_and_orient_mesh,
     postprocess_and_validate_glb,
     export_formats_from_mesh,
     convert_glb_to_format,
     Hunyuan3DGenerator,
+    SF3DGenerator,
     is_dit_cached,
     VRAM_PROFILES,
     detect_vram_profile,
@@ -82,11 +95,11 @@ from img2glb import (
 # ==============================================================================
 
 print("\n" + "="*70)
-print(" [PRE-CARGA INTELIGENTE] Inicializando sesión de Rembg U2-Net en memoria...")
+print(" [PRE-CARGA INTELIGENTE] Inicializando sesión de Rembg U2-Net en CPU (providers=['CPUExecutionProvider'])...")
 t_rembg_start = time.time()
 try:
-    REMBG_SESSION = rembg.new_session("u2net")
-    print(f" -> Rembg U2-Net listo en {time.time() - t_rembg_start:.2f}s (Inferencia en <0.5s)")
+    REMBG_SESSION = rembg.new_session("u2net", providers=['CPUExecutionProvider'])
+    print(f" -> Rembg U2-Net listo en CPU en {time.time() - t_rembg_start:.2f}s (0 MB VRAM ocupados)")
 except Exception as e:
     print(f" -> [Advertencia] Error al crear sesión rembg ({e}).")
     REMBG_SESSION = None
@@ -105,6 +118,7 @@ parser.add_argument(
 )
 parser.add_argument("--port", type=int, default=7860, help="Puerto del servidor Gradio")
 parser.add_argument("--share", action="store_true", help="Compartir enlace público Gradio")
+parser.add_argument("--gpu", default=None, help="GPU para la IA: índice de nvidia-smi (0, 1...), 'cpu' o 'ask' para forzar el menú")
 cmd_args, _ = parser.parse_known_args()
 MODE = cmd_args.mode.lower()
 
@@ -166,7 +180,20 @@ if torch.cuda.is_available():
     print("   [CONFIRMACIÓN DE GPU AL ARRANCAR EL SERVIDOR]")
     print(f"   ✓ GPU ASIGNADA PARA IA: {torch.cuda.get_device_name(0)} (cuda:0)")
     print(f"   ✓ VRAM DEDICADA DETECTADA: {_vram_gb} GB")
-    print("   ✓ GPU INTEGRADA INTEL: BLOQUEADA (OpenCL Desactivado, WDDM GpuPreference=2)")
+    print("   ✓ OTRAS GPUs: OCULTAS PARA CUDA (CUDA_VISIBLE_DEVICES)")
+    # Pulso de activación de 1.2s para verificar en el Administrador de Tareas la GPU elegida
+    try:
+        _a = torch.randn((5120, 5120), device="cuda:0", dtype=torch.float16)
+        _b = torch.randn((5120, 5120), device="cuda:0", dtype=torch.float16)
+        _t_pulse = time.time()
+        while time.time() - _t_pulse < 1.2:
+            torch.matmul(_a, _b)
+            torch.cuda.synchronize()
+        del _a, _b
+        torch.cuda.empty_cache()
+        print("   ✓ PULSO DE VALIDACIÓN EN VIVO: OK")
+    except Exception as _e_pulse:
+        print(f"   ! PULSO DE VALIDACIÓN FALLÓ: {_e_pulse}")
     print("=" * 76 + "\n")
 else:
     GPU_STATUS_TEXT = "CPU • ONLINE"
@@ -346,31 +373,37 @@ def _ui_generate_3d_impl(
     # --------------------------------------------------------------------------
     # ETAPA 2 & 3: Selección de Motor de IA e Inferencia 3D
     # --------------------------------------------------------------------------
+    unload_all_models()
+    flush_vram()
+    print_real_vram_status("WebUI Inicio Inferencia")
+
     is_sf3d = "sf3d" in str(ai_model_choice).lower() or "stable fast 3d" in str(ai_model_choice).lower()
 
     if is_sf3d:
         yield step_yield(render_progress_html("[2/4] Motor SF3D: Inicializando Stable Fast 3D en GPU...", 25))
+        unload_hunyuan()
+        flush_vram()
+        print_real_vram_status("WebUI Pre-SF3D")
         try:
-            from img2glb import SF3DGenerator
             sf3d_gen = SF3DGenerator()
         except Exception as e:
             yield step_yield(render_progress_html(f"Error al inicializar Stable Fast 3D: {e}", 0))
             return
 
-        yield step_yield(render_progress_html("[3/4] Inferencia Instantánea: Esculpiendo y horneando PBR en ~1 segundo...", 60))
+        yield step_yield(render_progress_html("[3/4] Inferencia Instantánea: Esculpiendo 3D y horneando PBR en GPU...", 60))
         try:
             raw_mesh = sf3d_gen.generate_mesh(
                 clean_img,
-                texture_resolution=1024,
-                generate_texture=generate_texture
+                texture_resolution=2048,
+                generate_texture=generate_texture,
+                foreground_ratio=0.82
             )
         except Exception as e:
             yield step_yield(render_progress_html(f"Error en inferencia SF3D: {e}", 0))
             return
 
         if target_faces and target_faces < len(raw_mesh.faces):
-            yield step_yield(render_progress_html(f"[3/4] Optimización PBR: Decimando a {target_faces:,} caras conservando texturas...", 88))
-            from img2glb import decimate_mesh_preserving_texture
+            yield step_yield(render_progress_html(f"[3/4] Optimización PBR: Decimando a {target_faces:,} caras con textura nativa...", 88))
             decimated_mesh = decimate_mesh_preserving_texture(raw_mesh, target_faces=target_faces)
         else:
             decimated_mesh = raw_mesh
@@ -385,15 +418,23 @@ def _ui_generate_3d_impl(
         if not generate_texture:
             import trimesh
             neutral_mat = trimesh.visual.material.PBRMaterial(
-                baseColorFactor=[0.84, 0.86, 0.90, 1.0],
-                metallicFactor=0.08,
-                roughnessFactor=0.55,
+                baseColorFactor=[0.82, 0.84, 0.88, 1.0],
+                metallicFactor=0.0,
+                roughnessFactor=0.90,
                 doubleSided=True
             )
             aligned_mesh.visual.material = neutral_mat
             final_mesh = aligned_mesh
         else:
+            if hasattr(aligned_mesh, "visual") and hasattr(aligned_mesh.visual, "material") and aligned_mesh.visual.material is not None:
+                aligned_mesh.visual.material.metallicFactor = 0.0
+                aligned_mesh.visual.material.roughnessFactor = 0.90
+                aligned_mesh.visual.material.doubleSided = True
             final_mesh = aligned_mesh
+
+        unload_sf3d()
+        flush_vram()
+        print_real_vram_status("WebUI Post-SF3D")
     else:
         # Pipeline Tencent Hunyuan3D-2 Turbo
         cached = is_dit_cached()
@@ -448,13 +489,16 @@ def _ui_generate_3d_impl(
         yield step_yield(render_progress_html(f"[2/4] Perfil VRAM: {profile_info['desc']}...", 25))
 
         target_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        unload_sf3d()
+        flush_vram()
+        print_real_vram_status("WebUI Pre-Hunyuan3D-2")
         try:
             generator = Hunyuan3DGenerator(
                 model_id="tencent/Hunyuan3D-2",
                 shape_subfolder="hunyuan3d-dit-v2-0-turbo",
                 paint_subfolder="hunyuan3d-paint-v2-0",
                 use_fp16=profile_info.get("use_fp16", True),
-                low_vram_mode=profile_info.get("low_vram_mode", profile_info.get("low_vram", True)),
+                low_vram_mode=True,
                 vram_profile=active_profile_key,
                 device=target_device
             )
@@ -462,11 +506,17 @@ def _ui_generate_3d_impl(
             yield step_yield(render_progress_html(f"Error al cargar Hunyuan3D-2: {e}", 0))
             return
 
-        # ETAPA 3/4: Geometría 3D y Decimación Hunyuan3D
-        yield step_yield(render_progress_html("[3/4] Síntesis Geométrica: Iniciando inferencia en GPU NVIDIA RTX...", 30))
+        # Purga total de VRAM antes de iniciar Etapa 1
+        flush_vram()
+
+        # ETAPA 1: Geometría Hunyuan3D-DiT y Decimación Previa
+        yield step_yield(render_progress_html("[3/4] [Etapa 1/2] Síntesis Geométrica DiT: Inferencia en GPU NVIDIA RTX...", 30))
 
         progress_q = queue.Queue()
         gen_result = {"mesh": None, "error": None}
+
+        # Límite seguro para 8 GB VRAM: máximo 40,000 caras antes de pasar a texturizado
+        safe_faces = min(target_faces, 40000) if (target_faces and target_faces > 0) else 40000
 
         def on_shape_progress(step_text, pct):
             progress_q.put((step_text, pct))
@@ -480,6 +530,7 @@ def _ui_generate_3d_impl(
                     steps=dit_steps,
                     octree_resolution=octree_res,
                     seed=42,
+                    target_faces=safe_faces,
                     progress_callback=on_shape_progress
                 )
                 gen_result["mesh"] = m
@@ -509,27 +560,20 @@ def _ui_generate_3d_impl(
 
         raw_mesh = gen_result["mesh"]
 
-        yield step_yield(render_progress_html("[3/4] Depuración Geométrica: Eliminando losas e islas parásitas...", 86))
-        cleaned_mesh = clean_mesh_floating_artifacts(raw_mesh)
-
-        if target_faces > 0:
-            yield step_yield(render_progress_html(f"[3/4] Optimización de Malla: Decimando a {target_faces:,} caras...", 88))
-            decimated_mesh = decimate_mesh_to_target_faces(cleaned_mesh, target_faces=target_faces)
-            decimated_mesh = clean_mesh_floating_artifacts(decimated_mesh)
-        else:
-            yield step_yield(render_progress_html(f"[3/4] Malla HD Original: Conservando {len(cleaned_mesh.faces):,} caras sin comprimir...", 88))
-            decimated_mesh = cleaned_mesh
-
         aligned_mesh = center_and_orient_mesh(
-            decimated_mesh,
+            raw_mesh,
             align_floor=False,
             normalize_scale=True,
             target_height=1.2
         )
 
-        # ETAPA 4/4: Texturizado Hunyuan3D
+        # Purga total de VRAM entre Etapa 1 y Etapa 2
+        flush_vram()
+        print_real_vram_status("WebUI Entre Etapa 1 y 2")
+
+        # ETAPA 2: Texturizado Nativo Multivista (Hunyuan3D-Paint en Low-VRAM)
         if generate_texture:
-            yield step_yield(render_progress_html("[4/4] Texturizado PBR: Horneando mapas de color y proyección UV...", 94))
+            yield step_yield(render_progress_html("[4/4] [Etapa 2/2] Texturizado Multivista: Cargando Hunyuan3D-Paint en GPU...", 90))
             try:
                 final_mesh = generator.paint_and_texture_mesh(aligned_mesh, clean_img)
                 final_mesh = center_and_orient_mesh(
@@ -544,13 +588,24 @@ def _ui_generate_3d_impl(
             yield step_yield(render_progress_html("[4/4] Empaquetado: Ensamblando malla base (sin textura)...", 94))
             import trimesh
             neutral_mat = trimesh.visual.material.PBRMaterial(
-                baseColorFactor=[0.84, 0.86, 0.90, 1.0],
-                metallicFactor=0.08,
-                roughnessFactor=0.55,
+                baseColorFactor=[0.82, 0.84, 0.88, 1.0],
+                metallicFactor=0.0,
+                roughnessFactor=0.90,
                 doubleSided=True
             )
             aligned_mesh.visual.material = neutral_mat
             final_mesh = aligned_mesh
+
+        # Purga total de VRAM tras concluir Etapa 2
+        unload_all_models()
+        flush_vram()
+        print_real_vram_status("WebUI Fin Generación")
+
+    # Garantizar material PBR mate/limpio en la malla final
+    if hasattr(final_mesh, "visual") and hasattr(final_mesh.visual, "material") and final_mesh.visual.material is not None:
+        final_mesh.visual.material.metallicFactor = 0.0
+        final_mesh.visual.material.roughnessFactor = 0.90
+        final_mesh.visual.material.doubleSided = True
 
     yield step_yield(render_progress_html("[4/4] Exportación Multi-Formato: Generando archivos .GLB, .STL y .3MF...", 97))
 
@@ -596,6 +651,9 @@ def _ui_generate_3d_impl(
             100
         )
 
+        # Purga estricta final de VRAM tras exportación completa
+        flush_vram()
+
         yield (
             str(glb_file),
             gr.update(value=str(glb_file), interactive=True),
@@ -605,7 +663,10 @@ def _ui_generate_3d_impl(
         )
 
     except Exception as e:
+        flush_vram()
         yield step_yield(render_progress_html(f"Error al exportar formatos: {e}", 0))
+    finally:
+        flush_vram()
 
 
 def ui_generate_3d(
@@ -795,8 +856,8 @@ def get_or_create_clay_glb(glb_path_str: Union[str, Path]) -> Optional[str]:
         neutral_mat = trimesh.visual.material.PBRMaterial(
             name="ClayMaterial",
             baseColorFactor=[0.84, 0.86, 0.90, 1.0],
-            metallicFactor=0.08,
-            roughnessFactor=0.55,
+            metallicFactor=0.0,
+            roughnessFactor=0.90,
             doubleSided=True
         )
         mesh_clay.visual = trimesh.visual.TextureVisuals(material=neutral_mat)
@@ -2044,16 +2105,16 @@ with gr.Blocks(title=page_title) as demo:
                         
                         ai_model_dropdown = gr.Dropdown(
                             choices=[
-                                "Hunyuan3D-2 Turbo (Geometría HD • Sólidos 3D)",
-                                "Stable Fast 3D (SF3D • Texturas PBR Instantáneas)"
+                                "Hunyuan3D-2 (Secuencial 2 Etapas • Máxima Calidad)",
+                                "Stable Fast 3D (SF3D • Rápido 1 Paso)"
                             ],
                             value=(
-                                "Stable Fast 3D (SF3D • Texturas PBR Instantáneas)"
+                                "Stable Fast 3D (SF3D • Rápido 1 Paso)"
                                 if MODE == "kambo"
-                                else "Hunyuan3D-2 Turbo (Geometría HD • Sólidos 3D)"
+                                else "Hunyuan3D-2 (Secuencial 2 Etapas • Máxima Calidad)"
                             ),
                             label="Motor de Inteligencia Artificial 3D",
-                            info="Hunyuan3D: Máxima definición sólida | SF3D: Texturas PBR en 1s",
+                            info="Hunyuan3D: Geometría DiT -> Purga VRAM -> Texturizado Paint | SF3D: PBR en 1 paso",
                             interactive=True
                         )
 

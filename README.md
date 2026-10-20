@@ -62,6 +62,26 @@ Proyectos/
 
 ---
 
+## 🖥️ Selección de GPU (equipos con 2 o más tarjetas)
+
+Al arrancar `webui.bat`, `webui-kambo.bat` o `run_cli.bat`, `gpu_select.py` enumera las tarjetas con `nvidia-smi` y, si el equipo tiene más de un adaptador, muestra un menú:
+
+```text
+   [0] NVIDIA GeForce RTX 4060 (8 GB VRAM)  <- predeterminada
+   [1] NVIDIA GeForce RTX 3090 (24 GB VRAM)
+   [C] CPU (sin aceleración, muy lento)
+    -  Intel(R) UHD Graphics: no compatible con CUDA (solo pantalla / navegador)
+   Elige GPU [Enter = 0, automático en 15s]:
+```
+
+- La tarjeta elegida se convierte en `cuda:0` dentro del proceso (`CUDA_VISIBLE_DEVICES` por UUID + `CUDA_DEVICE_ORDER=PCI_BUS_ID`).
+- La última elección se recuerda en `.gpu_choice` y es la opción predeterminada la próxima vez.
+- Las GPUs Intel/AMD aparecen solo como información: CUDA no puede usarlas.
+- Para saltar el menú: `webui.bat --gpu 1`, `run_cli.bat ... --gpu cpu` o `set STUDIO_GPU=0`. Para forzarlo: `--gpu ask`.
+- Probar el selector por separado: `.venv\Scripts\python.exe gpu_select.py --gpu ask`
+
+---
+
 ## 💻 Uso por Consola (CLI: `img2glb.py`)
 
 Comando oficial según especificación:
