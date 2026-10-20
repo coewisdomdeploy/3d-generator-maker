@@ -88,15 +88,43 @@ DEFAULT_SETTINGS = {
 # 2. Persistencia de la configuración
 # ==============================================================================
 
-def load_settings(path: Path) -> dict:
-    """Lee la configuración guardada y la completa con los valores por defecto."""
+def normalize_settings(raw: Optional[dict]) -> dict:
+    """
+    Completa con los valores por defecto y descarta claves o valores inválidos
+    (la configuración puede venir del localStorage del navegador).
+    """
     settings = json.loads(json.dumps(DEFAULT_SETTINGS))
-    try:
-        stored = json.loads(Path(path).read_text(encoding="utf-8"))
-        settings.update({k: v for k, v in stored.items() if k in DEFAULT_SETTINGS})
-    except Exception:
-        pass
+    if not isinstance(raw, dict):
+        return settings
+    for key, default in DEFAULT_SETTINGS.items():
+        value = raw.get(key)
+        if value is None or type(value) is not type(default) and not (
+            isinstance(default, float) and isinstance(value, int)
+        ):
+            continue
+        settings[key] = float(value) if isinstance(default, float) else value
+    if settings["mode"] not in ("modelos", "impresion"):
+        settings["mode"] = DEFAULT_SETTINGS["mode"]
+    settings["model_formats"] = [f for f in settings["model_formats"] if f in MODEL_FORMATS] or ["glb"]
+    settings["print_formats"] = [f for f in settings["print_formats"] if f in PRINT_FORMATS] or ["3mf"]
+    if settings["model_pivot"] not in ("base", "centro"):
+        settings["model_pivot"] = "base"
+    if settings["print_printer"] not in PRINTERS:
+        settings["print_printer"] = DEFAULT_SETTINGS["print_printer"]
+    if settings["print_slicer"] not in ("auto", "default", *SLICERS):
+        settings["print_slicer"] = "auto"
+    bed = settings["print_custom_bed"]
+    if len(bed) != 3 or not all(isinstance(v, (int, float)) and v > 0 for v in bed):
+        settings["print_custom_bed"] = list(DEFAULT_SETTINGS["print_custom_bed"])
     return settings
+
+
+def load_settings(path: Path) -> dict:
+    """Lee la configuración guardada en disco y la completa con los valores por defecto."""
+    try:
+        return normalize_settings(json.loads(Path(path).read_text(encoding="utf-8")))
+    except Exception:
+        return normalize_settings(None)
 
 
 def save_settings(path: Path, settings: dict) -> None:

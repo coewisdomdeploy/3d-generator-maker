@@ -71,6 +71,24 @@ from img2glb import (
     detect_vram_profile,
     DEFAULT_OUTPUT_DIR
 )
+from export_profiles import (
+    ALL_FORMATS,
+    MODEL_FORMATS,
+    PRINT_FORMATS,
+    PRINTERS,
+    CUSTOM_PRINTER,
+    SLICERS,
+    active_formats,
+    detect_slicers,
+    export_with_profile,
+    load_settings,
+    normalize_settings,
+    open_in_slicer,
+    printer_dims,
+    profile_label,
+    resolve_slicer,
+    save_settings,
+)
 
 # ==============================================================================
 # 2. Pre-inicialización Inteligente de Rembg (U2-Net) al arrancar el servidor
@@ -144,6 +162,14 @@ else:
 CURRENT_GENERATED_GLB: Optional[Path] = None
 CURRENT_GENERATED_FILES: dict[str, Optional[Path]] = {"glb": None, "stl": None, "3mf": None}
 IS_GENERATING: bool = False
+LAST_GEN_OK: bool = False
+LAST_GEN_SUMMARY: str = ""
+
+# Perfil de exportación (modal de configuración). Cada navegador guarda el suyo en
+# localStorage (gr.BrowserState); el .json en disco es el valor inicial para navegadores nuevos.
+SETTINGS_FILE = MODELS_ROOT / "studio_settings.json"
+INITIAL_SETTINGS: dict = load_settings(SETTINGS_FILE)
+EXPORTS_DIR = OUTPUT_DIR / "exports"
 PLACEHOLDER_GLB = Path(__file__).parent / "assets" / "placeholder.glb"
 EMPTY_GLB = Path(__file__).parent / "assets" / "empty.glb"
 
@@ -616,9 +642,11 @@ def _ui_generate_3d_impl(
         final_mesh.visual.material.roughnessFactor = 0.90
         final_mesh.visual.material.doubleSided = True
 
-    yield step_yield(render_progress_html("[4/4] Exportación Multi-Formato: Generando archivos .GLB, .STL y .3MF...", 97))
+    yield step_yield(render_progress_html("[4/4] Guardando modelo .GLB en la biblioteca...", 97))
 
-    # Guardar archivos .glb, .stl y .3mf en <HY3DGEN_MODELS>\output\
+    # Guardar el .glb maestro en <HY3DGEN_MODELS>\output\ (los formatos de descarga
+    # se generan después con el perfil de exportación activo: on_generation_completed)
+    global LAST_GEN_SUMMARY
     timestamp = int(time.time())
     raw_name = (model_name or "").strip()
     for ext in [".glb", ".stl", ".3mf"]:
@@ -636,40 +664,22 @@ def _ui_generate_3d_impl(
         exported_map = export_formats_from_mesh(
             mesh=final_mesh,
             base_output_path=base_dest,
-            formats=["glb", "stl", "3mf"],
+            formats=["glb"],
             target_faces=target_faces
         )
 
         glb_file = exported_map.get("glb")
-        stl_file = exported_map.get("stl")
-        threemf_file = exported_map.get("3mf")
-
         CURRENT_GENERATED_GLB = glb_file
         CURRENT_GENERATED_FILES["glb"] = glb_file
-        CURRENT_GENERATED_FILES["stl"] = stl_file
-        CURRENT_GENERATED_FILES["3mf"] = threemf_file
 
         elapsed = time.time() - total_start
-        glb_size_mb = glb_file.stat().st_size / (1024 * 1024) if glb_file and glb_file.exists() else 0.0
-        stl_size_kb = stl_file.stat().st_size / 1024 if stl_file and stl_file.exists() else 0.0
-        threemf_size_kb = threemf_file.stat().st_size / 1024 if threemf_file and threemf_file.exists() else 0.0
-        num_faces = len(final_mesh.faces)
-
-        final_msg = render_progress_html(
-            f"Modelo generado en {elapsed:.1f}s | {num_faces:,} caras | GLB: {glb_size_mb:.2f} MB • STL: {stl_size_kb:.0f} KB • 3MF: {threemf_size_kb:.0f} KB",
-            100
-        )
+        LAST_GEN_SUMMARY = f"Generado en {elapsed:.1f}s · {len(final_mesh.faces):,} caras"
+        final_msg = render_progress_html(f"{LAST_GEN_SUMMARY} · Exportando con el perfil activo...", 100)
 
         # Purga estricta final de VRAM tras exportación completa
         flush_vram()
 
-        yield (
-            str(glb_file),
-            gr.update(value=str(glb_file), interactive=True),
-            gr.update(value=str(stl_file), interactive=True),
-            gr.update(value=str(threemf_file), interactive=True),
-            final_msg
-        )
+        yield (str(glb_file), gr.skip(), gr.skip(), gr.skip(), final_msg)
 
     except Exception as e:
         flush_vram()
@@ -686,24 +696,22 @@ def ui_generate_3d(
     generate_texture: bool,
     model_name: str,
     vram_profile_choice: str = "Auto-detectar (Recomendado)"
-) -> Generator[Tuple[Optional[str], any, any, any, str], None, None]:
+) -> Generator[Tuple[Optional[str], str], None, None]:
     """
     Función generadora externa con bloqueo atómico anti-doble clic (mutex).
+    Emite (visor 3D, estado); las descargas las prepara on_generation_completed.
     """
-    global IS_GENERATING
+    global IS_GENERATING, LAST_GEN_OK
     if IS_GENERATING:
-        yield (
-            gr.skip(),
-            gr.update(interactive=False),
-            gr.update(interactive=False),
-            gr.update(interactive=False),
-            render_progress_html("Ya hay una generación en progreso. Por favor espera a que finalice.", 0)
-        )
+        yield gr.skip(), render_progress_html("Ya hay una generación en progreso. Por favor espera a que finalice.", 0)
         return
     IS_GENERATING = True
+    LAST_GEN_OK = False
+    previous_glb = CURRENT_GENERATED_GLB
     try:
         for out in _ui_generate_3d_impl(image, clean_silhouette, preset_label, ai_model_choice, generate_texture, model_name, vram_profile_choice):
-            yield out
+            yield out[0], out[4]
+        LAST_GEN_OK = CURRENT_GENERATED_GLB is not None and CURRENT_GENERATED_GLB != previous_glb
     finally:
         IS_GENERATING = False
         try:
@@ -747,9 +755,10 @@ def ui_save_to_game(category: str, custom_name: str) -> None:
         gr.Warning(f"Error al guardar en el juego: {e}")
 
 
-def ui_save_to_custom_dir(target_dir_str: str, custom_name: str) -> None:
-    """Copia el .glb generado a una carpeta o proyecto local especificado (aviso tipo toast)."""
-    if CURRENT_GENERATED_GLB is None or not CURRENT_GENERATED_GLB.exists():
+def ui_save_to_custom_dir(target_dir_str: str, custom_name: str, export_map: Optional[dict]) -> None:
+    """Copia los archivos del perfil de exportación activo a una carpeta local (aviso tipo toast)."""
+    sources = [Path(p) for p in (export_map or {}).values() if p and Path(p).exists()]
+    if not sources:
         gr.Warning("Primero genera un modelo 3D antes de exportarlo.")
         return
 
@@ -764,18 +773,19 @@ def ui_save_to_custom_dir(target_dir_str: str, custom_name: str) -> None:
         gr.Warning(f"No se pudo crear o acceder a la carpeta destino: {e}")
         return
         
-    raw_name = (custom_name or "").strip()
-    if raw_name.lower().endswith(".glb"):
-        raw_name = raw_name[:-4]
+    raw_name = Path((custom_name or "").strip()).stem
     safe_name = "".join(c for c in raw_name if c.isalnum() or c in ("_", "-")).strip()
-    if not safe_name:
-        safe_name = f"modelo_{int(time.time())}"
-    safe_name += ".glb"
-    
-    dest_file = dest_folder / safe_name
+    # Los exportados se llaman <stem>.glb, <stem>_print.stl, <stem>_obj.zip...: se conserva la cola
+    source_stem = Path(sources[0]).parent.name
+
+    copied = []
     try:
-        shutil.copy2(CURRENT_GENERATED_GLB, dest_file)
-        gr.Info(f"Copiado a {dest_file}")
+        for src in sources:
+            tail = src.name[len(source_stem):] if src.name.startswith(source_stem) else src.suffix
+            dest_file = dest_folder / f"{safe_name or source_stem}{tail}"
+            shutil.copy2(src, dest_file)
+            copied.append(dest_file.name)
+        gr.Info(f"Copiado a {dest_folder}: {', '.join(copied)}")
     except Exception as e:
         gr.Warning(f"Error al exportar modelo: {e}")
 
@@ -965,68 +975,260 @@ def on_camera_preset(preset_name: str):
         return gr.update(camera_position=(-90, 80, 2.4))
 
 
-def on_generation_completed():
-    """Se ejecuta al concluir la generación para actualizar métricas técnicas y reactivar controles."""
-    glb_path = str(CURRENT_GENERATED_GLB) if CURRENT_GENERATED_GLB and CURRENT_GENERATED_GLB.exists() else None
-    stats_html = render_mesh_stats_html(glb_path)
+def export_for_downloads(glb_path: Optional[str], settings: dict) -> Tuple[dict, str]:
+    """Exporta el .glb con el perfil de la sesión a output/exports/<modelo>/. Retorna ({fmt: ruta}, resumen)."""
+    if not glb_path or not Path(glb_path).exists():
+        return {}, ""
+    src = Path(glb_path)
+    try:
+        files, summary = export_with_profile(src, EXPORTS_DIR / src.stem, src.stem, normalize_settings(settings))
+        return {fmt: str(p) for fmt, p in files.items()}, summary
+    except Exception as e:
+        print(f"[Aviso Exportación] {e}")
+        return {}, f"Error al exportar: {e}"
+
+
+def download_updates(export_map: Optional[dict], settings: dict) -> list:
+    """Un update por formato (orden ALL_FORMATS): visible si el perfil lo usa, activo si existe el archivo."""
+    formats = active_formats(normalize_settings(settings))
+    updates = []
+    for fmt in ALL_FORMATS:
+        path = (export_map or {}).get(fmt)
+        ok = bool(path) and Path(path).exists()
+        updates.append(gr.update(visible=fmt in formats, value=path if ok else None, interactive=ok))
+    return updates
+
+
+def slicer_button_update(export_map: Optional[dict], settings: dict):
+    """Botón 'Abrir en <slicer>': solo en modo impresión."""
+    settings = normalize_settings(settings)
+    if settings["mode"] != "impresion":
+        return gr.update(visible=False)
+    _, name, exe = resolve_slicer(settings)
+    has_file = any(f in (export_map or {}) for f in PRINT_FORMATS)
+    return gr.update(visible=True, value=f"Abrir en {name}" if exe else "Abrir en slicer", interactive=has_file)
+
+
+def on_open_slicer(export_map: Optional[dict], settings: dict) -> None:
+    """Abre el archivo de impresión (3MF > STL > OBJ) en el slicer configurado."""
+    path = next((export_map[f] for f in PRINT_FORMATS if (export_map or {}).get(f)), None)
+    if not path or not Path(path).exists():
+        gr.Warning("No hay un archivo de impresión exportado todavía.")
+        return
+    try:
+        name = open_in_slicer(path, normalize_settings(settings))
+        gr.Info(f"Abriendo {Path(path).name} en {name}...")
+    except Exception as e:
+        gr.Warning(f"No se pudo abrir el slicer: {e}")
+
+
+def on_generation_completed(export_map: Optional[dict], settings: dict):
+    """Al concluir la generación: exporta con el perfil de la sesión, actualiza métricas y reactiva controles."""
+    if not LAST_GEN_OK:
+        # Generación fallida o cancelada: se conserva el estado y las descargas anteriores
+        return (
+            gr.update(interactive=True, value=GENERATE_LABEL),
+            gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(),
+            *download_updates(export_map, settings),
+            slicer_button_update(export_map, settings)
+        )
+    glb_path = str(CURRENT_GENERATED_GLB)
+    new_map, summary = export_for_downloads(glb_path, settings)
     return (
         gr.update(interactive=True, value=GENERATE_LABEL),
         glb_path,
-        stats_html,
-        "Textura"
+        render_mesh_stats_html(glb_path),
+        "Textura",
+        new_map,
+        render_progress_html(f"{LAST_GEN_SUMMARY} · {summary}", 100),
+        *download_updates(new_map, settings),
+        slicer_button_update(new_map, settings)
     )
 
 
-def on_select_library_model(selection: str):
-    """Carga el modelo en el visor y prepara descargas en GLB, STL y 3MF instantáneamente."""
+def on_select_library_model(selection: str, settings: dict):
+    """Carga el modelo en el visor y prepara las descargas con el perfil de exportación de la sesión."""
     glb_path_str = load_existing_model_preview(selection)
     if not glb_path_str:
         return (
             gr.skip(),
-            gr.update(interactive=False, value=None),
-            gr.update(interactive=False, value=None),
-            gr.update(interactive=False, value=None),
             None,
             render_mesh_stats_html(None),
-            "Textura"
+            "Textura",
+            {},
+            *download_updates({}, settings),
+            slicer_button_update({}, settings)
         )
-    glb_path = Path(glb_path_str)
-    
-    # 1. Comprobar si ya existen archivos hermanos .stl y .3mf para respuesta instantánea
-    stl_file = glb_path.with_suffix(".stl")
-    stl_val = str(stl_file.resolve()) if stl_file.exists() else None
-    
-    threemf_file = glb_path.with_suffix(".3mf")
-    threemf_val = str(threemf_file.resolve()) if threemf_file.exists() else None
-
-    # 2. Si no existen, convertir bajo demanda
-    if not stl_val:
-        try:
-            s = convert_glb_to_format(glb_path, "stl")
-            if s and s.exists():
-                stl_val = str(s.resolve())
-        except Exception:
-            stl_val = None
-
-    if not threemf_val:
-        try:
-            t = convert_glb_to_format(glb_path, "3mf")
-            if t and t.exists():
-                threemf_val = str(t.resolve())
-        except Exception:
-            threemf_val = None
-
-    stats_html = render_mesh_stats_html(str(glb_path.resolve()))
-
+    glb_path = str(Path(glb_path_str).resolve())
+    export_map, _ = export_for_downloads(glb_path, settings)
     return (
-        str(glb_path.resolve()),
-        gr.update(interactive=True, value=str(glb_path.resolve())),
-        gr.update(interactive=stl_val is not None, value=stl_val),
-        gr.update(interactive=threemf_val is not None, value=threemf_val),
-        str(glb_path.resolve()),
-        stats_html,
-        "Textura"
+        glb_path,
+        glb_path,
+        render_mesh_stats_html(glb_path),
+        "Textura",
+        export_map,
+        *download_updates(export_map, settings),
+        slicer_button_update(export_map, settings)
     )
+
+
+# ------------------------------------------------------------------------------
+# Modal de configuración de exportación
+# ------------------------------------------------------------------------------
+
+MODE_CHOICES = [("Modelos 3D", "modelos"), ("Impresión 3D", "impresion")]
+PIVOT_CHOICES = [("Base", "base"), ("Centro", "centro")]
+TEXTURE_CHOICES = [("1K", 1024), ("2K", 2048), ("4K", 4096)]
+MODEL_FORMAT_CHOICES = [(f.upper(), f) for f in MODEL_FORMATS]
+PRINT_FORMAT_CHOICES = [(f.upper(), f) for f in PRINT_FORMATS]
+
+
+def slicer_choices() -> list:
+    installed = detect_slicers()
+    choices = [("Automático (según impresora)", "auto")]
+    for key, (name, _) in SLICERS.items():
+        choices.append((f"{name}" + ("" if key in installed else " (no instalado)"), key))
+    choices.append(("Programa predeterminado de Windows", "default"))
+    return choices
+
+
+def render_printer_info(printer: str, slicer: str, bx=None, by=None, bz=None) -> str:
+    """Línea informativa: volumen de impresión, tecnología y slicer que se usará."""
+    tmp = normalize_settings({"print_printer": printer, "print_slicer": slicer,
+                              "print_custom_bed": [bx or 220, by or 220, bz or 250]})
+    x, y, z, tech, _ = printer_dims(tmp)
+    _, name, exe = resolve_slicer(tmp)
+    slicer_txt = f"se abrirá en {name}" if exe else "slicer no detectado: se abrirá con el programa predeterminado"
+    return f'<div class="printer-info"><b>{x:g} × {y:g} × {z:g} mm</b> · {tech} · {slicer_txt}</div>'
+
+
+def on_open_settings(settings: dict):
+    """Abre el modal cargando el perfil guardado en el navegador (descarta cambios sin guardar)."""
+    s = normalize_settings(settings)
+    is_print = s["mode"] == "impresion"
+    bed = s["print_custom_bed"]
+    return (
+        gr.update(visible=True),
+        s["mode"],
+        gr.update(visible=not is_print),
+        gr.update(visible=is_print),
+        s["model_formats"],
+        s["model_pivot"],
+        s["model_height_m"],
+        s["texture_max"],
+        s["print_printer"],
+        gr.update(visible=s["print_printer"] == CUSTOM_PRINTER),
+        bed[0], bed[1], bed[2],
+        s["print_height_mm"],
+        s["print_fit_bed"],
+        s["print_formats"],
+        s["print_repair"],
+        gr.update(choices=slicer_choices(), value=s["print_slicer"]),
+        render_printer_info(s["print_printer"], s["print_slicer"], *bed),
+    )
+
+
+def on_save_settings(
+    mode, model_formats, model_pivot, model_height_m, texture_max,
+    printer, bed_x, bed_y, bed_z, print_height_mm, fit_bed, print_formats, repair, slicer,
+    gen_model_path, lib_model_path
+):
+    """
+    Guarda el perfil en el navegador (y en disco como valor inicial para navegadores nuevos),
+    cierra el modal y vuelve a exportar los modelos cargados con el nuevo perfil.
+    """
+    if not model_formats:
+        gr.Warning("Modelos 3D necesita al menos un formato: se usará GLB.")
+    if not print_formats:
+        gr.Warning("Impresión 3D necesita al menos un formato: se usará 3MF.")
+    settings = normalize_settings({
+        "mode": mode,
+        "model_formats": list(model_formats or []),
+        "model_pivot": model_pivot,
+        "model_height_m": float(model_height_m or 1.0),
+        "texture_max": int(texture_max or 2048),
+        "print_printer": printer,
+        "print_custom_bed": [float(bed_x or 220), float(bed_y or 220), float(bed_z or 250)],
+        "print_height_mm": float(print_height_mm or 80.0),
+        "print_fit_bed": bool(fit_bed),
+        "print_formats": list(print_formats or []),
+        "print_repair": bool(repair),
+        "print_slicer": slicer or "auto",
+    })
+    try:
+        save_settings(SETTINGS_FILE, settings)
+    except Exception as e:
+        print(f"[Aviso] No se pudo guardar {SETTINGS_FILE}: {e}")
+
+    gen_map, _ = export_for_downloads(gen_model_path, settings)
+    lib_map, _ = export_for_downloads(lib_model_path, settings)
+    gr.Info(f"Perfil guardado: {profile_label(settings)}")
+    return (
+        gr.update(visible=False),
+        gr.update(value=profile_label(settings)),
+        settings,
+        gen_map, *download_updates(gen_map, settings), slicer_button_update(gen_map, settings),
+        lib_map, *download_updates(lib_map, settings), slicer_button_update(lib_map, settings),
+    )
+
+
+# ------------------------------------------------------------------------------
+# Preferencias de la interfaz guardadas en el navegador (localStorage)
+# ------------------------------------------------------------------------------
+
+# Clave y secreto fijos: con valores aleatorios (por defecto en gr.BrowserState) lo guardado
+# se perdería en cada reinicio del servidor. Son preferencias locales, no datos sensibles.
+BROWSER_STATE_SECRET = "studio3d-local-ui-preferences"
+UI_PREFS_STORAGE_KEY = f"studio3d_ui_prefs_{MODE}"
+EXPORT_STORAGE_KEY = f"studio3d_export_profile_{MODE}"
+
+# La pestaña activa es estado visual: se guarda en el navegador solo con clics reales del usuario
+# (Gradio dispara 'select' del Tab al montar la página, lo que pisaría la preferencia guardada)
+TAB_PERSIST_JS = """
+() => {
+    const KEY = "studio3d_tab_%s";
+    const tabButtons = () => [...document.querySelectorAll('.custom-tabs [role="tablist"] button[role="tab"]')];
+    let saved = null;
+    try { saved = localStorage.getItem(KEY); } catch (e) {}
+    const restore = (attempt) => {
+        const buttons = tabButtons();
+        if (!buttons.length) {
+            if (attempt < 50) setTimeout(() => restore(attempt + 1), 100);
+            return;
+        }
+        const target = buttons.find(b => b.textContent.trim() === saved);
+        if (target && !target.classList.contains("selected")) target.click();
+    };
+    restore(0);
+    document.addEventListener("click", (e) => {
+        const tab = e.target.closest('.custom-tabs [role="tab"]');
+        if (tab && e.isTrusted) {
+            try { localStorage.setItem(KEY, tab.textContent.trim()); } catch (err) {}
+        }
+    }, true);
+}
+""" % MODE
+
+
+def remember_pref(key: str):
+    """Crea el callback que guarda un valor de la interfaz en las preferencias del navegador."""
+    def _store(value, prefs):
+        prefs = dict(prefs or {})
+        prefs[key] = value
+        return prefs
+    return _store
+
+
+def restore_pref(prefs: Optional[dict], key: str, allowed=None, kind=None):
+    """Valor guardado si es válido; si no existe o ya no es válido, no toca el componente."""
+    if not isinstance(prefs, dict) or key not in prefs:
+        return gr.skip()
+    value = prefs[key]
+    if kind is not None and not isinstance(value, kind):
+        return gr.skip()
+    if allowed is not None and value not in allowed:
+        return gr.skip()
+    return value
 
 
 # ==============================================================================
@@ -1074,6 +1276,7 @@ html, body {
     background: var(--s-bg) !important;
     position: relative !important;
 }
+.gradio-container .main.fillable { max-width: min(100%, 2000px) !important; }
 .gradio-container .main,
 .gradio-container .wrap,
 .gradio-container .contain {
@@ -1555,6 +1758,144 @@ footer { display: none !important; }
     font-size: 0.78rem !important;
 }
 
+/* ==============================================================================
+   Tuerca de configuración (esquina derecha de la cabecera)
+   ============================================================================== */
+.studio-header { padding-right: 250px; }
+.settings-btn {
+    position: absolute !important;
+    top: 6px !important;
+    right: 0 !important;
+    z-index: 10 !important;
+    width: 240px !important;
+    max-width: 240px !important;
+    height: 32px !important;
+    min-height: 32px !important;
+    padding: 0 12px !important;
+    justify-content: flex-start !important;
+    gap: 8px !important;
+    border: 1px solid var(--s-border) !important;
+    border-radius: 999px !important;
+    background: var(--s-surface) !important;
+    color: var(--s-muted) !important;
+    font-size: 0.74rem !important;
+    font-weight: 600 !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    box-shadow: none !important;
+    transition: border-color 0.15s ease, color 0.15s ease !important;
+}
+.settings-btn img {
+    filter: invert(1) !important;
+    opacity: 0.8 !important;
+    width: 15px !important;
+    height: 15px !important;
+    transition: transform 0.4s ease !important;
+}
+.settings-btn:hover { color: #fff !important; border-color: var(--s-accent) !important; }
+.settings-btn:hover img { transform: rotate(60deg); }
+
+/* ==============================================================================
+   Modal de configuración de exportación
+   ============================================================================== */
+.settings-modal {
+    position: fixed !important;
+    inset: 0 !important;
+    z-index: 1000 !important;
+    margin: 0 !important;
+    padding: 16px !important;
+    align-items: center !important;
+    justify-content: center !important;
+    background: rgba(5, 6, 9, 0.72) !important;
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    border: none !important;
+}
+.settings-panel {
+    flex: 0 0 auto !important;
+    width: min(620px, 100%) !important;
+    max-height: calc(100vh - 32px) !important;
+    overflow-y: auto !important;
+    padding: 18px 20px !important;
+    gap: 14px !important;
+    background: var(--s-surface) !important;
+    border: 1px solid var(--s-border-strong) !important;
+    border-radius: 14px !important;
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6) !important;
+    animation: s-pop 0.18s ease-out;
+}
+@keyframes s-pop { from { opacity: 0; transform: translateY(8px) scale(0.98); } }
+.settings-panel > * { flex: 0 0 auto !important; }
+.settings-panel .block,
+.settings-panel .form,
+.settings-panel .row,
+.settings-panel .gr-group {
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+}
+.settings-panel .block { padding: 0 !important; }
+.settings-panel .row { gap: 12px !important; }
+.modal-head { align-items: flex-start !important; flex-wrap: nowrap !important; }
+.modal-head > .block:first-child { flex: 1 1 auto !important; }
+.modal-title { font-size: 1rem; font-weight: 700; color: #fff; }
+.modal-sub { margin-top: 3px; font-size: 0.78rem; color: var(--s-muted); }
+.modal-section { gap: 12px !important; padding: 0 !important; border: none !important; background: transparent !important; }
+.modal-hint {
+    font-size: 0.74rem;
+    line-height: 1.45;
+    color: var(--s-dim);
+    padding: 8px 10px;
+    border-radius: var(--s-radius-sm);
+    background: var(--s-surface-2);
+}
+.printer-info { font-size: 0.76rem; color: var(--s-muted); }
+.printer-info b { color: var(--s-text); }
+.modal-foot { justify-content: flex-end !important; padding-top: 4px; border-top: 1px solid var(--s-border) !important; }
+.modal-foot .btn-ghost { flex: 0 0 auto !important; width: auto !important; height: 38px !important; }
+.btn-save { flex: 0 0 auto !important; width: auto !important; min-height: 38px !important; padding: 0 22px !important; }
+
+.mode-switch .wrap { width: 100% !important; }
+.mode-switch label { flex: 1 1 0 !important; justify-content: center !important; height: 32px !important; font-size: 0.82rem !important; }
+
+/* Chips de formato (casillas) y radios en línea */
+.fmt-chips .wrap { display: flex !important; flex-wrap: wrap !important; gap: 6px !important; }
+.fmt-chips input[type="checkbox"] { display: none !important; }
+.fmt-chips label {
+    margin: 0 !important;
+    padding: 6px 14px !important;
+    border: 1px solid var(--s-border) !important;
+    border-radius: var(--s-radius-sm) !important;
+    background: var(--s-surface-2) !important;
+    color: var(--s-muted) !important;
+    font-size: 0.78rem !important;
+    font-weight: 700 !important;
+    cursor: pointer !important;
+    box-shadow: none !important;
+}
+.fmt-chips label:hover { color: var(--s-text) !important; }
+.fmt-chips label.selected,
+.fmt-chips label:has(input:checked) {
+    border-color: var(--s-accent) !important;
+    background: var(--s-accent-soft) !important;
+    color: #fff !important;
+}
+.chips-inline .wrap { display: flex !important; grid-template-columns: none !important; }
+.chips-inline label { flex: 1 1 0 !important; padding: 7px 10px !important; }
+
+.gradio-container input[type="number"] {
+    background: var(--s-surface-2) !important;
+    border-color: var(--s-border) !important;
+    border-radius: var(--s-radius-sm) !important;
+    color: var(--s-text) !important;
+    font-size: 0.82rem !important;
+}
+
+/* Botón de slicer resaltado */
+.btn-accent { border-color: rgba(139, 92, 246, 0.45) !important; color: #fff !important; }
+.action-bar .btn-accent { flex: 0 0 auto !important; width: auto !important; }
+
 /* Pestaña Sistema */
 .sys-card {
     max-width: 760px !important;
@@ -1579,6 +1920,9 @@ footer { display: none !important; }
     .studio-main-row { flex-wrap: wrap !important; }
     .studio-sidebar { flex: 1 1 100% !important; width: 100% !important; max-width: 100% !important; }
     .brand-tag { display: none; }
+    .gpu-pill { display: none; }
+    .studio-header { padding-right: 178px; }
+    .settings-btn { width: 170px !important; max-width: 170px !important; }
     .action-bar { flex-wrap: wrap !important; }
 }
 """
@@ -1676,13 +2020,36 @@ def build_viewer_toolbar():
     return shading, bg, cam
 
 
-def build_download_buttons(glb=None, stl=None, threemf=None, enabled=False):
-    """Tres botones compactos de descarga (GLB / STL / 3MF)."""
-    common = dict(scale=0, min_width=84, elem_classes=["btn-dl"])
-    glb_btn = gr.DownloadButton("GLB", value=glb, icon="assets/icons/cube.svg", interactive=enabled, **common)
-    stl_btn = gr.DownloadButton("STL", value=stl, icon="assets/icons/printer.svg", interactive=enabled and bool(stl), **common)
-    threemf_btn = gr.DownloadButton("3MF", value=threemf, icon="assets/icons/layers.svg", interactive=enabled and bool(threemf), **common)
-    return glb_btn, stl_btn, threemf_btn
+FORMAT_ICONS = {"glb": "cube", "obj": "palette", "ply": "sparkles", "stl": "printer", "3mf": "layers"}
+
+
+def build_download_buttons() -> list:
+    """Un botón compacto por formato (orden ALL_FORMATS); solo se ven los del perfil activo."""
+    formats = active_formats(INITIAL_SETTINGS)
+    return [
+        gr.DownloadButton(
+            fmt.upper(),
+            icon=f"assets/icons/{FORMAT_ICONS[fmt]}.svg",
+            interactive=False,
+            visible=fmt in formats,
+            scale=0,
+            min_width=84,
+            elem_classes=["btn-dl"]
+        )
+        for fmt in ALL_FORMATS
+    ]
+
+
+def build_slicer_button():
+    return gr.Button(
+        "Abrir en slicer",
+        icon="assets/icons/printer.svg",
+        interactive=False,
+        visible=INITIAL_SETTINGS["mode"] == "impresion",
+        scale=0,
+        min_width=150,
+        elem_classes=["btn-ghost", "btn-accent"]
+    )
 
 
 with gr.Blocks(title=page_title) as demo:
@@ -1707,10 +2074,149 @@ with gr.Blocks(title=page_title) as demo:
         padding=False
     )
 
+    # Preferencias guardadas en el navegador (localStorage): sobreviven a recargas y reinicios
+    ui_prefs = gr.BrowserState(
+        default_value={},
+        storage_key=UI_PREFS_STORAGE_KEY,
+        secret=BROWSER_STATE_SECRET
+    )
+    export_settings = gr.BrowserState(
+        default_value=INITIAL_SETTINGS,
+        storage_key=EXPORT_STORAGE_KEY,
+        secret=BROWSER_STATE_SECRET
+    )
+
+    # Tuerca de configuración (se coloca en la esquina derecha de la cabecera con CSS)
+    btn_settings = gr.Button(
+        profile_label(INITIAL_SETTINGS),
+        icon="assets/icons/settings.svg",
+        elem_classes=["settings-btn"]
+    )
+
+    # Modal de configuración de exportación (estilo Meshy)
+    with gr.Column(visible=False, elem_classes=["settings-modal"]) as settings_modal:
+        with gr.Column(elem_classes=["settings-panel"]):
+            with gr.Row(elem_classes=["modal-head"]):
+                gr.HTML(
+                    """
+                    <div class="modal-title">Configuración de exportación</div>
+                    <div class="modal-sub">Elige para qué es el modelo. Se aplica a las descargas, a Copiar y al slicer.</div>
+                    """,
+                    padding=False
+                )
+                btn_close_settings = gr.Button(
+                    "",
+                    icon="assets/icons/x.svg",
+                    scale=0,
+                    min_width=36,
+                    elem_classes=["btn-ghost", "btn-icon"]
+                )
+
+            set_mode = gr.Radio(
+                choices=MODE_CHOICES,
+                value=INITIAL_SETTINGS["mode"],
+                show_label=False,
+                container=False,
+                elem_classes=["segmented", "mode-switch"]
+            )
+
+            with gr.Column(visible=INITIAL_SETTINGS["mode"] != "impresion", elem_classes=["modal-section"]) as model_group:
+                set_model_formats = gr.CheckboxGroup(
+                    choices=MODEL_FORMAT_CHOICES,
+                    value=INITIAL_SETTINGS["model_formats"],
+                    label="Formatos",
+                    elem_classes=["fmt-chips"]
+                )
+                with gr.Row():
+                    set_pivot = gr.Radio(
+                        choices=PIVOT_CHOICES,
+                        value=INITIAL_SETTINGS["model_pivot"],
+                        label="Origen",
+                        min_width=140,
+                        elem_classes=["preset-chips", "chips-inline"]
+                    )
+                    set_height_m = gr.Number(
+                        value=INITIAL_SETTINGS["model_height_m"],
+                        label="Altura (m)",
+                        minimum=0.01,
+                        step=0.1,
+                        min_width=100
+                    )
+                    set_texture = gr.Radio(
+                        choices=TEXTURE_CHOICES,
+                        value=INITIAL_SETTINGS["texture_max"],
+                        label="Textura máx.",
+                        min_width=170,
+                        elem_classes=["preset-chips", "chips-inline"]
+                    )
+                gr.HTML(
+                    '<div class="modal-hint">Y-up, listo para Godot, Unity, Unreal, Blender y web. '
+                    'El OBJ con textura se descarga como .zip (obj + mtl + png).</div>',
+                    padding=False
+                )
+
+            with gr.Column(visible=INITIAL_SETTINGS["mode"] == "impresion", elem_classes=["modal-section"]) as print_group:
+                with gr.Row():
+                    set_printer = gr.Dropdown(
+                        choices=list(PRINTERS),
+                        value=INITIAL_SETTINGS["print_printer"],
+                        label="Impresora",
+                        min_width=180
+                    )
+                    set_slicer = gr.Dropdown(
+                        choices=slicer_choices(),
+                        value=INITIAL_SETTINGS["print_slicer"],
+                        label="Slicer",
+                        min_width=180
+                    )
+                printer_info = gr.HTML(
+                    value=render_printer_info(INITIAL_SETTINGS["print_printer"], INITIAL_SETTINGS["print_slicer"], *INITIAL_SETTINGS["print_custom_bed"]),
+                    padding=False
+                )
+                with gr.Row(visible=INITIAL_SETTINGS["print_printer"] == CUSTOM_PRINTER) as custom_bed_row:
+                    set_bed_x = gr.Number(value=INITIAL_SETTINGS["print_custom_bed"][0], label="Cama X (mm)", minimum=10, min_width=90)
+                    set_bed_y = gr.Number(value=INITIAL_SETTINGS["print_custom_bed"][1], label="Cama Y (mm)", minimum=10, min_width=90)
+                    set_bed_z = gr.Number(value=INITIAL_SETTINGS["print_custom_bed"][2], label="Altura Z (mm)", minimum=10, min_width=90)
+                with gr.Row():
+                    set_height_mm = gr.Number(
+                        value=INITIAL_SETTINGS["print_height_mm"],
+                        label="Altura del modelo (mm)",
+                        minimum=1,
+                        step=5,
+                        min_width=140
+                    )
+                    set_print_formats = gr.CheckboxGroup(
+                        choices=PRINT_FORMAT_CHOICES,
+                        value=INITIAL_SETTINGS["print_formats"],
+                        label="Formatos",
+                        min_width=200,
+                        elem_classes=["fmt-chips"]
+                    )
+                with gr.Row():
+                    set_fit_bed = gr.Checkbox(
+                        value=INITIAL_SETTINGS["print_fit_bed"],
+                        label="Ajustar al volumen de impresión",
+                        container=False,
+                        elem_classes=["tex-check"]
+                    )
+                    set_repair = gr.Checkbox(
+                        value=INITIAL_SETTINGS["print_repair"],
+                        label="Reparar malla (normales y huecos)",
+                        container=False,
+                        elem_classes=["tex-check"]
+                    )
+                gr.HTML(
+                    '<div class="modal-hint">Solo geometría, en milímetros y Z-up, apoyada en la cama y centrada '
+                    'en el volumen de la impresora. El 3MF lleva las unidades incluidas.</div>',
+                    padding=False
+                )
+
+            with gr.Row(elem_classes=["modal-foot"]):
+                btn_cancel_settings = gr.Button("Cancelar", scale=0, min_width=100, elem_classes=["btn-ghost"])
+                btn_save_settings = gr.Button("Guardar", scale=0, min_width=120, elem_classes=["btn-generate", "btn-save"])
+
     _initial_preview = get_initial_preview_model()
     _has_real_model = bool(_initial_preview and not _initial_preview.endswith("placeholder.glb") and not _initial_preview.endswith("empty.glb"))
-    _init_stl = str(Path(_initial_preview).with_suffix(".stl")) if _has_real_model and Path(_initial_preview).with_suffix(".stl").exists() else None
-    _init_3mf = str(Path(_initial_preview).with_suffix(".3mf")) if _has_real_model and Path(_initial_preview).with_suffix(".3mf").exists() else None
 
     with gr.Tabs(elem_classes=["custom-tabs"]):
         # ======================================================================
@@ -1800,11 +2306,10 @@ with gr.Blocks(title=page_title) as demo:
                             elem_classes=["hud-block"]
                         )
                     active_model_path = gr.State(value=_initial_preview if _has_real_model else None)
+                    gen_export_state = gr.State(value={})
 
                     with gr.Row(elem_classes=["action-bar"]):
-                        download_glb_btn, download_stl_btn, download_3mf_btn = build_download_buttons(
-                            _initial_preview if _has_real_model else None, _init_stl, _init_3mf, _has_real_model
-                        )
+                        gen_dl_buttons = build_download_buttons()
                         if MODE == "kambo":
                             dest_category = gr.Dropdown(
                                 choices=["/bombos/", "/bozis/", "/cosmetics/"],
@@ -1824,7 +2329,7 @@ with gr.Blocks(title=page_title) as demo:
                             )
                         else:
                             custom_dest_folder = gr.Textbox(
-                                placeholder="Copiar .glb a carpeta (ej. C:/Proyectos/Godot/assets)",
+                                placeholder="Copiar exportados a carpeta (ej. C:/Proyectos/Godot/assets)",
                                 show_label=False,
                                 container=False,
                                 lines=1,
@@ -1839,6 +2344,7 @@ with gr.Blocks(title=page_title) as demo:
                                 min_width=96,
                                 elem_classes=["btn-ghost"]
                             )
+                        gen_slicer_btn = build_slicer_button()
 
         # ======================================================================
         # TAB 2: Biblioteca
@@ -1861,6 +2367,7 @@ with gr.Blocks(title=page_title) as demo:
                         elem_classes=["hud-block"]
                     )
                 lib_active_model_path = gr.State(value=_initial_preview if _has_real_model else None)
+                lib_export_state = gr.State(value={})
 
                 with gr.Row(elem_classes=["action-bar"]):
                     dropdown_models = gr.Dropdown(
@@ -1879,7 +2386,8 @@ with gr.Blocks(title=page_title) as demo:
                         min_width=36,
                         elem_classes=["btn-ghost", "btn-icon"]
                     )
-                    lib_download_glb, lib_download_stl, lib_download_3mf = build_download_buttons()
+                    lib_dl_buttons = build_download_buttons()
+                    lib_slicer_btn = build_slicer_button()
 
         # ======================================================================
         # TAB 3: Sistema
@@ -1896,7 +2404,8 @@ with gr.Blocks(title=page_title) as demo:
 - **GPU:** {GPU_SYS_TEXT}
 - **Perfil VRAM auto-detectado:** `{auto_vram_key}` ({auto_vram_desc})
 - **Modelos y caché:** `{MODELS_ROOT}`
-- **Salida:** `{OUTPUT_DIR}` (`.glb`, `.stl`, `.3mf`)
+- **Salida:** `{OUTPUT_DIR}` (GLB maestro) y `{EXPORTS_DIR}` (exportados por perfil)
+- **Configuración de exportación:** `{SETTINGS_FILE}`
 {kambo_sys_info}- **Motores:** Tencent Hunyuan3D-2 Turbo / Stable Fast 3D + Rembg U2-Net
 - **Limpieza de geometría:** eliminación de losas e islas parásitas (< 3% del volumen)
                 """,
@@ -1923,12 +2432,10 @@ with gr.Blocks(title=page_title) as demo:
     btn_generate.click(
         fn=lambda: (
             gr.update(interactive=False, value="Generando..."),
-            gr.update(interactive=False),
-            gr.update(interactive=False),
-            gr.update(interactive=False)
+            *[gr.update(interactive=False) for _ in range(len(gen_dl_buttons) + 1)]
         ),
         inputs=[],
-        outputs=[btn_generate, download_glb_btn, download_stl_btn, download_3mf_btn]
+        outputs=[btn_generate, *gen_dl_buttons, gen_slicer_btn]
     ).then(
         fn=ui_generate_3d,
         inputs=[
@@ -1940,11 +2447,12 @@ with gr.Blocks(title=page_title) as demo:
             txt_model_name,
             vram_dropdown
         ],
-        outputs=[viewer_3d, download_glb_btn, download_stl_btn, download_3mf_btn, status_widget]
+        outputs=[viewer_3d, status_widget]
     ).then(
         fn=on_generation_completed,
-        inputs=[],
-        outputs=[btn_generate, active_model_path, mesh_stats_display, viewer_shading_mode]
+        inputs=[gen_export_state, export_settings],
+        outputs=[btn_generate, active_model_path, mesh_stats_display, viewer_shading_mode,
+                 gen_export_state, status_widget, *gen_dl_buttons, gen_slicer_btn]
     )
 
     # 3. Controles del visor (sombreado, fondo, cámara)
@@ -1964,7 +2472,7 @@ with gr.Blocks(title=page_title) as demo:
         outputs=[viewer_3d]
     )
 
-    # 4. Guardar directamente en el juego o carpeta personalizada
+    # 4. Guardar directamente en el juego, en una carpeta o abrir en el slicer
     if MODE == "kambo":
         btn_save_game.click(
             fn=ui_save_to_game,
@@ -1974,9 +2482,11 @@ with gr.Blocks(title=page_title) as demo:
     else:
         btn_save_custom.click(
             fn=ui_save_to_custom_dir,
-            inputs=[custom_dest_folder, txt_model_name],
+            inputs=[custom_dest_folder, txt_model_name, gen_export_state],
             outputs=[]
         )
+    gen_slicer_btn.click(fn=on_open_slicer, inputs=[gen_export_state, export_settings], outputs=[])
+    lib_slicer_btn.click(fn=on_open_slicer, inputs=[lib_export_state, export_settings], outputs=[])
 
     # 5. Explorador de modelos en biblioteca
     btn_refresh_library.click(
@@ -1984,22 +2494,11 @@ with gr.Blocks(title=page_title) as demo:
         inputs=[],
         outputs=[dropdown_models]
     )
-    
-    # Actualización automática al cambiar, ingresar o seleccionar
     dropdown_models.change(
         fn=on_select_library_model,
-        inputs=[dropdown_models],
-        outputs=[library_viewer, lib_download_glb, lib_download_stl, lib_download_3mf, lib_active_model_path, lib_mesh_stats_display, lib_shading_mode]
-    )
-    dropdown_models.input(
-        fn=on_select_library_model,
-        inputs=[dropdown_models],
-        outputs=[library_viewer, lib_download_glb, lib_download_stl, lib_download_3mf, lib_active_model_path, lib_mesh_stats_display, lib_shading_mode]
-    )
-    dropdown_models.select(
-        fn=on_select_library_model,
-        inputs=[dropdown_models],
-        outputs=[library_viewer, lib_download_glb, lib_download_stl, lib_download_3mf, lib_active_model_path, lib_mesh_stats_display, lib_shading_mode]
+        inputs=[dropdown_models, export_settings],
+        outputs=[library_viewer, lib_active_model_path, lib_mesh_stats_display, lib_shading_mode,
+                 lib_export_state, *lib_dl_buttons, lib_slicer_btn]
     )
 
     # Controladores de Visualización Interactiva y Malla (Biblioteca)
@@ -2017,6 +2516,94 @@ with gr.Blocks(title=page_title) as demo:
         fn=on_camera_preset,
         inputs=[lib_cam_choice],
         outputs=[library_viewer]
+    )
+
+    # 6. Modal de configuración de exportación
+    btn_settings.click(
+        fn=on_open_settings,
+        inputs=[export_settings],
+        outputs=[settings_modal, set_mode, model_group, print_group,
+                 set_model_formats, set_pivot, set_height_m, set_texture,
+                 set_printer, custom_bed_row, set_bed_x, set_bed_y, set_bed_z,
+                 set_height_mm, set_fit_bed, set_print_formats, set_repair, set_slicer, printer_info]
+    )
+    for _btn in (btn_close_settings, btn_cancel_settings):
+        _btn.click(fn=lambda: gr.update(visible=False), inputs=[], outputs=[settings_modal])
+
+    set_mode.change(
+        fn=lambda m: (gr.update(visible=m != "impresion"), gr.update(visible=m == "impresion")),
+        inputs=[set_mode],
+        outputs=[model_group, print_group]
+    )
+    for _comp in (set_printer, set_slicer, set_bed_x, set_bed_y, set_bed_z):
+        _comp.change(
+            fn=lambda p, s, x, y, z: (render_printer_info(p, s, x, y, z), gr.update(visible=p == CUSTOM_PRINTER)),
+            inputs=[set_printer, set_slicer, set_bed_x, set_bed_y, set_bed_z],
+            outputs=[printer_info, custom_bed_row]
+        )
+
+    btn_save_settings.click(
+        fn=on_save_settings,
+        inputs=[set_mode, set_model_formats, set_pivot, set_height_m, set_texture,
+                set_printer, set_bed_x, set_bed_y, set_bed_z, set_height_mm, set_fit_bed,
+                set_print_formats, set_repair, set_slicer,
+                active_model_path, lib_active_model_path],
+        outputs=[settings_modal, btn_settings, export_settings,
+                 gen_export_state, *gen_dl_buttons, gen_slicer_btn,
+                 lib_export_state, *lib_dl_buttons, lib_slicer_btn]
+    )
+
+    # 7. Preferencias de la interfaz en el navegador: cada cambio se guarda en localStorage
+    #    y al abrir la página se restauran (solo valores que sigan siendo válidos)
+    persisted_controls = {
+        "preset": (preset_radio, list(PRESET_CONFIG_MAP), str),
+        "engine": (ai_model_dropdown, [ENGINE_HUNYUAN, ENGINE_SF3D], str),
+        "vram": (vram_dropdown, VRAM_PROFILE_CHOICES, str),
+        "texture": (chk_texture, None, bool),
+        "model_name": (txt_model_name, None, str),
+        "shading": (viewer_shading_mode, SHADING_CHOICES, str),
+        "bg": (viewer_bg_choice, BG_CHOICES, str),
+        "cam": (viewer_cam_choice, CAM_CHOICES, str),
+        "lib_shading": (lib_shading_mode, SHADING_CHOICES, str),
+        "lib_bg": (lib_bg_choice, BG_CHOICES, str),
+        "lib_cam": (lib_cam_choice, CAM_CHOICES, str),
+        "lib_model": (dropdown_models, None, str),
+    }
+    if MODE == "kambo":
+        persisted_controls["dest_category"] = (dest_category, ["/bombos/", "/bozis/", "/cosmetics/"], str)
+    else:
+        persisted_controls["dest_folder"] = (custom_dest_folder, None, str)
+
+    for _key, (_comp, _allowed, _kind) in persisted_controls.items():
+        _comp.change(
+            fn=remember_pref(_key),
+            inputs=[_comp, ui_prefs],
+            outputs=[ui_prefs],
+            show_progress="hidden",
+            trigger_mode="always_last"
+        )
+
+    def restore_session(prefs, settings):
+        """Al abrir la página: restaura la interfaz y el perfil de exportación guardados en el navegador."""
+        settings = normalize_settings(settings)
+        values = []
+        for key, (_comp, allowed, kind) in persisted_controls.items():
+            if key == "lib_model":
+                allowed = [m for m in list_existing_models() if not m.startswith("(")]
+            values.append(restore_pref(prefs, key, allowed, kind))
+        return (
+            *values,
+            gr.update(value=profile_label(settings)),
+            *download_updates({}, settings), slicer_button_update({}, settings),
+            *download_updates({}, settings), slicer_button_update({}, settings),
+        )
+
+    demo.load(
+        fn=restore_session,
+        inputs=[ui_prefs, export_settings],
+        outputs=[*[c for c, _, _ in persisted_controls.values()], btn_settings,
+                 *gen_dl_buttons, gen_slicer_btn, *lib_dl_buttons, lib_slicer_btn],
+        show_progress="hidden"
     )
 
 
@@ -2053,5 +2640,6 @@ if __name__ == "__main__":
         inbrowser=False,
         theme=custom_theme,
         css=CUSTOM_CSS,
+        js=TAB_PERSIST_JS,
         allowed_paths=allowed_list
     )
