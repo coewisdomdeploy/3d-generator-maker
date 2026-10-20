@@ -11,7 +11,7 @@ proceso, así que el resto del código no necesita cambios.
 
 Prioridad de selección:
     1. Argumento --gpu <índice|cpu|ask>
-    2. Variable de entorno STUDIO_GPU (mismo formato)
+    2. Variable de entorno STUDIO_GPU (mismo formato), o STUDIO_GPU=... en .env
     3. Menú interactivo en consola (si hay más de un adaptador)
     4. Última GPU elegida (guardada en .gpu_choice)
     5. Primera GPU NVIDIA disponible
@@ -78,6 +78,18 @@ def list_other_adapters() -> list[str]:
     names = [l.strip() for l in res.stdout.splitlines() if l.strip()]
     ignored = ("nvidia", "microsoft basic", "remote display", "virtual", "parsec", "meta")
     return [n for n in names if not any(k in n.lower() for k in ignored)]
+
+
+def _env_file_value(key: str) -> Optional[str]:
+    """Lee una clave del .env del proyecto (aquí aún no se ha cargado: torch no debe importarse antes)."""
+    try:
+        for line in (Path(__file__).resolve().parent / ".env").read_text(encoding="utf-8").splitlines():
+            k, sep, v = line.strip().partition("=")
+            if sep and k.strip() == key and not line.lstrip().startswith("#"):
+                return v.strip() or None
+    except Exception:
+        pass
+    return None
 
 
 def _load_saved_choice() -> Optional[str]:
@@ -194,7 +206,7 @@ def select_gpu(argv: Optional[list[str]] = None) -> dict:
             cli_choice = argv[i + 1]
         elif arg.startswith("--gpu="):
             cli_choice = arg.split("=", 1)[1]
-    requested = cli_choice or os.environ.get("STUDIO_GPU")
+    requested = cli_choice or os.environ.get("STUDIO_GPU") or _env_file_value("STUDIO_GPU")
     force_ask = (requested or "").strip().lower() == "ask"
 
     gpus = list_nvidia_gpus()

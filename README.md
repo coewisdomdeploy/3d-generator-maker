@@ -53,12 +53,18 @@ Proyectos/
    ```cmd
    setup.bat
    ```
-2. El script realizará automáticamente:
-   - Detección de Python 3.11 en `D:\Programas\Python311` o en el sistema.
-   - Creación del entorno virtual en `D:\AI_Models\venv_3dgen`.
-   - Instalación de PyTorch con soporte **CUDA 12.4**.
-   - Instalación de `requirements.txt` y `hy3dgen`.
-   - Verificación del estado de la GPU NVIDIA.
+2. El instalador recorre 9 pasos (se puede volver a ejecutar: omite lo que ya está bien):
+   1. **Python 3.10–3.12 de 64 bits** (ofrece instalar 3.11 con `winget` si no hay).
+   2. **Entorno virtual** en `<carpeta de modelos>\venv_3dgen`, enlazado como `.venv`.
+   3. **PyTorch**: CUDA 12.4 si hay tarjeta NVIDIA, o solo CPU. La tarjeta concreta se elige al abrir la app.
+   4. **Dependencias**: con Python 3.11 instala el entorno exacto verificado (`requirements-lock.txt`); si no, `requirements.txt`. La versión CUDA de PyTorch queda fijada para que ninguna dependencia la cambie por la de CPU.
+   5. **Motores**: Hunyuan3D-2 (`hy3dgen`) y/o Stable Fast 3D (repositorio + token de Hugging Face).
+   6. **Pesos de los modelos**: muestra qué falta y ofrece descargarlo ya (geometría ~4.9 GB, textura ~9 GB, SF3D ~3.8 GB), para que el primer uso no se quede esperando.
+   7. **Textura Hunyuan3D-Paint** (opcional): ofrece instalar Visual Studio Build Tools y CUDA Toolkit 12.4 con `winget` (sin tocar el driver) y compilar `custom_rasterizer`. También se puede hacer después con `instalar_textura_hunyuan.bat`.
+   8. **Verificación de la GPU** con PyTorch.
+   9. **Configuración**: guarda la carpeta de modelos elegida en `.env` (la usan la app, la CLI y los lanzadores) y muestra el estado final de cada componente.
+
+   Estado de los pesos en cualquier momento (no usa la GPU): `.venv\Scripts\python.exe preparar_modelos.py status`
 
 ---
 
@@ -158,5 +164,15 @@ webui-kambo.bat
 
 - **¿Dónde están los archivos descargados?**
   Todos los pesos y cachés residen en `D:\AI_Models\`. Si necesitas liberar espacio en el futuro, puedes limpiar esa carpeta sin afectar tu sistema operativo.
-- **Memoria VRAM (GPU 16GB):**
-  El pipeline opera en `fp16` con descarga secuencial de modelos. El pico máximo de consumo de VRAM no supera los 9-11 GB, dejando suficiente margen para que el sistema operativo y Godot permanezcan abiertos simultáneamente.
+- **Memoria: un solo modelo en la GPU a la vez, con validación antes de cada carga.**
+  Flujo con textura: 1) se genera la geometría, 2) el modelo de forma sale de la VRAM y se comprueba que la VRAM quedó libre, 3) se valida que haya VRAM (~4.8 GB) y RAM (~7.5 GB + margen) libres para Hunyuan3D-Paint; si la RAM no alcanza, se libera también la copia en RAM del modelo de forma, 4) solo entonces se carga Paint. Si aun así no cabe, no se carga (se usa la textura de contingencia) para no trabar el equipo; con forma o SF3D se muestra un error claro.
+  Opciones en `.env` (ver `.env.example`): `KEEP_MODELS_IN_RAM`, `RAM_SAFETY_MARGIN_GB`, `RAM_PARK_MIN_FREE_GB`.
+- **Perfiles de VRAM:**
+  | Perfil | Pipeline de forma | Octree máx. | Textura |
+  | :--- | :--- | :--- | :--- |
+  | 6 GB / 8 GB | Un componente en GPU a la vez (condicionador → DiT → VAE) | 256 | 1024 |
+  | 12 GB | Completo en GPU | 320 | 1024 |
+  | 16 GB+ | Completo en GPU | 384 | 2048 |
+- **Calidad y caras:** "Máxima Calidad HD" conserva la malla completa **sin textura**. Con textura, cualquier preset se limita a 40.000 caras (el mismo tope que usa Hunyuan3D-2 antes de pintar).
+- **Textura Hunyuan3D-Paint no disponible:** necesita la extensión CUDA `custom_rasterizer` compilada. Instala CUDA Toolkit 12.4 y Visual Studio 2022 Build Tools (C++), abre una consola nueva y ejecuta `instalar_textura_hunyuan.bat`. Sin ella se usa automáticamente el horneado UV de contingencia y la consola indica el motivo.
+- **La descarga automática de pesos falla:** la interfaz muestra el error (no se queda colgada) si la descarga falla, termina sin completar o pasa 5 minutos sin avanzar. Reintenta con `descargar_modelos.bat`.

@@ -3,10 +3,13 @@ import sys
 import yaml
 from pathlib import Path
 
-safetensors_path = Path("D:/AI_Models/tencent/Hunyuan3D-2/hunyuan3d-dit-v2-0-turbo/model.fp16.safetensors")
-config_path = Path("D:/AI_Models/tencent/Hunyuan3D-2/hunyuan3d-dit-v2-0-turbo/config.yaml")
+from studio_env import HUNYUAN_LOCAL_DIR
 
-print("[1/3] Verificando archivos en D:/AI_Models/tencent/Hunyuan3D-2/hunyuan3d-dit-v2-0-turbo...")
+dit_dir = HUNYUAN_LOCAL_DIR / "hunyuan3d-dit-v2-0-turbo"
+safetensors_path = dit_dir / "model.fp16.safetensors"
+config_path = dit_dir / "config.yaml"
+
+print(f"[1/3] Verificando archivos en {dit_dir}...")
 if not config_path.exists():
     print("  [ERROR] config.yaml no existe en la carpeta.")
     sys.exit(1)

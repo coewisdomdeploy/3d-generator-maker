@@ -25,44 +25,9 @@ import gc
 from pathlib import Path
 from typing import Optional, Tuple, Union, Any, Callable
 
-# Configuración Temprana de Cache para evitar saturar el Disco C:\ (100% en D:\)
-def configure_environment_and_cache():
-    # Prioridad absoluta a la unidad D:\ para modelos y cachés pesados
-    if Path("D:/").exists():
-        base_ai_dir = Path("D:/AI_Models")
-        hf_dir = base_ai_dir / "huggingface"
-        torch_dir = base_ai_dir / "torch"
-        u2net_dir = base_ai_dir / "u2net"
-        temp_dir = base_ai_dir / "temp"
-        
-        output_dir = base_ai_dir / "output"
-        for d in [hf_dir, torch_dir, u2net_dir, temp_dir, output_dir]:
-            d.mkdir(parents=True, exist_ok=True)
-            
-        os.environ.setdefault("HF_HOME", str(hf_dir))
-        os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(hf_dir / "hub"))
-        os.environ.setdefault("TORCH_HOME", str(torch_dir))
-        os.environ.setdefault("U2NET_HOME", str(u2net_dir))
-        os.environ.setdefault("HY3DGEN_MODELS", str(base_ai_dir))
-        os.environ.setdefault("TEMP", str(temp_dir))
-        os.environ.setdefault("TMP", str(temp_dir))
-        print(f"[Smart Cache] Almacenamiento 3D y modelos configurados en D: ({base_ai_dir})")
-
-    # Cargar variables de entorno adicionales desde .env si existe
-    env_file = Path(".env")
-    if env_file.exists():
-        try:
-            with open(env_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#") and "=" in line:
-                        k, v = line.split("=", 1)
-                        if k.strip() not in os.environ:
-                            os.environ[k.strip()] = v.strip()
-        except Exception:
-            pass
-
-configure_environment_and_cache()
+# Rutas de modelos y cachés (raíz elegida en setup.bat, guardada en .env). Antes de torch.
+from studio_env import MODELS_ROOT, OUTPUT_DIR as STUDIO_OUTPUT_DIR, HUNYUAN_LOCAL_DIR, SF3D_LOCAL_DIR, REPOS_DIR
+print(f"[Smart Cache] Modelos y cachés en: {MODELS_ROOT}")
 
 # Selección de GPU al usar la CLI directamente (en la WebUI ya se hizo antes de importar este módulo)
 if __name__ == "__main__":
@@ -89,7 +54,7 @@ if torch.cuda.is_available():
     except Exception:
         pass
 
-DEFAULT_OUTPUT_DIR = Path("D:/AI_Models/output") if Path("D:/").exists() else Path("./outputs")
+DEFAULT_OUTPUT_DIR = STUDIO_OUTPUT_DIR
 DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ==============================================================================
@@ -127,55 +92,201 @@ def print_real_vram_status(stage_name: str = "") -> Tuple[float, float]:
     return 0.0, 0.0
 
 
-# Variables globales de referencia a pipelines para descarga cruzada total
-_GLOBAL_SF3D_MODEL = None
-_GLOBAL_SHAPE_PIPELINE = None
-_GLOBAL_PAINT_PIPELINE = None
+# ==============================================================================
+# Gestor de Residencia de Modelos: UN SOLO modelo en la GPU a la vez
+# ==============================================================================
+# Hay tres modelos pesados: "shape" (Hunyuan3D-DiT), "paint" (Hunyuan3D-Paint) y
+# "sf3d" (Stable Fast 3D). Flujo garantizado para cada carga:
+#   1. Se sacan de la VRAM todos los demás modelos.
+#   2. Se VALIDA que haya VRAM libre suficiente; si no, se destruyen los demás y se revalida.
+#   3. Si el modelo no está ya en RAM, se VALIDA que haya RAM libre para cargarlo (más un
+#      margen para Windows); si no, se liberan de la RAM los otros modelos y se revalida.
+#   4. Si aun así no cabe, NO se carga (InsufficientMemoryError) para no saturar el equipo.
+# Al terminar, park_model() saca el modelo de la VRAM, comprueba que la VRAM quedó libre
+# y lo conserva en RAM solo si sobra memoria (KEEP_MODELS_IN_RAM=0 lo desactiva).
+
+RAM_SAFETY_MARGIN_GB = float(os.environ.get("RAM_SAFETY_MARGIN_GB", "2"))
+RAM_PARK_MIN_FREE_GB = float(os.environ.get("RAM_PARK_MIN_FREE_GB", "4"))
+KEEP_MODELS_IN_RAM = os.environ.get("KEEP_MODELS_IN_RAM", "1").strip().lower() not in ("0", "false", "no")
+
+# Memoria estimada por modelo (fp16), medida sobre los pesos en disco:
+#   ram_load: pico de RAM durante la carga desde disco (pesos fp32 -> conversión a fp16)
+#   vram:     VRAM necesaria durante su etapa
+MODEL_MEMORY_GB = {
+    "shape": {"ram_load": 6.5, "vram": 4.5, "vram_full": 6.0},  # DiT 4.7 GB + DINOv2 + VAE turbo
+    "paint": {"ram_load": 7.5, "vram": 4.8},                    # Delight 4.0 GB + Multivista 4.8 GB (fp32 en disco)
+    "sf3d":  {"ram_load": 4.5, "vram": 6.0},                    # model.safetensors 3.8 GB (fp32)
+}
+
+_MODEL_CACHE: dict = {}
+
+
+class InsufficientMemoryError(RuntimeError):
+    """No hay RAM/VRAM suficiente para cargar un modelo sin saturar el equipo."""
+
+
+def _system_ram_free_gb() -> float:
+    try:
+        import psutil
+        return psutil.virtual_memory().available / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+
+def _vram_free_gb() -> float:
+    """VRAM libre real según el driver (incluye lo que usen otros programas)."""
+    if not torch.cuda.is_available():
+        return 0.0
+    free_b, _ = torch.cuda.mem_get_info(0)
+    return free_b / (1024 ** 3)
+
+
+def _vram_held_mb() -> float:
+    """VRAM ocupada por tensores de ESTE proceso."""
+    return torch.cuda.memory_allocated(0) / (1024 ** 2) if torch.cuda.is_available() else 0.0
+
+
+def _move_model_to_cpu(kind: str, model: Any) -> None:
+    """Saca de la VRAM todos los pesos de un modelo, sea cual sea su tipo."""
+    try:
+        if kind == "paint":
+            for sub in getattr(model, "models", {}).values():
+                sub_pipe = getattr(sub, "pipeline", None)
+                if sub_pipe is None:
+                    continue
+                if getattr(sub_pipe, "_offload_gpu_id", None) is not None and hasattr(sub_pipe, "maybe_free_model_hooks"):
+                    sub_pipe.maybe_free_model_hooks()  # Con offload de diffusers: devuelve todo a CPU
+                else:
+                    sub_pipe.to("cpu")
+            # El renderizador guarda buffers de la malla en la GPU
+            if hasattr(model, "render"):
+                model.render = None
+        elif hasattr(model, "to"):
+            model.to("cpu")
+    except Exception as e:
+        print(f" -> [VRAM Guard] Aviso al mover '{kind}' a CPU: {e}")
+
+
+def release_model(kind: str) -> None:
+    """Destruye un modelo (VRAM y RAM) y reporta cuánta RAM se recuperó."""
+    model = _MODEL_CACHE.pop(kind, None)
+    if model is None:
+        return
+    ram_before = _system_ram_free_gb()
+    _move_model_to_cpu(kind, model)
+    del model
+    flush_vram()
+    print(f" -> [Memoria] '{kind}' liberado de RAM y VRAM (RAM libre: {ram_before:.1f} -> {_system_ram_free_gb():.1f} GB)")
+
+
+def park_model(kind: str) -> None:
+    """
+    Saca un modelo de la VRAM y valida que la VRAM del proceso quedó libre. Lo conserva
+    en RAM solo si KEEP_MODELS_IN_RAM está activo y queda RAM de sobra; si no, lo destruye.
+    """
+    model = _MODEL_CACHE.get(kind)
+    if model is None:
+        return
+    _move_model_to_cpu(kind, model)
+    flush_vram()
+
+    held_mb = _vram_held_mb()
+    if held_mb > 256:
+        print(f" -> [VRAM Guard] Tras sacar '{kind}' siguen {held_mb:.0f} MB en VRAM: se destruye el modelo.")
+        release_model(kind)
+        return
+
+    free_gb = _system_ram_free_gb()
+    if not KEEP_MODELS_IN_RAM:
+        release_model(kind)
+    elif free_gb < RAM_PARK_MIN_FREE_GB:
+        print(f" -> [RAM Guard] Solo {free_gb:.1f} GB de RAM libre: se libera '{kind}' en lugar de conservarlo.")
+        release_model(kind)
+    else:
+        print(f" -> [Memoria] '{kind}' fuera de la VRAM ({held_mb:.0f} MB retenidos) y conservado en RAM ({free_gb:.1f} GB libres)")
+
+
+def park_all_models() -> None:
+    """Deja la VRAM vacía conservando en RAM los modelos que quepan."""
+    for kind in list(_MODEL_CACHE):
+        park_model(kind)
+    flush_vram()
+
+
+def activate_model(kind: str, vram_needed_gb: Optional[float] = None, strict_vram: bool = False) -> Optional[Any]:
+    """
+    Prepara la memoria para usar `kind` como ÚNICO modelo en la GPU (ver flujo arriba).
+    Devuelve el modelo si ya estaba en RAM, o None si hay que cargarlo (y llamar a register_model()).
+    Lanza InsufficientMemoryError si falta RAM, o VRAM con strict_vram=True.
+    """
+    est = MODEL_MEMORY_GB.get(kind, {})
+    vram_need = vram_needed_gb if vram_needed_gb is not None else est.get("vram", 0.0)
+    others = [k for k in _MODEL_CACHE if k != kind]
+
+    # 1. Ningún otro modelo en la VRAM
+    for other in others:
+        park_model(other)
+    flush_vram()
+
+    # 2. Validar VRAM
+    vram_ok = True
+    if torch.cuda.is_available():
+        vram_free = _vram_free_gb()
+        if vram_free < vram_need and any(k in _MODEL_CACHE for k in others):
+            for other in others:
+                release_model(other)
+            vram_free = _vram_free_gb()
+        vram_ok = vram_free >= vram_need
+        mark = "OK" if vram_ok else "INSUFICIENTE"
+        print(f" -> [Memoria] '{kind}': VRAM libre {vram_free:.1f} GB (necesita ~{vram_need:.1f}) {mark}")
+        if not vram_ok:
+            msg = (f"VRAM insuficiente para '{kind}': {vram_free:.1f} GB libres, necesita ~{vram_need:.1f} GB. "
+                   "Cierra programas que usen la GPU (juegos, navegador con aceleración, Godot).")
+            if strict_vram:
+                raise InsufficientMemoryError(msg)
+            print(f" -> [Memoria] Aviso: {msg} Se intentará igualmente.")
+
+    # 3. Validar RAM (solo si hay que cargarlo desde disco)
+    cached = _MODEL_CACHE.get(kind)
+    if cached is None:
+        ram_need = est.get("ram_load", 0.0) + RAM_SAFETY_MARGIN_GB
+        ram_free = _system_ram_free_gb()
+        for other in others:
+            if ram_free >= ram_need:
+                break
+            if other in _MODEL_CACHE:
+                release_model(other)
+                ram_free = _system_ram_free_gb()
+        ram_ok = ram_free >= ram_need
+        mark = "OK" if ram_ok else "INSUFICIENTE"
+        print(f" -> [Memoria] '{kind}': RAM libre {ram_free:.1f} GB (necesita ~{ram_need:.1f} con margen) {mark}")
+        if not ram_ok:
+            raise InsufficientMemoryError(
+                f"RAM insuficiente para cargar '{kind}': {ram_free:.1f} GB libres, necesita ~{ram_need:.1f} GB. "
+                "Cierra programas para no saturar el equipo."
+            )
+    return cached
+
+
+def register_model(kind: str, model: Any) -> None:
+    _MODEL_CACHE[kind] = model
 
 
 def unload_sf3d() -> None:
-    """Descarga total y purga estricta de SF3D de GPU a CPU para liberar VRAM."""
-    global _GLOBAL_SF3D_MODEL
-    if _GLOBAL_SF3D_MODEL is not None:
-        print(" -> [VRAM Guard] Descargando SF3D de GPU a CPU...")
-        try:
-            if hasattr(_GLOBAL_SF3D_MODEL, "to"):
-                _GLOBAL_SF3D_MODEL.to("cpu")
-        except Exception:
-            pass
-        del _GLOBAL_SF3D_MODEL
-        _GLOBAL_SF3D_MODEL = None
-    flush_vram()
+    """Destruye Stable Fast 3D."""
+    release_model("sf3d")
 
 
 def unload_hunyuan() -> None:
-    """Descarga total y purga estricta de pipelines Hunyuan3D de GPU a CPU para liberar VRAM."""
-    global _GLOBAL_SHAPE_PIPELINE, _GLOBAL_PAINT_PIPELINE
-    if _GLOBAL_SHAPE_PIPELINE is not None:
-        print(" -> [VRAM Guard] Descargando Hunyuan3D Shape Pipeline de GPU a CPU...")
-        try:
-            if hasattr(_GLOBAL_SHAPE_PIPELINE, "to"):
-                _GLOBAL_SHAPE_PIPELINE.to("cpu")
-        except Exception:
-            pass
-        del _GLOBAL_SHAPE_PIPELINE
-        _GLOBAL_SHAPE_PIPELINE = None
-    if _GLOBAL_PAINT_PIPELINE is not None:
-        print(" -> [VRAM Guard] Descargando Hunyuan3D Paint Pipeline de GPU a CPU...")
-        try:
-            if hasattr(_GLOBAL_PAINT_PIPELINE, "to"):
-                _GLOBAL_PAINT_PIPELINE.to("cpu")
-        except Exception:
-            pass
-        del _GLOBAL_PAINT_PIPELINE
-        _GLOBAL_PAINT_PIPELINE = None
-    flush_vram()
+    """Destruye los pipelines Hunyuan3D (forma y pintura)."""
+    release_model("shape")
+    release_model("paint")
 
 
 def unload_all_models() -> None:
-    """Descarga total de todos los modelos residentes en GPU."""
-    unload_sf3d()
-    unload_hunyuan()
+    """Destruye todos los modelos (VRAM y RAM)."""
+    for kind in list(_MODEL_CACHE):
+        release_model(kind)
     flush_vram()
 
 # ==============================================================================
@@ -268,7 +379,7 @@ try:
 
                                 a00 = float(ref_img[iy0, ix0, 3])
                                 a10 = float(ref_img[iy0, ix1, 3])
-                                a01 = float(ref_img[iy0, ix1, 3])
+                                a01 = float(ref_img[iy1, ix0, 3])
                                 a11 = float(ref_img[iy1, ix1, 3])
                                 alpha = (1.0 - dy) * ((1.0 - dx) * a00 + dx * a10) + dy * ((1.0 - dx) * a01 + dx * a11)
                                 alpha_norm = alpha / 255.0
@@ -302,66 +413,65 @@ _numba_rasterize = None
 # Perfiles de Rendimiento de VRAM y Hardware Adaptativo
 # ==============================================================================
 
+# Campos con efecto real:
+#   staged_offload: True  -> sube a la GPU un componente a la vez (condicionador -> DiT -> VAE).
+#                            Pico de VRAM ~2-3 GB menor; cuesta ~1-2 s de transferencias.
+#                   False -> el pipeline de forma completo vive en la GPU durante su etapa.
+#   max_octree:     tope de resolución octree del Volume Decoding (más = más detalle y VRAM).
+#   paint_resolution: resolución de render/textura de Hunyuan3D-Paint.
+#   use_fp16:       precisión de los pesos.
+# Tope de caras antes de texturizar: TEXTURE_SAFE_MAX_FACES (igual en todos los perfiles,
+# es el valor que usa el propio Hunyuan3D-2 con su FaceReducer antes de pintar).
+TEXTURE_SAFE_MAX_FACES = 40000
+
 VRAM_PROFILES = {
     "auto": {
         "name": "Auto-detectar (Recomendado)",
         "desc": "Ajusta la asignación de VRAM según el hardware detectado en el equipo.",
-        "low_vram": True,
-        "low_vram_mode": True,
         "use_fp16": True,
-        "cpu_offload": False,
-        "default_octree": 256,
-        "gc_after_step": True
+        "staged_offload": True,
+        "max_octree": 256,
+        "paint_resolution": 1024,
     },
     "low_6gb": {
         "name": "6GB VRAM (Optimizado RTX 4050 Laptop / RTX 3050)",
-        "desc": "Perfil nativo CUDA en fp16 con liberación inmediata de VRAM tras la inferencia para GPU de 6GB.",
-        "low_vram": True,
-        "low_vram_mode": True,
+        "desc": "6GB: un componente del modelo en la GPU a la vez y octree 256.",
         "use_fp16": True,
-        "cpu_offload": False,
-        "default_octree": 256,
-        "gc_after_step": True
+        "staged_offload": True,
+        "max_octree": 256,
+        "paint_resolution": 1024,
     },
     "low_8gb": {
         "name": "8GB VRAM (Optimizado RTX 4060 / Laptops)",
-        "desc": "Perfil optimizado para 8GB: descarga tensores tras inferencia y vacía caché para evitar saturar memoria compartida.",
-        "low_vram": True,
-        "low_vram_mode": True,
+        "desc": "8GB: un componente del modelo en la GPU a la vez y octree 256.",
         "use_fp16": True,
-        "cpu_offload": False,
-        "default_octree": 256,
-        "gc_after_step": True
+        "staged_offload": True,
+        "max_octree": 256,
+        "paint_resolution": 1024,
     },
     "mid_12gb": {
         "name": "12GB VRAM (Equilibrado RTX 3060 / 4070)",
-        "desc": "Perfil intermedio para 10-12GB: retiene pipeline en VRAM pero limpia buffers intermedios.",
-        "low_vram": False,
-        "low_vram_mode": False,
+        "desc": "12GB: pipeline de forma completo en GPU y octree hasta 320.",
         "use_fp16": True,
-        "cpu_offload": False,
-        "default_octree": 320,
-        "gc_after_step": False
+        "staged_offload": False,
+        "max_octree": 320,
+        "paint_resolution": 1024,
     },
     "high_16gb": {
         "name": "16GB+ VRAM (Máximo Rendimiento RTX 4080 / 4090 / 3090)",
-        "desc": "Perfil de alto rendimiento para 16GB+: retiene modelos completamente en GPU para generaciones instantáneas.",
-        "low_vram": False,
-        "low_vram_mode": False,
+        "desc": "16GB+: pipeline completo en GPU, octree hasta 384 y textura 2048.",
         "use_fp16": True,
-        "cpu_offload": False,
-        "default_octree": 384,
-        "gc_after_step": False
+        "staged_offload": False,
+        "max_octree": 384,
+        "paint_resolution": 2048,
     },
     "cpu": {
         "name": "CPU Seguro (Sin GPU)",
-        "desc": "Inferencia forzada en memoria RAM del sistema.",
-        "low_vram": True,
-        "low_vram_mode": True,
+        "desc": "Inferencia forzada en memoria RAM del sistema (muy lenta).",
         "use_fp16": False,
-        "cpu_offload": False,
-        "default_octree": 192,
-        "gc_after_step": True
+        "staged_offload": False,
+        "max_octree": 192,
+        "paint_resolution": 1024,
     }
 }
 
@@ -386,12 +496,12 @@ def detect_vram_profile() -> str:
 def is_dit_cached() -> bool:
     """Verifica si los pesos safetensors de Hunyuan3D-2 DiT están completamente descargados en disco."""
     # 1. Comprobar ruta directa de modelos en D:\AI_Models\tencent\Hunyuan3D-2
-    direct_path = Path("D:/AI_Models/tencent/Hunyuan3D-2/hunyuan3d-dit-v2-0-turbo/model.fp16.safetensors")
+    direct_path = HUNYUAN_LOCAL_DIR / "hunyuan3d-dit-v2-0-turbo" / "model.fp16.safetensors"
     if direct_path.exists() and direct_path.stat().st_size > 4 * 1024 * 1024 * 1024:
         return True
 
     # 2. Comprobar snapshots de Hugging Face
-    hf_hub = Path(os.environ.get("HUGGINGFACE_HUB_CACHE", "D:/AI_Models/huggingface/hub"))
+    hf_hub = Path(os.environ["HUGGINGFACE_HUB_CACHE"])
     snapshots_dir = hf_hub / "models--tencent--Hunyuan3D-2" / "snapshots"
     if snapshots_dir.exists():
         for p in snapshots_dir.rglob("model.fp16.safetensors"):
@@ -412,9 +522,9 @@ def resolve_target_path(output_path_str: str) -> Path:
     """
     Resuelve inteligentemente la ruta de destino.
     Si se especifica '../kaboomi-party/...' pero la carpeta está en '../Games/kaboomi-party/...'
-    o en 'C:/Users/Mastermind/Proyectos/Games/kaboomi-party/...',
+    o en '~/Proyectos/Games/kaboomi-party/...' (o en KABOOMI_DIR del .env),
     resuelve la ruta real existente para que funcione sin fricciones.
-    Si solo se especifica un nombre de archivo, lo ubica en D:/AI_Models/output/.
+    Si solo se especifica un nombre de archivo, lo ubica en <HY3DGEN_MODELS>/output/.
     """
     target = Path(output_path_str)
     
@@ -435,9 +545,12 @@ def resolve_target_path(output_path_str: str) -> Path:
         if candidate_path.parent.exists():
             return candidate_path.resolve()
             
-        # Probar en C:/Users/Mastermind/Proyectos/Games/kaboomi-party
-        proyectos_root = Path("C:/Users/Mastermind/Proyectos/Games/kaboomi-party")
-        if proyectos_root.exists():
+        # Probar en KABOOMI_DIR (.env) y en ~/Proyectos/Games/kaboomi-party
+        env_root = os.environ.get("KABOOMI_DIR")
+        roots = [Path(__file__).resolve().parent / env_root] if env_root else []
+        roots.append(Path.home() / "Proyectos" / "Games" / "kaboomi-party")
+        proyectos_root = next((r for r in roots if r.exists()), None)
+        if proyectos_root is not None:
             subparts = parts[idx+1:]
             candidate_proy = proyectos_root.joinpath(*subparts)
             if candidate_proy.parent.exists():
@@ -1344,7 +1457,28 @@ try:
 except ImportError:
     from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline as Hunyuan3DShapePipeline
 
-_GLOBAL_SHAPE_PIPELINE = None
+_PAINT_UNAVAILABLE_REASON: Optional[str] = None
+_PAINT_CHECKED = False
+
+
+def hunyuan_paint_available() -> bool:
+    """
+    Comprueba una sola vez si Hunyuan3D-Paint puede ejecutarse. Necesita la extensión CUDA
+    compilada `custom_rasterizer` (y `mesh_processor`) del repositorio de Hunyuan3D-2.
+    """
+    global _PAINT_UNAVAILABLE_REASON, _PAINT_CHECKED
+    if not _PAINT_CHECKED:
+        _PAINT_CHECKED = True
+        try:
+            import custom_rasterizer  # noqa: F401
+            from hy3dgen.texgen import Hunyuan3DPaintPipeline  # noqa: F401
+        except Exception as e:
+            _PAINT_UNAVAILABLE_REASON = (
+                f"{e}. Compila la extensión: cd hy3dgen/texgen/custom_rasterizer && python setup.py install "
+                "(requiere CUDA Toolkit y Visual Studio Build Tools)"
+            )
+    return _PAINT_UNAVAILABLE_REASON is None
+
 
 class Hunyuan3DGenerator:
     """
@@ -1368,7 +1502,6 @@ class Hunyuan3DGenerator:
         self.paint_subfolder = paint_subfolder
         self.use_fp16 = use_fp16
         if torch.cuda.is_available() and device != "cpu":
-            torch.cuda.set_device(0)
             self.device = "cuda:0"
         else:
             self.device = "cpu"
@@ -1379,18 +1512,24 @@ class Hunyuan3DGenerator:
             resolved_key = detect_vram_profile()
         else:
             resolved_key = vram_profile.lower()
+        if "cuda" not in self.device:
+            resolved_key = "cpu"
 
         pcfg = VRAM_PROFILES.get(resolved_key, VRAM_PROFILES["low_8gb"])
         self.vram_profile_key = resolved_key
         self.vram_profile_name = pcfg.get("name", "Auto")
-        self.low_vram_mode = pcfg.get("low_vram", True) if low_vram_mode is None else low_vram_mode
+        # low_vram_mode explícito (CLI --no-low-vram) tiene prioridad sobre el perfil
+        self.staged_offload = pcfg["staged_offload"] if low_vram_mode is None else bool(low_vram_mode)
+        self.max_octree = pcfg["max_octree"]
+        self.paint_resolution = pcfg["paint_resolution"]
 
-        print(f"[Hunyuan3D] Dispositivo: {self.device.upper()} | Tipo de dato: {self.dtype} | Perfil VRAM: {self.vram_profile_name}")
+        mode_txt = "un componente en GPU a la vez" if self.staged_offload else "pipeline completo en GPU"
+        print(f"[Hunyuan3D] Dispositivo: {self.device.upper()} | Tipo de dato: {self.dtype} | Perfil VRAM: {self.vram_profile_name} ({mode_txt})")
         if "cuda" in str(self.device):
             gpu_name = torch.cuda.get_device_name(0)
             vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-            print(f"[Hunyuan3D] GPU: {gpu_name} ({vram_gb:.1f} GB VRAM) -> Pipeline Secuencial 2 Etapas (Low-VRAM 8GB Activo)")
-            
+            print(f"[Hunyuan3D] GPU: {gpu_name} ({vram_gb:.1f} GB VRAM) -> Pipeline secuencial: forma y textura nunca coexisten en VRAM")
+
             # Ajustes de aceleración CUDA
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
@@ -1399,6 +1538,89 @@ class Hunyuan3DGenerator:
         """Purga estricta de VRAM delegada a flush_vram()."""
         flush_vram()
 
+    def _get_shape_pipeline(self):
+        """
+        Devuelve el pipeline de forma listo en el dispositivo, reutilizando la copia aparcada
+        en RAM si existe (evita releer ~5 GB del disco). Con staged_offload sube a la GPU un
+        componente a la vez: condicionador -> DiT -> VAE.
+        """
+        mem = MODEL_MEMORY_GB["shape"]
+        shape_pipe = activate_model("shape", vram_needed_gb=mem["vram"] if self.staged_offload else mem["vram_full"])
+        if shape_pipe is not None and getattr(shape_pipe, "_studio_dtype", None) != self.dtype:
+            release_model("shape")
+            shape_pipe = None
+
+        if shape_pipe is None:
+            local_shape_dir = HUNYUAN_LOCAL_DIR
+            model_source = str(local_shape_dir) if (local_shape_dir / self.shape_subfolder).exists() else self.model_id
+
+            # Se carga en CPU: la carga no ocupa VRAM y cada etapa sube solo lo que necesita
+            print(f" -> Cargando Hunyuan3DShapePipeline desde {model_source} [{self.shape_subfolder}] ({self.dtype})...")
+            t_load = time.time()
+            shape_pipe = Hunyuan3DShapePipeline.from_pretrained(
+                model_source,
+                subfolder=self.shape_subfolder,
+                torch_dtype=self.dtype,
+                device="cpu"
+            )
+
+            # FlashVDM: aceleración del Volume Decoding (se activa una sola vez por pipeline)
+            if hasattr(shape_pipe, "enable_flashvdm"):
+                try:
+                    shape_pipe.enable_flashvdm(enabled=True)
+                    print(" -> [FlashVDM] FlashVDM activado en Hunyuan3DShapePipeline.")
+                except Exception as e_fvdm:
+                    try:
+                        shape_pipe.enable_flashvdm(enabled=True, replace_vae=False)
+                        print(" -> [FlashVDM] FlashVDM activado (sin reemplazo de VAE).")
+                    except Exception as e_fvdm2:
+                        print(f" -> [FlashVDM] No disponible ({e_fvdm} / {e_fvdm2}). Continuando con VAE estándar.")
+
+            shape_pipe._studio_dtype = self.dtype
+            shape_pipe._studio_orig_encode_cond = shape_pipe.encode_cond
+            shape_pipe._studio_orig_export = shape_pipe._export
+            register_model("shape", shape_pipe)
+            print(f" -> Pipeline de forma cargado desde disco en {time.time() - t_load:.1f}s (se conservará en RAM).")
+        else:
+            print(" -> Pipeline de forma reutilizado desde RAM (sin leer el disco).")
+
+        device = torch.device(self.device)
+        staged = self.staged_offload and device.type == "cuda"
+
+        # NOTA: no se usa enable_model_cpu_offload(): en hy3dgen 2.0.2 crea los latentes en
+        # pipe.device (CPU) mientras el DiT corre en CUDA y la inferencia falla con
+        # "Cannot generate a cpu tensor from a generator of type cuda".
+        def staged_encode_cond(*args, **kwargs):
+            shape_pipe.conditioner.to(device)
+            result = shape_pipe._studio_orig_encode_cond(*args, **kwargs)
+            if staged:
+                shape_pipe.conditioner.to("cpu")
+                flush_vram()
+            shape_pipe.model.to(device)
+            return result
+
+        def staged_export(*args, **kwargs):
+            # Volume Decoding con la VRAM libre de DiT y condicionador
+            if staged:
+                shape_pipe.model.to("cpu")
+                shape_pipe.conditioner.to("cpu")
+                flush_vram()
+            shape_pipe.vae.to(device)
+            print_real_vram_status("Inicio Volume Decoding")
+            return shape_pipe._studio_orig_export(*args, **kwargs)
+
+        shape_pipe.encode_cond = staged_encode_cond
+        shape_pipe._export = staged_export
+
+        # pipe.device decide dónde se crean latentes y timesteps: siempre el dispositivo real
+        if staged:
+            shape_pipe.to("cpu")
+            shape_pipe.device = device
+        else:
+            shape_pipe.to(device)
+        print_real_vram_status("Pipeline de forma listo")
+        return shape_pipe
+
     def generate_shape(
         self,
         image: Image.Image,
@@ -1406,106 +1628,41 @@ class Hunyuan3DGenerator:
         octree_resolution: int = 256,
         seed: int = 42,
         target_faces: int = 40000,
-        progress_callback: Optional[Callable[[str, int], None]] = None
+        progress_callback: Optional[Callable[[str, int], None]] = None,
+        texture_safe_cap: Optional[int] = None
     ) -> trimesh.Trimesh:
         """
-        Etapa 1 - Generación de Geometría (Hunyuan3D-DiT) y Decimación Previa:
-        1. Purga total de VRAM obligatoria antes de iniciar.
-        2. Preprocesamiento con Inpainting de bordes en el canal alfa (cv2.inpaint) para evitar halos oscuros.
-        3. Carga únicamente Hunyuan3DShapePipeline en precisión torch.float16.
-        4. Inferencia DiT de geometría pura (sin textura).
-        5. Reducción de polígonos previa (según target_faces o tope seguro de 40,000 caras para 8 GB)
-           y filtro de suavizado Taubin ANTES de pasar a la Etapa 2 para no saturar xatlas ni rasterizador.
-        6. Guarda la malla en memoria RAM (CPU), mueve el pipeline a CPU, lo elimina y purga VRAM.
+        Etapa 1 - Generación de Geometría (Hunyuan3D-DiT):
+        1. Saca de la VRAM cualquier otro modelo (SF3D / Paint) y prepara el pipeline de forma.
+        2. Preprocesa el canal alfa con inpainting de bordes (evita halos oscuros).
+        3. Inferencia DiT + Volume Decoding con offload por etapas según el perfil de VRAM.
+        4. Limpia islas flotantes y reduce polígonos:
+             - target_faces > 0: reduce a ese número de caras.
+             - target_faces <= 0: conserva la malla completa (HD).
+             - texture_safe_cap: tope adicional cuando después se va a texturizar.
+        5. Suavizado Taubin y aparca el pipeline en RAM (VRAM libre para la Etapa 2).
         """
+        safe_octree = min(int(octree_resolution or 256), self.max_octree)
+        faces_txt = f"{target_faces:,}" if target_faces and target_faces > 0 else "HD (sin reducir)"
         print(f"\n[Etapa 1/2] Generando geometría 3D pura con Hunyuan3D-DiT ({self.shape_subfolder})...")
-        print(f" -> Pasos DiT: {steps} | Octree: {octree_resolution} | Semilla: {seed} | Objetivo caras: {target_faces:,}")
+        print(f" -> Pasos DiT: {steps} | Octree: {safe_octree} | Semilla: {seed} | Objetivo caras: {faces_txt}")
         start_t = time.time()
 
-        # 1. Asegurar descarga total previa de SF3D y purga estricta
-        unload_sf3d()
-        flush_vram()
-        print_real_vram_status("Pre-Carga Hunyuan3D-DiT")
-
-        shape_pipe = None
         try:
             # Preprocesamiento con Inpainting de bordes en canal alfa (cv2.inpaint)
             prep_image = inpaint_edge_padding(image, dilation_pixels=10, alpha_threshold=25)
 
-            # Cargar únicamente Hunyuan3DShapePipeline en float16
-            base_models = os.environ.get("HY3DGEN_MODELS", "D:/AI_Models")
-            local_shape_dir = Path(base_models) / "tencent" / "Hunyuan3D-2"
-            if (local_shape_dir / self.shape_subfolder).exists():
-                model_source = str(local_shape_dir)
-            else:
-                model_source = self.model_id
-
-            print(f" -> Cargando Hunyuan3DShapePipeline desde {model_source} [{self.shape_subfolder}] en float16...")
-            shape_pipe = Hunyuan3DShapePipeline.from_pretrained(
-                model_source,
-                subfolder=self.shape_subfolder,
-                torch_dtype=self.dtype,
-                device=self.device
-            )
-
-            # 1. FlashVDM: Aceleración de Volume Decoding para reducir tiempo a segundos
-            if hasattr(shape_pipe, "enable_flashvdm"):
-                try:
-                    shape_pipe.enable_flashvdm(enabled=True)
-                    print(" -> [FlashVDM] FlashVDM activado exitosamente en Hunyuan3DShapePipeline.")
-                except Exception as e_fvdm:
-                    try:
-                        shape_pipe.enable_flashvdm(enabled=True, replace_vae=False)
-                        print(" -> [FlashVDM] FlashVDM activado (sin reemplazo de VAE).")
-                    except Exception as e_fvdm2:
-                        print(f" -> [FlashVDM] Aviso: FlashVDM no disponible ({e_fvdm} / {e_fvdm2}). Continuando con VAE estándar.")
-
-            # 2. Model CPU Offload en Hunyuan3D-DiT para GPUs de 8GB
-            if hasattr(shape_pipe, "enable_model_cpu_offload"):
-                try:
-                    shape_pipe.enable_model_cpu_offload()
-                    print(" -> [Model CPU Offload] enable_model_cpu_offload() activado en Hunyuan3DShapePipeline.")
-                except Exception as e_off:
-                    if "cuda" in str(self.device):
-                        shape_pipe.to(self.device)
-            elif "cuda" in str(self.device):
-                shape_pipe.to(self.device)
-
-            # 3. Hook crítico: Descargar pesos de DiT y Conditioner a CPU antes del Volume Decoding
-            # para que el VAE tenga el 100% de la VRAM (evita paging de 4.7 GB a Shared GPU Memory)
-            orig_export = shape_pipe._export
-
-            def offload_and_export(*args, **kwargs):
-                print("\n" + "-"*65)
-                print(" [Volume Decoding Optimization] Descargando pesos de DiT y Conditioner a CPU...")
-                if hasattr(shape_pipe, "model") and shape_pipe.model is not None:
-                    try:
-                        shape_pipe.model.to("cpu")
-                    except Exception:
-                        pass
-                if hasattr(shape_pipe, "conditioner") and shape_pipe.conditioner is not None:
-                    try:
-                        shape_pipe.conditioner.to("cpu")
-                    except Exception:
-                        pass
-                flush_vram()
-                print_real_vram_status("Inicio Volume Decoding (VAE en GPU limpia)")
-                print("-"*65 + "\n")
-                return orig_export(*args, **kwargs)
-
-            shape_pipe._export = offload_and_export
-
-            print_real_vram_status("Post-Carga Hunyuan3D-DiT Pipeline")
+            shape_pipe = self._get_shape_pipeline()
 
             generator = torch.Generator(device=self.device).manual_seed(seed) if seed >= 0 else None
-            
+
             # Callback para pasos individuales de difusión DiT
             def dit_step_callback(step_idx, t, outputs):
                 if progress_callback:
                     cur_step = step_idx + 1
                     pct = 30 + int((cur_step / max(steps, 1)) * 35) # 30% a 65%
                     vram_mb = torch.cuda.memory_allocated(0) / (1024 ** 2) if torch.cuda.is_available() else 0
-                    progress_callback(f"[3/4] 🚀 Inferencia NVIDIA RTX ({vram_mb:.0f} MB): Paso {cur_step}/{steps} ({pct}%)...", pct)
+                    progress_callback(f"[3/4] Inferencia DiT en GPU ({vram_mb:.0f} MB): Paso {cur_step}/{steps} ({pct}%)...", pct)
 
             # Hook para capturar progreso de Volume Decoding en tiempo real
             import tqdm
@@ -1522,13 +1679,12 @@ class Hunyuan3DGenerator:
                         last_v_pct = v_pct
                         overall_pct = 66 + int(v_pct * 0.18) # 66% a 84%
                         vram_mb = torch.cuda.memory_allocated(0) / (1024 ** 2) if torch.cuda.is_available() else 0
-                        progress_callback(f"[3/4] 🚀 Decodificando en NVIDIA RTX ({vram_mb:.0f} MB): {v_pct}%...", overall_pct)
+                        progress_callback(f"[3/4] Decodificando volumen en GPU ({vram_mb:.0f} MB): {v_pct}%...", overall_pct)
                 return res
 
             tqdm.tqdm.update = custom_tqdm_update
 
-            # Resolución octree controlada (192 o 256) y num_chunks=32000 para reducir iteraciones de decodificación
-            safe_octree = min(int(octree_resolution), 256) if octree_resolution else 256
+            # num_chunks=32000 reduce iteraciones de decodificación sin disparar la VRAM
             safe_chunks = 32000
             print(f" -> [Inferencia DiT] Octree: {safe_octree} | Chunks: {safe_chunks} | Pasos: {steps}")
 
@@ -1546,7 +1702,7 @@ class Hunyuan3DGenerator:
                     )
             finally:
                 tqdm.tqdm.update = orig_tqdm_update
-                
+
             raw_mesh = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
 
             try:
@@ -1557,15 +1713,14 @@ class Hunyuan3DGenerator:
             # Depuración de geometría: eliminar islas parásitas y losas flotantes
             cleaned_mesh = clean_mesh_floating_artifacts(raw_mesh)
 
-            # MUY IMPORTANTE PARA 8 GB DE VRAM: Reducción de polígonos previa y suavizado Taubin
-            # ANTES de pasar a la Etapa 2. No se pasa una malla de 280,000 caras a Hunyuan3D-Paint.
-            if target_faces and target_faces > 0:
-                safe_faces = min(int(target_faces), 40000)
-            else:
-                safe_faces = 40000  # Límite máximo seguro para preset HD en 8GB de VRAM
+            # Reducción de polígonos: lo que pida el usuario y, si después se texturiza,
+            # como máximo texture_safe_cap (no se pasa una malla de 280k caras al texturizado)
+            safe_faces = int(target_faces) if target_faces and target_faces > 0 else None
+            if texture_safe_cap:
+                safe_faces = min(safe_faces or texture_safe_cap, texture_safe_cap)
 
-            if len(cleaned_mesh.faces) > safe_faces:
-                print(f" -> [Etapa 1/2] Decimando malla de {len(cleaned_mesh.faces):,} a {safe_faces:,} caras (Protección 8GB VRAM)...")
+            if safe_faces and len(cleaned_mesh.faces) > safe_faces:
+                print(f" -> [Etapa 1/2] Decimando malla de {len(cleaned_mesh.faces):,} a {safe_faces:,} caras...")
                 decimated_mesh = decimate_mesh_to_target_faces(cleaned_mesh, target_faces=safe_faces)
             else:
                 decimated_mesh = cleaned_mesh
@@ -1573,19 +1728,22 @@ class Hunyuan3DGenerator:
             print(f" -> [Etapa 1/2] Aplicando filtro de suavizado Taubin ({len(decimated_mesh.faces):,} caras)...")
             smoothed_mesh = apply_taubin_smoothing(decimated_mesh, lamb=0.53, nu=-0.55, iterations=5)
 
-            # Guardar malla procesada en memoria RAM del sistema (CPU)
-            cpu_mesh = smoothed_mesh.copy()
-
-            print(f" -> [Etapa 1/2 Completada] Geometría optimizada: {len(cpu_mesh.vertices):,} vértices, {len(cpu_mesh.faces):,} caras en {time.time() - start_t:.2f}s")
-            return cpu_mesh
+            print(f" -> [Etapa 1/2 Completada] Geometría: {len(smoothed_mesh.vertices):,} vértices, {len(smoothed_mesh.faces):,} caras en {time.time() - start_t:.2f}s")
+            return smoothed_mesh
 
         except ImportError as e:
             print(f"[ERROR CRÍTICO] La librería hy3dgen no está instalada: {e}")
             print("Ejecuta 'setup.bat' o 'pip install git+https://github.com/Tencent-Hunyuan/Hunyuan3D-2.git'")
             raise
+        except torch.cuda.OutOfMemoryError:
+            # Un pipeline a medias tras un OOM no es fiable: se destruye
+            release_model("shape")
+            print("[ERROR] VRAM insuficiente para la geometría. Prueba un perfil de VRAM menor o un octree más bajo.")
+            raise
         except Exception as e:
             err_str = str(e)
             if "SingleImageEncoder" in err_str or "state_dict" in err_str:
+                release_model("shape")
                 print(f"\n[DIAGNÓSTICO] {err_str}")
                 print(" -> Causa: Los pesos de Hunyuan3D-2 Turbo están incompletos en disco o corruptos.")
                 print(" -> Solución: Ejecuta 'descargar_modelos.bat' para completar el archivo model.fp16.safetensors (4.93 GB).")
@@ -1593,16 +1751,65 @@ class Hunyuan3DGenerator:
             print(f"[ERROR] Falló la generación de forma: {e}")
             raise
         finally:
-            # Mover pipeline de geometría a CPU, eliminarlo con del y purgar VRAM completamente
-            if shape_pipe is not None:
-                if hasattr(shape_pipe, "to"):
-                    try:
-                        shape_pipe.to("cpu")
-                    except Exception:
-                        pass
-                del shape_pipe
-            flush_vram()
-            print(" -> [Etapa 1/2] Pipeline DiT descargado de VRAM y purga estricta completada.")
+            # Aparcar en RAM (o liberar si falta RAM): la VRAM queda libre para la Etapa 2
+            park_model("shape")
+            print_real_vram_status("Post-Etapa 1 (forma aparcada)")
+
+    def _get_paint_pipeline(self):
+        """Devuelve Hunyuan3D-Paint (reutilizando la copia aparcada en RAM) con la forma ya fuera de la VRAM."""
+        paint_pipeline = activate_model("paint", strict_vram=True)
+        if paint_pipeline is None:
+            from hy3dgen.texgen import Hunyuan3DPaintPipeline
+
+            local_model_dir = HUNYUAN_LOCAL_DIR
+            if (local_model_dir / "hunyuan3d-delight-v2-0").exists() and (local_model_dir / self.paint_subfolder).exists():
+                paint_source = str(local_model_dir)
+            else:
+                paint_source = self.model_id
+
+            print(f" -> Cargando Hunyuan3DPaintPipeline ({paint_source}) en float16...")
+            t_load = time.time()
+            paint_pipeline = Hunyuan3DPaintPipeline.from_pretrained(paint_source)
+
+            # Offload de diffusers: delight y multivista suben a la GPU solo mientras se ejecutan
+            if "cuda" in str(self.device) and hasattr(paint_pipeline, "enable_model_cpu_offload"):
+                try:
+                    paint_pipeline.enable_model_cpu_offload()
+                    print(" -> [Paint Low-VRAM] Model CPU Offload activado en Hunyuan3D-Paint.")
+                except Exception as e_off:
+                    print(f" -> [Paint Low-VRAM] Offload no disponible ({e_off}); se usa la GPU directamente.")
+
+            # VAE Slicing y VAE Tiling en los componentes internos de difusión
+            for sub in getattr(paint_pipeline, "models", {}).values():
+                sub_p = getattr(sub, "pipeline", None)
+                for opt in ("enable_vae_slicing", "enable_vae_tiling"):
+                    if sub_p is not None and hasattr(sub_p, opt):
+                        try:
+                            getattr(sub_p, opt)()
+                        except Exception:
+                            pass
+
+            register_model("paint", paint_pipeline)
+            print(f" -> Hunyuan3D-Paint cargado desde disco en {time.time() - t_load:.1f}s (se conservará en RAM).")
+        else:
+            print(" -> Hunyuan3D-Paint reutilizado desde RAM (sin leer el disco).")
+
+        from hy3dgen.texgen.differentiable_renderer.mesh_render import MeshRender
+
+        # Resolución de render/textura según el perfil de VRAM
+        res = self.paint_resolution
+        if hasattr(paint_pipeline, "config"):
+            paint_pipeline.config.render_size = res
+            paint_pipeline.config.texture_size = res
+            paint_pipeline.config.candidate_camera_azims = [0, 90, 180, 270, 0, 180]
+            paint_pipeline.config.candidate_camera_elevs = [0, 0, 0, 0, 90, -90]
+            paint_pipeline.config.candidate_view_weights = [1.0, 0.1, 0.5, 0.1, 0.05, 0.05]
+        paint_pipeline.render = MeshRender(
+            default_resolution=res,
+            texture_size=res,
+            device="cuda" if "cuda" in str(self.device) else "cpu"
+        )
+        return paint_pipeline
 
     def paint_and_texture_mesh(
         self,
@@ -1610,107 +1817,23 @@ class Hunyuan3DGenerator:
         image: Image.Image
     ) -> trimesh.Trimesh:
         """
-        Etapa 2 - Texturizado Nativo Multivista (Hunyuan3D-Paint) en modo Low-VRAM (8 GB):
-        1. Con la VRAM completamente libre, carga Hunyuan3DPaintPipeline en torch.float16.
-        2. Activa optimizaciones de memoria en diffusers (enable_model_cpu_offload, enable_vae_slicing, enable_vae_tiling).
-        3. Configura resolución segura para 8 GB (render_size/texture_size en 1024x1024 y vistas controladas).
-        4. Envuelve la inferencia en try/except torch.cuda.OutOfMemoryError con contingencia garantizada.
-        5. Destruye inmediatamente el pipeline de pintura (del paint_pipeline) y ejecuta flush_vram().
-        6. Configura acabado PBR mate/limpio (metallicFactor=0.0, roughnessFactor=0.9).
+        Etapa 2 - Texturizado Nativo Multivista (Hunyuan3D-Paint):
+        1. Saca de la VRAM el pipeline de forma y SF3D (nunca coexisten con Paint).
+        2. Reutiliza Paint desde RAM o lo carga una vez, con offload de diffusers y VAE slicing/tiling.
+        3. Render/textura a la resolución del perfil de VRAM (1024 en 6-12 GB, 2048 en 16 GB+).
+        4. Si Paint no está disponible o se queda sin VRAM, recurre al horneado UV de contingencia.
+        5. Aparca Paint en RAM al terminar y aplica acabado PBR mate.
         """
-        print(f"\n[Etapa 2/2] Texturizado Nativo Multivista con Hunyuan3D-Paint en modo Low-VRAM...")
+        print("\n[Etapa 2/2] Texturizado Nativo Multivista con Hunyuan3D-Paint...")
         start_t = time.time()
-        unload_sf3d()
-        unload_hunyuan()
-        flush_vram()
-        print_real_vram_status("Pre-Carga Hunyuan3D-Paint")
 
-        base_dir = os.environ.get('HY3DGEN_MODELS', 'D:/AI_Models')
-        local_model_dir = Path(base_dir) / "tencent" / "Hunyuan3D-2"
-        if (local_model_dir / "hunyuan3d-delight-v2-0").exists() and (local_model_dir / self.paint_subfolder).exists():
-            paint_source = str(local_model_dir)
-        else:
-            paint_source = self.model_id
-
-        paint_pipeline = None
         textured_mesh = None
-
-        try:
-            from hy3dgen.texgen import Hunyuan3DPaintPipeline
-            from hy3dgen.texgen.differentiable_renderer.mesh_render import MeshRender
-
-            print(f" -> Cargando Hunyuan3DPaintPipeline ({paint_source}) en float16...")
-            paint_pipeline = Hunyuan3DPaintPipeline.from_pretrained(paint_source)
-
-            # Configuración segura para 8 GB VRAM: 1024x1024 y 6 vistas controladas
-            if hasattr(paint_pipeline, "config"):
-                paint_pipeline.config.render_size = 1024
-                paint_pipeline.config.texture_size = 1024
-                paint_pipeline.config.candidate_camera_azims = [0, 90, 180, 270, 0, 180]
-                paint_pipeline.config.candidate_camera_elevs = [0, 0, 0, 0, 90, -90]
-                paint_pipeline.config.candidate_view_weights = [1.0, 0.1, 0.5, 0.1, 0.05, 0.05]
-
-            # Reconfigurar MeshRender a resolución segura 1024x1024
-            paint_pipeline.render = MeshRender(
-                default_resolution=1024,
-                texture_size=1024,
-                device="cuda" if torch.cuda.is_available() else "cpu"
-            )
-
-            # Activar optimizaciones de ahorro de memoria en diffusers
-            if hasattr(paint_pipeline, "enable_model_cpu_offload"):
-                try:
-                    paint_pipeline.enable_model_cpu_offload()
-                    print(" -> [Paint Low-VRAM] Model CPU Offload activado en Hunyuan3D-Paint.")
-                except Exception as e_off:
-                    print(f" -> [Paint Low-VRAM] GPU direct mode ({e_off})")
-                    if "cuda" in str(self.device):
-                        paint_pipeline.to(self.device)
-            elif "cuda" in str(self.device):
-                paint_pipeline.to(self.device)
-
-            # Habilitar VAE Slicing y VAE Tiling en los componentes internos de difusión
-            if hasattr(paint_pipeline, "models"):
-                for m_name in ["delight_model", "multiview_model"]:
-                    if m_name in paint_pipeline.models:
-                        sub_p = getattr(paint_pipeline.models[m_name], "pipeline", None)
-                        if sub_p is not None:
-                            if hasattr(sub_p, "enable_vae_slicing"):
-                                try:
-                                    sub_p.enable_vae_slicing()
-                                except Exception:
-                                    pass
-                            if hasattr(sub_p, "enable_vae_tiling"):
-                                try:
-                                    sub_p.enable_vae_tiling()
-                                except Exception:
-                                    pass
-
-            print(f" -> Pintando malla de {len(mesh.faces):,} caras con Hunyuan3D-Paint...")
-            with torch.inference_mode():
-                textured_mesh = paint_pipeline(mesh, image=image)
-
-            print(f" -> [Hunyuan3D-Paint] Texturizado multivista completado con éxito en {time.time() - start_t:.2f}s.")
-
-        except (torch.cuda.OutOfMemoryError, RuntimeError) as e_oom:
-            print(f" -> [Aviso CUDA OOM en Hunyuan3D-Paint] {e_oom}. Liberando VRAM y recurriendo a horneado UV de contingencia...")
-            flush_vram()
+        if not hunyuan_paint_available():
+            print(f" -> [Hunyuan3D-Paint] No disponible: {_PAINT_UNAVAILABLE_REASON}")
+            print(" -> Usando horneado UV de contingencia (proyección frontal/trasera en CPU).")
             textured_mesh = self._fallback_texture_bake(mesh, image)
-        except Exception as e_tex:
-            print(f" -> [Aviso Hunyuan3D-Paint] {e_tex}. Recurriendo a horneado UV de contingencia...")
-            flush_vram()
-            textured_mesh = self._fallback_texture_bake(mesh, image)
-        finally:
-            if paint_pipeline is not None:
-                try:
-                    if hasattr(paint_pipeline, "to"):
-                        paint_pipeline.to("cpu")
-                except Exception:
-                    pass
-                del paint_pipeline
-            flush_vram()
-            print_real_vram_status("Post-Hunyuan Paint Unload")
-            print(" -> [Etapa 2/2] Pipeline de pintura destruido y VRAM purgada al 100%.")
+        else:
+            textured_mesh = self._run_paint_pipeline(mesh, image, start_t)
 
         # Ajuste de material PBR mate/limpio (metallicFactor=0.0, roughnessFactor=0.90)
         if textured_mesh is not None and hasattr(textured_mesh, "visual") and hasattr(textured_mesh.visual, "material") and textured_mesh.visual.material is not None:
@@ -1720,6 +1843,34 @@ class Hunyuan3DGenerator:
             mat.doubleSided = True
 
         return textured_mesh if textured_mesh is not None else mesh
+
+    def _run_paint_pipeline(self, mesh: trimesh.Trimesh, image: Image.Image, start_t: float) -> Optional[trimesh.Trimesh]:
+        """Ejecuta Hunyuan3D-Paint; ante OOM o error recurre al horneado de contingencia."""
+        textured_mesh = None
+        try:
+            paint_pipeline = self._get_paint_pipeline()
+            print_real_vram_status("Pre-Inferencia Hunyuan3D-Paint")
+            print(f" -> Pintando malla de {len(mesh.faces):,} caras con Hunyuan3D-Paint...")
+            with torch.inference_mode():
+                textured_mesh = paint_pipeline(mesh, image=image)
+            print(f" -> [Hunyuan3D-Paint] Texturizado multivista completado en {time.time() - start_t:.2f}s.")
+
+        except InsufficientMemoryError as e_mem:
+            print(f" -> [Hunyuan3D-Paint] No se carga para no saturar el equipo: {e_mem}")
+            textured_mesh = None
+        except torch.cuda.OutOfMemoryError as e_oom:
+            print(f" -> [Aviso CUDA OOM en Hunyuan3D-Paint] {e_oom}. Recurriendo a horneado UV de contingencia...")
+            release_model("paint")
+            textured_mesh = None
+        except Exception as e_tex:
+            print(f" -> [Aviso Hunyuan3D-Paint] {e_tex}. Recurriendo a horneado UV de contingencia...")
+            textured_mesh = None
+        finally:
+            park_model("paint")
+            print_real_vram_status("Post-Hunyuan Paint (aparcado)")
+        if textured_mesh is None:
+            textured_mesh = self._fallback_texture_bake(mesh, image)
+        return textured_mesh
 
     def _fallback_texture_bake(self, mesh: trimesh.Trimesh, image: Image.Image) -> trimesh.Trimesh:
         """
@@ -1900,8 +2051,6 @@ class Hunyuan3DGenerator:
 # 5b. Generador Secundario: Stable Fast 3D (SF3D de Stability AI)
 # ==============================================================================
 
-_GLOBAL_SF3D_MODEL = None
-
 def _ensure_sf3d_shims(repo_dir: Optional[Path] = None):
     """
     Configura shims / polyfills de alto rendimiento para uv_unwrapper y texture_baker
@@ -1920,9 +2069,8 @@ def _ensure_sf3d_shims(repo_dir: Optional[Path] = None):
         if repo_dir:
             candidate_paths.append(repo_dir / "uv_unwrapper" / "uv_unwrapper" / "unwrap.py")
         candidate_paths.extend([
-            Path("D:/AI_Models/repos/stable-fast-3d/uv_unwrapper/uv_unwrapper/unwrap.py"),
-            Path("./stable-fast-3d/uv_unwrapper/uv_unwrapper/unwrap.py"),
-            Path(os.environ.get("HY3DGEN_MODELS", "D:/AI_Models")) / "repos/stable-fast-3d/uv_unwrapper/uv_unwrapper/unwrap.py"
+            REPOS_DIR / "stable-fast-3d" / "uv_unwrapper" / "uv_unwrapper" / "unwrap.py",
+            Path("./stable-fast-3d/uv_unwrapper/uv_unwrapper/unwrap.py")
         ])
 
         for unwrap_path in candidate_paths:
@@ -2107,20 +2255,18 @@ class SF3DGenerator:
         self.model = None
 
     def _load_model(self):
-        # 1. Asegurar descarga total de Hunyuan3D y purga de VRAM
-        unload_hunyuan()
-        flush_vram()
+        # Hunyuan3D (forma/pintura) sale de la VRAM: SF3D es el único modelo en la GPU
+        cached = activate_model("sf3d")
         print_real_vram_status("Pre-Carga SF3D")
-
-        global _GLOBAL_SF3D_MODEL
-        if _GLOBAL_SF3D_MODEL is not None:
-            self.model = _GLOBAL_SF3D_MODEL
+        if cached is not None:
+            cached.to(self.device)
+            self.model = cached
+            print("[SF3D] Modelo reutilizado desde RAM (sin leer el disco).")
             return
 
         candidates = [
-            Path("D:/AI_Models/repos/stable-fast-3d"),
-            Path("./stable-fast-3d"),
-            Path(os.environ.get("HY3DGEN_MODELS", "D:/AI_Models")) / "repos" / "stable-fast-3d"
+            REPOS_DIR / "stable-fast-3d",
+            Path("./stable-fast-3d")
         ]
         found_repo = None
         for c in candidates:
@@ -2140,7 +2286,7 @@ class SF3DGenerator:
                 "Ejecuta 'setup.bat' y selecciona la opción de Stable Fast 3D."
             ) from e
 
-        local_weights_dir = Path("D:/AI_Models/stabilityai/stable-fast-3d")
+        local_weights_dir = SF3D_LOCAL_DIR
         target_path_or_id = str(local_weights_dir) if (local_weights_dir / "model.safetensors").exists() else self.model_id
 
         print(f"[SF3D] Inicializando Stable Fast 3D desde '{target_path_or_id}' en {self.device.upper()}...")
@@ -2152,7 +2298,7 @@ class SF3DGenerator:
             )
             model.to(self.device)
             model.eval()
-            _GLOBAL_SF3D_MODEL = model
+            register_model("sf3d", model)
             self.model = model
             print("[SF3D] Modelo cargado exitosamente en VRAM.")
         except Exception as e:
@@ -2168,7 +2314,7 @@ class SF3DGenerator:
                     )
                     model.to(self.device)
                     model.eval()
-                    _GLOBAL_SF3D_MODEL = model
+                    register_model("sf3d", model)
                     self.model = model
                     print("[SF3D] Modelo cargado exitosamente desde mirror en VRAM.")
                     return
@@ -2199,7 +2345,7 @@ class SF3DGenerator:
             edge_dilation_pixels=10
         )
 
-        temp_dir = Path(os.environ.get("TEMP", "D:/AI_Models/temp"))
+        temp_dir = Path(os.environ["TEMP"])
         temp_dir.mkdir(parents=True, exist_ok=True)
         temp_glb = temp_dir / f"sf3d_tmp_{int(time.time()*1000)}.glb"
 
@@ -2289,26 +2435,10 @@ class SF3DGenerator:
                     temp_glb.unlink()
                 except Exception:
                     pass
-            # Descarga total de SF3D para no dejarlo residente en VRAM
-            if self.model is not None:
-                try:
-                    if hasattr(self.model, "to"):
-                        self.model.to("cpu")
-                except Exception:
-                    pass
-                del self.model
-                self.model = None
-            global _GLOBAL_SF3D_MODEL
-            if _GLOBAL_SF3D_MODEL is not None:
-                try:
-                    if hasattr(_GLOBAL_SF3D_MODEL, "to"):
-                        _GLOBAL_SF3D_MODEL.to("cpu")
-                except Exception:
-                    pass
-                del _GLOBAL_SF3D_MODEL
-                _GLOBAL_SF3D_MODEL = None
-            flush_vram()
-            print_real_vram_status("Post-SF3D Unload")
+            # SF3D sale de la VRAM y queda aparcado en RAM para la siguiente generación
+            self.model = None
+            park_model("sf3d")
+            print_real_vram_status("Post-SF3D (aparcado)")
 
 
 # ==============================================================================
@@ -2510,18 +2640,13 @@ def generate_model_pipeline(
             vram_profile=resolved_profile
         )
 
-    # Purga estricta inicial de VRAM antes de iniciar el pipeline
-    unload_all_models()
-    flush_vram()
+    # Cada motor saca a los demás de la VRAM al activarse (un solo modelo en GPU a la vez)
     print_real_vram_status("CLI Inicio Inferencia")
 
     # 3. Generación y texturizado según el motor seleccionado
     if "sf3d" in model_type.lower():
         if step_callback:
             step_callback(2, "⚡ Inicializando Stable Fast 3D en GPU...")
-        unload_hunyuan()
-        flush_vram()
-        print_real_vram_status("CLI Pre-SF3D")
         sf3d_gen = SF3DGenerator()
         if step_callback:
             step_callback(3, "⚡ SF3D: Generando geometría y texturas PBR instantáneas...")
@@ -2555,23 +2680,17 @@ def generate_model_pipeline(
                 doubleSided=True
             )
             final_textured_mesh.visual.material = neutral_mat
-        
-        unload_sf3d()
-        flush_vram()
-        print_real_vram_status("CLI Post-SF3D")
     else:
-        # Etapa 1: Geometría Hunyuan3D-DiT con Decimación Previa (máx 40,000 caras) y Taubin Smoothing
+        # Etapa 1: Geometría Hunyuan3D-DiT (con textura, máx. TEXTURE_SAFE_MAX_FACES caras) y Taubin Smoothing
         if step_callback:
-            step_callback(3, f"🧊 [Etapa 1/2] Esculpiendo geometría 3D y optimizando topología...")
-        unload_sf3d()
-        flush_vram()
-        print_real_vram_status("CLI Pre-Hunyuan DiT")
+            step_callback(3, "🧊 [Etapa 1/2] Esculpiendo geometría 3D y optimizando topología...")
         raw_mesh = generator.generate_shape(
             clean_image,
             steps=steps,
             octree_resolution=octree_resolution,
             seed=seed,
-            target_faces=target_faces
+            target_faces=target_faces,
+            texture_safe_cap=TEXTURE_SAFE_MAX_FACES if generate_texture else None
         )
         aligned_mesh = center_and_orient_mesh(
             raw_mesh,
@@ -2606,9 +2725,8 @@ def generate_model_pipeline(
             aligned_mesh.visual.material = neutral_mat
             final_textured_mesh = aligned_mesh
 
-        # Purga total de VRAM tras concluir Etapa 2
+        # La CLI termina al exportar: se liberan RAM y VRAM
         unload_all_models()
-        flush_vram()
         print_real_vram_status("CLI Fin Generación")
 
     # 5. Exportación Multi-Formato (.GLB, .STL, .3MF)
@@ -2633,7 +2751,6 @@ def generate_model_pipeline(
 
     elapsed = time.time() - total_start
     main_file = exported_map.get("glb") or (list(exported_map.values())[0] if exported_map else dest_path)
-    file_size_mb = main_file.stat().st_size / (1024 * 1024) if main_file.exists() else 0.0
     
     print("\n" + "="*70)
     print(" ¡GENERACIÓN COMPLETADA CON ÉXITO!")
@@ -2722,7 +2839,7 @@ def main():
     parser.add_argument(
         "--no-low-vram",
         action="store_true",
-        help="Desactivar el modo de bajo VRAM (fuerza mantener modelos en VRAM simultáneamente)"
+        help="Sube el pipeline de forma completo a la GPU en lugar de un componente a la vez (más rápido si sobra VRAM)"
     )
     parser.add_argument(
         "--formats",

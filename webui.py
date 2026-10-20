@@ -1,4 +1,3 @@
-import gc
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -10,6 +9,7 @@ Diseño Industrial Ultra-Limpio con Iconos SVG, Animaciones Fluidas y Cero Emoji
 ==============================================================================
 """
 
+import gc
 import os
 import sys
 import time
@@ -23,30 +23,10 @@ from pathlib import Path
 from typing import Optional, Tuple, Generator, Union
 
 # ==============================================================================
-# 1. Configuración Estricta de Rutas y Almacenamiento en Disco D:
+# 1. Rutas de Almacenamiento (raíz elegida en setup.bat, guardada en .env)
 # ==============================================================================
 
-if Path("D:/").exists():
-    base_ai_dir = Path("D:/AI_Models")
-    hf_dir = base_ai_dir / "huggingface"
-    torch_dir = base_ai_dir / "torch"
-    u2net_dir = base_ai_dir / "u2net"
-    temp_dir = base_ai_dir / "temp"
-    output_dir = base_ai_dir / "output"
-    
-    for d in [hf_dir, torch_dir, u2net_dir, temp_dir, output_dir]:
-        d.mkdir(parents=True, exist_ok=True)
-        
-    os.environ["HF_HOME"] = str(hf_dir)
-    os.environ["HUGGINGFACE_HUB_CACHE"] = str(hf_dir / "hub")
-    os.environ["TORCH_HOME"] = str(torch_dir)
-    os.environ["U2NET_HOME"] = str(u2net_dir)
-    os.environ["HY3DGEN_MODELS"] = str(base_ai_dir)
-    os.environ["TEMP"] = str(temp_dir)
-    os.environ["TMP"] = str(temp_dir)
-
-OUTPUT_DIR = Path("D:/AI_Models/output") if Path("D:/").exists() else Path("./outputs")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+from studio_env import MODELS_ROOT, OUTPUT_DIR
 
 # Selección de GPU (debe ocurrir antes de importar torch / gradio / rembg)
 from gpu_select import select_gpu
@@ -71,6 +51,8 @@ from img2glb import (
     unload_sf3d,
     unload_hunyuan,
     unload_all_models,
+    park_all_models,
+    TEXTURE_SAFE_MAX_FACES,
     apply_taubin_smoothing,
     inpaint_edge_padding,
     preprocess_and_remove_background,
@@ -122,22 +104,23 @@ parser.add_argument("--gpu", default=None, help="GPU para la IA: índice de nvid
 cmd_args, _ = parser.parse_known_args()
 MODE = cmd_args.mode.lower()
 
-# Rutas específicas para el modo Kaboomi Party
+# Rutas específicas para el modo Kaboomi Party (KABOOMI_DIR del .env tiene prioridad;
+# las rutas relativas se resuelven desde la carpeta del proyecto, no desde donde se lance)
+SCRIPT_DIR = Path(__file__).resolve().parent
 POSSIBLE_KABOOMI_ROOTS = [
-    Path("C:/Users/Mastermind/Proyectos/Games/kaboomi-party"),
-    Path("C:/Users/Mastermind/Proyectos/kaboomi-party"),
-    Path("../Games/kaboomi-party"),
-    Path("../kaboomi-party")
+    *([SCRIPT_DIR / os.environ["KABOOMI_DIR"]] if os.environ.get("KABOOMI_DIR") else []),
+    Path.home() / "Proyectos" / "Games" / "kaboomi-party",
+    Path.home() / "Proyectos" / "kaboomi-party",
+    SCRIPT_DIR.parent / "Games" / "kaboomi-party",
+    SCRIPT_DIR.parent / "kaboomi-party"
 ]
 
 def get_kaboomi_dir() -> Path:
     """Detecta la carpeta raíz del proyecto Kaboomi Party."""
     for p in POSSIBLE_KABOOMI_ROOTS:
-        if p.exists() and (p / "project.godot").exists():
+        if p.exists() and ((p / "project.godot").exists() or (p / "assets").exists()):
             return p.resolve()
-        if p.exists() and (p / "assets").exists():
-            return p.resolve()
-    return Path("C:/Users/Mastermind/Proyectos/Games/kaboomi-party").resolve()
+    return POSSIBLE_KABOOMI_ROOTS[0].resolve()
 
 if MODE == "kambo":
     KABOOMI_ROOT = get_kaboomi_dir()
@@ -202,8 +185,9 @@ else:
 
 
 PRESET_CONFIG_MAP = {
-    "Alta Calidad (50,000 caras • Curvas Suaves y Detalladas)": {"faces": 50000, "steps": 5, "octree": 256},
-    "Máxima Calidad HD (Malla Completa ~280k caras • Sin Comprimir)": {"faces": 0, "steps": 5, "octree": 256},
+    "Alta Calidad (50,000 caras • Con textura: 40k)": {"faces": 50000, "steps": 5, "octree": 256},
+    # octree 384 se limita según el perfil de VRAM (256 en 6-8 GB, 320 en 12 GB, 384 en 16 GB+)
+    "Máxima Calidad HD (Malla Completa sin reducir • Con textura: 40k)": {"faces": 0, "steps": 5, "octree": 384},
     "Equilibrado (20,000 caras • Estándar 3D)": {"faces": 20000, "steps": 5, "octree": 256},
     "Móvil Low-Poly (5,000 caras • Juegos Ligeros)": {"faces": 5000, "steps": 4, "octree": 256}
 }
@@ -253,6 +237,87 @@ def render_progress_html(step_text: str, percent: int) -> str:
         </div>
     </div>
     """
+
+
+# ==============================================================================
+# Descarga automática de pesos DiT con detección de fallos (nunca se queda colgada)
+# ==============================================================================
+
+DOWNLOAD_STATUS_FILE = MODELS_ROOT / "download_status.json"
+DOWNLOAD_LOCK_FILE = MODELS_ROOT / "download_status.lock"
+DOWNLOAD_STALL_TIMEOUT_SEC = 300
+DOWNLOAD_ERROR = "__ERROR__"
+_DOWNLOAD_PROC: Optional[subprocess.Popen] = None
+
+
+def _download_lock_alive() -> bool:
+    """True si otra descarga (p. ej. descargar_modelos.bat) mantiene el bloqueo y su proceso sigue vivo."""
+    try:
+        import psutil
+        pid = int(DOWNLOAD_LOCK_FILE.read_text().strip() or 0)
+        return bool(pid) and psutil.pid_exists(pid)
+    except Exception:
+        return False
+
+
+def _wait_for_dit_download() -> Generator[Tuple[str, Union[int, str]], None, None]:
+    """
+    Lanza download_model.py (si no hay otra descarga en curso) y emite (texto, porcentaje)
+    mientras avanza. Si la descarga falla, muere o se detiene 5 minutos, emite
+    (DOWNLOAD_ERROR, mensaje) y termina.
+    """
+    global _DOWNLOAD_PROC
+    script_dir = Path(__file__).resolve().parent
+    proc_running = _DOWNLOAD_PROC is not None and _DOWNLOAD_PROC.poll() is None
+    if not proc_running and not _download_lock_alive():
+        DOWNLOAD_STATUS_FILE.unlink(missing_ok=True)  # Evita leer el estado de una descarga anterior
+        print(" -> [WebUI] Pesos DiT de Hunyuan3D-2 no encontrados. Iniciando descarga en segundo plano...")
+        try:
+            _DOWNLOAD_PROC = subprocess.Popen([sys.executable, str(script_dir / "download_model.py")], cwd=str(script_dir))
+        except Exception as e_dl:
+            yield DOWNLOAD_ERROR, f"No se pudo lanzar download_model.py ({e_dl})."
+            return
+
+    last_bytes, last_progress_t, last_console_t = -1, time.time(), 0.0
+    while not is_dit_cached():
+        try:
+            sdata = json.loads(DOWNLOAD_STATUS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            sdata = {}
+
+        if sdata.get("error"):
+            yield DOWNLOAD_ERROR, f"La descarga de pesos falló ({sdata['error']})."
+            return
+        proc_dead = _DOWNLOAD_PROC is not None and _DOWNLOAD_PROC.poll() is not None
+        if proc_dead and not _download_lock_alive() and not is_dit_cached():
+            yield DOWNLOAD_ERROR, f"La descarga terminó (código {_DOWNLOAD_PROC.returncode}) sin completar los pesos."
+            return
+
+        downloaded = sdata.get("downloaded_bytes", 0)
+        if downloaded != last_bytes:
+            last_bytes, last_progress_t = downloaded, time.time()
+        elif time.time() - last_progress_t > DOWNLOAD_STALL_TIMEOUT_SEC:
+            if _DOWNLOAD_PROC is not None and _DOWNLOAD_PROC.poll() is None:
+                _DOWNLOAD_PROC.terminate()
+            yield DOWNLOAD_ERROR, "La descarga lleva 5 minutos sin avanzar (¿sin conexión?)."
+            return
+
+        if sdata:
+            pct = sdata.get("percent", 0)
+            eta = sdata.get("eta_seconds", 0)
+            eta_str = f"{int(eta // 60)}m {int(eta % 60):02d}s" if eta > 0 else "calculando..."
+            txt = (f"[2/4] Descargando pesos DiT ({sdata.get('downloaded_mb', 0):.0f}/{sdata.get('total_mb', 4702):.0f} MB"
+                   f" • {pct}% • {sdata.get('speed_mb', 0)} MB/s • ETA: {eta_str})")
+            bar_pct = int(pct * 0.45 + 5)
+        else:
+            txt, bar_pct = f"[2/4] Iniciando descarga de pesos Hunyuan3D-2 (~4.9GB) a {MODELS_ROOT}...", 5
+
+        if time.time() - last_console_t >= 5.0:
+            print(f" -> {txt}")
+            last_console_t = time.time()
+        yield txt, bar_pct
+        time.sleep(1.5)
+    print(" -> [WebUI] Pesos DiT de Hunyuan3D-2 listos en disco.")
 
 
 # ==============================================================================
@@ -307,7 +372,7 @@ def _ui_generate_3d_impl(
       - Etapa 3: Síntesis DiT granular (30% -> 65%), Volume Decoding (66% -> 84%), Depuración de losas (86%), Decimación (88%)
       - Etapa 4: Texturizado UV (94%), Empaquetado Multi-Formato GLB/STL/3MF (97%), Finalizado (100%)
     """
-    global CURRENT_GENERATED_GLB, CURRENT_GENERATED_FILES
+    global CURRENT_GENERATED_GLB
 
     def step_yield(msg_html: str):
         return gr.skip(), gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), msg_html
@@ -326,26 +391,10 @@ def _ui_generate_3d_impl(
     print("   [BOTÓN GENERAR PULSADO - INICIANDO PROCESAMIENTO]")
     gpu_name = "CPU"
     if torch.cuda.is_available():
-        torch.cuda.set_device(0)
         gpu_name = torch.cuda.get_device_name(0)
-        # Pulso de activación de 1.2s en CUDA para verificar la GPU NVIDIA al 100% en Administrador de Tareas
-        try:
-            d = torch.device("cuda:0")
-            _a = torch.randn((5120, 5120), device=d, dtype=torch.float16)
-            _b = torch.randn((5120, 5120), device=d, dtype=torch.float16)
-            t_pulse = time.time()
-            while time.time() - t_pulse < 1.2:
-                _c = torch.matmul(_a, _b)
-                torch.cuda.synchronize()
-            del _a, _b, _c
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
-        vram_alloc = torch.cuda.memory_allocated(0) / (1024 ** 2)
-        vram_tot = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        free_b, total_b = torch.cuda.mem_get_info(0)
         print(f"   ✓ GPU EN EJECUCIÓN: {gpu_name} (cuda:0)")
-        print(f"   ✓ VRAM TOTAL: {vram_tot:.2f} GB | VRAM EN USO: {vram_alloc:.1f} MB")
-        print("   ✓ GPU INTEL: BLOQUEADA Y DESCONECTADA")
+        print(f"   ✓ VRAM TOTAL: {total_b / 1024 ** 3:.2f} GB | VRAM LIBRE: {free_b / 1024 ** 2:.0f} MB")
     else:
         print("   ! DISPOSITIVO: CPU")
     print("=" * 76 + "\n")
@@ -353,7 +402,7 @@ def _ui_generate_3d_impl(
     # --------------------------------------------------------------------------
     # ETAPA 1/4: Silueta Limpia (15%)
     # --------------------------------------------------------------------------
-    yield step_yield(render_progress_html(f"[1/4] GPU NVIDIA ({gpu_name}): Extrayendo silueta limpia...", 15))
+    yield step_yield(render_progress_html(f"[1/4] {gpu_name}: Extrayendo silueta limpia...", 15))
     
     try:
         if clean_silhouette is not None:
@@ -373,17 +422,13 @@ def _ui_generate_3d_impl(
     # --------------------------------------------------------------------------
     # ETAPA 2 & 3: Selección de Motor de IA e Inferencia 3D
     # --------------------------------------------------------------------------
-    unload_all_models()
-    flush_vram()
+    # Cada motor saca a los demás de la VRAM al activarse; los inactivos quedan aparcados en RAM
     print_real_vram_status("WebUI Inicio Inferencia")
 
     is_sf3d = "sf3d" in str(ai_model_choice).lower() or "stable fast 3d" in str(ai_model_choice).lower()
 
     if is_sf3d:
         yield step_yield(render_progress_html("[2/4] Motor SF3D: Inicializando Stable Fast 3D en GPU...", 25))
-        unload_hunyuan()
-        flush_vram()
-        print_real_vram_status("WebUI Pre-SF3D")
         try:
             sf3d_gen = SF3DGenerator()
         except Exception as e:
@@ -416,7 +461,6 @@ def _ui_generate_3d_impl(
         )
 
         if not generate_texture:
-            import trimesh
             neutral_mat = trimesh.visual.material.PBRMaterial(
                 baseColorFactor=[0.82, 0.84, 0.88, 1.0],
                 metallicFactor=0.0,
@@ -431,54 +475,15 @@ def _ui_generate_3d_impl(
                 aligned_mesh.visual.material.roughnessFactor = 0.90
                 aligned_mesh.visual.material.doubleSided = True
             final_mesh = aligned_mesh
-
-        unload_sf3d()
-        flush_vram()
-        print_real_vram_status("WebUI Post-SF3D")
     else:
         # Pipeline Tencent Hunyuan3D-2 Turbo
-        cached = is_dit_cached()
-        if not cached:
-            status_file = Path("D:/AI_Models/download_status.json")
-            script_dir = Path(__file__).resolve().parent
-            download_script = script_dir / "download_model.py"
-            print(f" -> [WebUI] Pesos DiT de Hunyuan3D-2 no encontrados en cache. Iniciando descarga automatica en segundo plano ({download_script})...")
-            try:
-                subprocess.Popen([sys.executable, str(download_script)], cwd=str(script_dir))
-            except Exception as e_dl:
-                print(f" -> [WebUI Error] No se pudo lanzar download_model.py: {e_dl}")
-
-            last_console_time = 0
-            while not is_dit_cached():
-                if status_file.exists():
-                    try:
-                        with open(status_file, "r", encoding="utf-8") as f:
-                            sdata = json.load(f)
-                        if sdata.get("is_complete"):
-                            print(" -> [WebUI] ¡Descarga de pesos DiT completada con exito!")
-                            break
-                        pct = sdata.get("percent", 0)
-                        dl_mb = sdata.get("downloaded_mb", 0)
-                        tot_mb = sdata.get("total_mb", 4702)
-                        spd = sdata.get("speed_mb", 0)
-                        eta = sdata.get("eta_seconds", 0)
-                        eta_str = f"{int(eta//60)}m {int(eta%60):02d}s" if eta > 0 else "calculando..."
-                        txt = f"[2/4] Descargando pesos DiT ({dl_mb:.0f}/{tot_mb:.0f} MB • {pct}% • {spd} MB/s • ETA: {eta_str})"
-                        now_t = time.time()
-                        if now_t - last_console_time >= 5.0:
-                            print(f" -> {txt}")
-                            last_console_time = now_t
-                        yield step_yield(render_progress_html(txt, int(pct * 0.45 + 5)))
-                    except Exception:
-                        pass
-                else:
-                    now_t = time.time()
-                    if now_t - last_console_time >= 5.0:
-                        print(" -> [WebUI] Esperando sincronizacion de descarga de pesos...")
-                        last_console_time = now_t
-                    yield step_yield(render_progress_html("[2/4] Iniciando descarga de pesos Hunyuan3D-2 (~4.9GB) a Disco D:...", 25))
-                
-                time.sleep(1.5)
+        if not is_dit_cached():
+            for msg, pct in _wait_for_dit_download():
+                if msg == DOWNLOAD_ERROR:
+                    print(f" -> [WebUI Error] {pct}")
+                    yield step_yield(render_progress_html(f"Error: {pct} Ejecuta descargar_modelos.bat o usa el motor SF3D.", 0))
+                    return
+                yield step_yield(render_progress_html(msg, pct))
 
         # Determinar perfil VRAM activo
         selected_key = VRAM_CHOICE_TO_KEY.get(vram_profile_choice, "auto")
@@ -489,16 +494,13 @@ def _ui_generate_3d_impl(
         yield step_yield(render_progress_html(f"[2/4] Perfil VRAM: {profile_info['desc']}...", 25))
 
         target_device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        unload_sf3d()
-        flush_vram()
-        print_real_vram_status("WebUI Pre-Hunyuan3D-2")
         try:
             generator = Hunyuan3DGenerator(
                 model_id="tencent/Hunyuan3D-2",
                 shape_subfolder="hunyuan3d-dit-v2-0-turbo",
                 paint_subfolder="hunyuan3d-paint-v2-0",
                 use_fp16=profile_info.get("use_fp16", True),
-                low_vram_mode=True,
+                low_vram_mode=None,  # Lo decide el perfil de VRAM
                 vram_profile=active_profile_key,
                 device=target_device
             )
@@ -510,28 +512,30 @@ def _ui_generate_3d_impl(
         flush_vram()
 
         # ETAPA 1: Geometría Hunyuan3D-DiT y Decimación Previa
-        yield step_yield(render_progress_html("[3/4] [Etapa 1/2] Síntesis Geométrica DiT: Inferencia en GPU NVIDIA RTX...", 30))
+        yield step_yield(render_progress_html(f"[3/4] [Etapa 1/2] Síntesis Geométrica DiT: Inferencia en {gpu_name}...", 30))
 
         progress_q = queue.Queue()
         gen_result = {"mesh": None, "error": None}
 
-        # Límite seguro para 8 GB VRAM: máximo 40,000 caras antes de pasar a texturizado
-        safe_faces = min(target_faces, 40000) if (target_faces and target_faces > 0) else 40000
+        # El tope de caras solo aplica si se va a texturizar (el texturizado no admite 280k caras).
+        # Sin textura, "Máxima Calidad HD" conserva la malla completa.
+        texture_cap = TEXTURE_SAFE_MAX_FACES if generate_texture else None
+        if texture_cap and (not target_faces or target_faces > texture_cap):
+            print(f" -> [WebUI] Con textura la malla se limita a {texture_cap:,} caras (sin textura se conserva completa).")
 
         def on_shape_progress(step_text, pct):
             progress_q.put((step_text, pct))
 
         def run_shape_worker():
             try:
-                if torch.cuda.is_available():
-                    torch.cuda.set_device(0)
                 m = generator.generate_shape(
                     clean_img,
                     steps=dit_steps,
                     octree_resolution=octree_res,
                     seed=42,
-                    target_faces=safe_faces,
-                    progress_callback=on_shape_progress
+                    target_faces=target_faces,
+                    progress_callback=on_shape_progress,
+                    texture_safe_cap=texture_cap
                 )
                 gen_result["mesh"] = m
             except Exception as err:
@@ -586,7 +590,6 @@ def _ui_generate_3d_impl(
                 final_mesh = aligned_mesh
         else:
             yield step_yield(render_progress_html("[4/4] Empaquetado: Ensamblando malla base (sin textura)...", 94))
-            import trimesh
             neutral_mat = trimesh.visual.material.PBRMaterial(
                 baseColorFactor=[0.82, 0.84, 0.88, 1.0],
                 metallicFactor=0.0,
@@ -596,9 +599,8 @@ def _ui_generate_3d_impl(
             aligned_mesh.visual.material = neutral_mat
             final_mesh = aligned_mesh
 
-        # Purga total de VRAM tras concluir Etapa 2
-        unload_all_models()
-        flush_vram()
+        # VRAM vacía al terminar; los modelos quedan aparcados en RAM para la próxima generación
+        park_all_models()
         print_real_vram_status("WebUI Fin Generación")
 
     # Garantizar material PBR mate/limpio en la malla final
@@ -609,7 +611,7 @@ def _ui_generate_3d_impl(
 
     yield step_yield(render_progress_html("[4/4] Exportación Multi-Formato: Generando archivos .GLB, .STL y .3MF...", 97))
 
-    # Guardar archivos .glb, .stl y .3mf en D:\AI_Models\output\
+    # Guardar archivos .glb, .stl y .3mf en <HY3DGEN_MODELS>\output\
     timestamp = int(time.time())
     raw_name = (model_name or "").strip()
     for ext in [".glb", ".stl", ".3mf"]:
@@ -698,18 +700,13 @@ def ui_generate_3d(
     finally:
         IS_GENERATING = False
         try:
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
+            park_all_models()
         except Exception:
             pass
 
 
 def ui_save_to_game(category: str, subcategory: str, custom_name: str) -> str:
     """Copia directamente el .glb generado a la carpeta de Kaboomi Party."""
-    global CURRENT_GENERATED_GLB
     if CURRENT_GENERATED_GLB is None or not CURRENT_GENERATED_GLB.exists():
         return "Primero genera un modelo 3D antes de guardarlo en el juego."
     
@@ -748,7 +745,6 @@ def ui_save_to_game(category: str, subcategory: str, custom_name: str) -> str:
 
 def ui_save_to_custom_dir(target_dir_str: str, custom_name: str) -> str:
     """Copia el .glb generado a una carpeta o proyecto local especificado."""
-    global CURRENT_GENERATED_GLB
     if CURRENT_GENERATED_GLB is None or not CURRENT_GENERATED_GLB.exists():
         return "Primero genera un modelo 3D antes de exportarlo."
     
@@ -821,7 +817,7 @@ def load_existing_model_preview(selection: str) -> Optional[str]:
             if target.exists():
                 return str(target.resolve())
             
-            # Búsqueda en salidas de D:\AI_Models
+            # Búsqueda en la carpeta de salidas
             for f in OUTPUT_DIR.glob(f"**/{clean_name}"):
                 if f.exists():
                     return str(f.resolve())
@@ -2097,7 +2093,7 @@ with gr.Blocks(title=page_title) as demo:
                         
                         preset_radio = gr.Radio(
                             choices=list(PRESET_CONFIG_MAP.keys()),
-                            value="Alta Calidad (50,000 caras • Curvas Suaves y Detalladas)",
+                            value="Alta Calidad (50,000 caras • Con textura: 40k)",
                             label="",
                             show_label=False,
                             elem_classes=["preset-radio-list"]
@@ -2553,15 +2549,15 @@ if __name__ == "__main__":
     print("\n" + "="*70)
     if MODE == "kambo":
         print(" KABOOMI 3D STUDIO (GRADIO WEBUI)")
-        print(f" -> Modo: Kaboomi Party Edition")
+        print(" -> Modo: Kaboomi Party Edition")
         print(f" -> Directorio de Salida: {OUTPUT_DIR}")
-        print(f" -> Modelos y Caché: D:\\AI_Models (100% Protegido)")
+        print(" -> Modelos y Caché: D:\\AI_Models (100% Protegido)")
         print(f" -> Proyecto Kaboomi Party: {KABOOMI_ROOT}")
     else:
         print(" 3D AI STUDIO (GRADIO WEBUI)")
-        print(f" -> Modo: Estándar / General")
+        print(" -> Modo: Estándar / General")
         print(f" -> Directorio de Salida: {OUTPUT_DIR}")
-        print(f" -> Modelos y Caché: D:\\AI_Models (100% Protegido)")
+        print(" -> Modelos y Caché: D:\\AI_Models (100% Protegido)")
     print("="*70)
     
     allowed_list = [str(OUTPUT_DIR.resolve()), str(Path("assets").resolve())]

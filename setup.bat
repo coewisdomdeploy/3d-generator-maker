@@ -162,7 +162,7 @@ echo.
 :: 2. DETECCION Y PRIORIZACION DEL LANZADOR 'py' Y INTERPRETE DE PYTHON
 :: ==============================================================================
 :retry_python_detection
-echo [1/8] Verificando interprete de Python (priorizando lanzador oficial 'py')...
+echo [1/9] Verificando interprete de Python (priorizando lanzador oficial 'py')...
 
 set "PY_CMD="
 set "PY_LAUNCHER="
@@ -335,7 +335,7 @@ echo.
 :: ==============================================================================
 :: 3. CREACION, ACTIVACION Y VALIDACION RIGUROSA DEL ENTORNO VIRTUAL
 :: ==============================================================================
-echo [2/8] Configurando y validando entorno virtual (usando py / python 64-bit)...
+echo [2/9] Configurando y validando entorno virtual (usando py / python 64-bit)...
 
 if /i "!MODELS_ROOT!"=="%~dp0AI_Models" (
     set "VENV_DIR=%~dp0.venv"
@@ -413,82 +413,62 @@ if exist "!VENV_DIR!\Scripts\activate.bat" (
 echo [INFO] Actualizando pip en el entorno virtual...
 "!VENV_PY!" -m pip install --upgrade pip >nul 2>&1
 echo !GREEN![OK]!RESET! Gestor pip del entorno verificado y actualizado.
-echo !GREEN![OK]!RESET! Paso [2/8] superado exitosamente.
+echo !GREEN![OK]!RESET! Paso [2/9] superado exitosamente.
 echo.
 
 :: ==============================================================================
-:: SELECCION Y ASIGNACION DE GPU (INTEL UHD vs NVIDIA GEFORCE RTX 4050)
+:: TIPO DE ACELERACION (decide que PyTorch se instala)
 :: ==============================================================================
+:: La tarjeta concreta se elige cada vez que se abre la aplicacion (gpu_select.py):
+:: aqui solo se decide si se instala PyTorch con CUDA (NVIDIA) o solo CPU.
 echo ==============================================================================
-echo       SELECCION DE TARJETA GRAFICA / PROCESADOR DE ACELERACION
+echo       TIPO DE ACELERACION PARA LA IA
 echo ==============================================================================
-echo [INFO] Escaneando hardware grafico del equipo...
-echo.
-
-echo Adaptadores de pantalla encontrados en Windows:
+echo Adaptadores de video encontrados en Windows:
 powershell -NoProfile -Command "Get-CimInstance Win32_VideoController | ForEach-Object { '  - ' + $_.Name }" 2>nul
 echo.
 
 set "HAS_NVIDIA=0"
-set "DETECTED_GPU_NAME=NVIDIA GeForce RTX 4050 Laptop GPU"
-set "DETECTED_VRAM=6144"
-
+set "NVIDIA_COUNT=0"
 where nvidia-smi.exe >nul 2>&1
 if !errorlevel! neq 0 (
-    if exist "%SystemRoot%\System32\nvidia-smi.exe" set "PATH=%SystemRoot%\System32;!PATH!"
     if exist "%ProgramFiles%\NVIDIA Corporation\NVSMI\nvidia-smi.exe" set "PATH=%ProgramFiles%\NVIDIA Corporation\NVSMI;!PATH!"
 )
-
 where nvidia-smi.exe >nul 2>&1
-if !errorlevel! neq 0 goto :skip_nvsmi_select
+if !errorlevel! neq 0 goto :accel_list_done
+echo Tarjetas NVIDIA compatibles con CUDA:
 for /f "tokens=1,2,3 delims=," %%A in ('nvidia-smi --query-gpu=index^,name^,memory.total --format=csv^,noheader^,nounits 2^>nul') do (
     set "HAS_NVIDIA=1"
-    set "DETECTED_GPU_NAME=%%B"
-    set "DETECTED_VRAM=%%C"
-    echo Acelerador NVIDIA CUDA verificado:
-    echo   - Dispositivo [%%A]: %%B [%%C MB VRAM]
+    set /a NVIDIA_COUNT+=1
+    echo   - [%%A] %%B ^(%%C MB VRAM^)
 )
-:skip_nvsmi_select
-
-echo.
-echo Selecciona la tarjeta grafica que usara el Generador 3D (para evitar que use la Intel UHD):
-echo.
-echo   [1] GPU Dedicada NVIDIA (!DETECTED_GPU_NAME!) - RECOMENDADO
-echo       - Aceleracion por hardware con nucleos CUDA / Tensor
-echo       - Configura Windows en 'Alto Rendimiento' para este entorno
-echo.
-echo   [2] Modo CPU (Sin aceleracion NVIDIA)
-echo       - Ejecucion en memoria RAM del sistema
+:accel_list_done
 echo.
 
-set "GPU_OPT=1"
-set /p "GPU_OPT=Elige una opcion [1 o 2] (Enter para opcion 1 - NVIDIA): "
-echo.
-
+if "!HAS_NVIDIA!"=="1" (
+    set "GPU_OPT=1"
+    if !NVIDIA_COUNT! gtr 1 echo !CYAN![INFO]!RESET! Hay !NVIDIA_COUNT! tarjetas NVIDIA: la aplicacion preguntara cual usar cada vez que se abra.
+) else (
+    set "GPU_OPT=2"
+    echo !YELLOW![AVISO]!RESET! No se detecto ninguna tarjeta NVIDIA ^(o falta el driver^). Intel/AMD no sirven para CUDA.
+)
+echo   [1] NVIDIA CUDA 12.4 - RECOMENDADO
+echo   [2] Solo CPU - muy lento
+set /p "GPU_OPT=Elige el tipo de PyTorch a instalar [1/2] (Enter = !GPU_OPT!): "
 set "GPU_OPT=!GPU_OPT: =!"
 if not "!GPU_OPT!"=="2" set "GPU_OPT=1"
-
 if "!GPU_OPT!"=="1" (
-    set "CUDA_VISIBLE_DEVICES=0"
-    set "STUDIO_DEVICE=cuda:0"
-    echo !GREEN![OK]!RESET! Asignada GPU NVIDIA: !DETECTED_GPU_NAME! [CUDA:0]
-    
-    rem Forzar preferencia de Alto Rendimiento en el Registro de Windows
+    echo !GREEN![OK]!RESET! Se instalara PyTorch con CUDA 12.4.
     reg add "HKCU\Software\Microsoft\DirectX\UserGpuPreferences" /v "!VENV_PY!" /t REG_SZ /d "GpuPreference=2;" /f >nul 2>&1
-    if !errorlevel! equ 0 (
-        echo !GREEN![OK]!RESET! Configurado Windows: Asignado Alto Rendimiento para "!VENV_PY!"
-    )
 ) else (
-    set "CUDA_VISIBLE_DEVICES="
-    set "STUDIO_DEVICE=cpu"
-    echo !YELLOW![AVISO]!RESET! Asignado Modo CPU para el generador 3D.
+    echo !YELLOW![AVISO]!RESET! Se instalara PyTorch solo CPU.
 )
 echo.
 
 :: ==============================================================================
 :: 4. INSTALACION Y VERIFICACION DE PYTORCH CON ACELERACION CUDA
 :: ==============================================================================
-echo [3/8] Verificando PyTorch con aceleracion CUDA (usando entorno virtual)...
+echo [3/9] Verificando PyTorch con aceleracion CUDA (usando entorno virtual)...
 
 if "!GPU_OPT!"=="2" (
     echo [INFO] Modo CPU seleccionado. Verificando PyTorch CPU...
@@ -510,7 +490,7 @@ if !errorlevel! equ 0 (
     "!VENV_PY!" -m pip uninstall -y torch torchvision torchaudio >nul 2>&1
 )
 
-echo [INFO] Instalando PyTorch con aceleracion CUDA 12.4 para !DETECTED_GPU_NAME!...
+echo [INFO] Instalando PyTorch con aceleracion CUDA 12.4...
 "!VENV_PY!" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --trusted-host download.pytorch.org --trusted-host download-r2.pytorch.org --trusted-host files.pythonhosted.org --trusted-host pypi.org --cache-dir "!PIP_CACHE_DIR!"
 "!VENV_PY!" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
 if !errorlevel! equ 0 (
@@ -582,22 +562,35 @@ echo !GREEN![OK]!RESET! PyTorch con aceleracion NVIDIA CUDA verificado y operati
 echo.
 
 :: ==============================================================================
-:: 5. INSTALACION Y VERIFICACION DE LIBRERIAS BASE 3D
+:: 5. DEPENDENCIAS DEL PROYECTO (sin tocar la version CUDA de PyTorch)
 :: ==============================================================================
-echo [4/8] Verificando librerias 3D base y utilidades...
+echo [4/9] Instalando / verificando dependencias del proyecto...
+:: Se fija la version instalada de torch/torchvision: si otra dependencia pidiera torch,
+:: pip bajaria la version CPU de PyPI y se perderia la aceleracion CUDA.
+set "CONSTRAINTS_FILE=!TEMP!\torch_constraints.txt"
+"!VENV_PY!" -c "import torch, torchvision; print('torch==' + torch.__version__); print('torchvision==' + torchvision.__version__)" > "!CONSTRAINTS_FILE!" 2>nul
+if !errorlevel! neq 0 type nul > "!CONSTRAINTS_FILE!"
 
-"!VENV_PY!" -c "import trimesh, pymeshlab, pyfqmr, rembg, pygltflib, gradio, xatlas, PIL, cv2" >nul 2>&1
-if !errorlevel! equ 0 goto :base_deps_ok
+:: Python 3.11: entorno EXACTO verificado (requirements-lock.txt, --no-deps).
+:: Otras versiones de Python o si falla: requirements.txt con resolucion normal.
+"!VENV_PY!" -c "import sys; sys.exit(0 if sys.version_info[:2] == (3, 11) else 1)" >nul 2>&1
+if !errorlevel! neq 0 goto :deps_loose
+echo [INFO] Instalando el entorno exacto verificado (requirements-lock.txt)...
+"!VENV_PY!" -m pip install -r "%~dp0requirements-lock.txt" --no-deps --cache-dir "!PIP_CACHE_DIR!"
+if !errorlevel! equ 0 goto :deps_verify
+echo !YELLOW![AVISO]!RESET! No se pudo instalar el entorno exacto. Probando con requirements.txt...
 
-echo [INFO] Instalando dependencias base desde requirements.txt (usando entorno virtual)...
-"!VENV_PY!" -m pip install -r requirements.txt --cache-dir "!PIP_CACHE_DIR!"
-echo !GREEN![OK]!RESET! Dependencias base instaladas.
-goto :base_deps_done
+:deps_loose
+"!VENV_PY!" -m pip install -r "%~dp0requirements.txt" -c "!CONSTRAINTS_FILE!" --extra-index-url https://download.pytorch.org/whl/cu124 --cache-dir "!PIP_CACHE_DIR!"
 
-:base_deps_ok
-echo !GREEN![OK]!RESET! Dependencias base 3D y utilidades ya instaladas. Omitiendo instalacion.
-
-:base_deps_done
+:deps_verify
+"!VENV_PY!" -c "import importlib.util as u, sys; m = [x for x in ['torch', 'trimesh', 'pymeshlab', 'pyfqmr', 'rembg', 'pygltflib', 'gradio', 'xatlas', 'PIL', 'cv2', 'diffusers', 'transformers', 'accelerate', 'psutil', 'numba', 'requests', 'huggingface_hub', 'hy3dgen'] if u.find_spec(x) is None]; [print('   - falta:', x) for x in m]; sys.exit(1 if m else 0)"
+if !errorlevel! equ 0 (
+    echo !GREEN![OK]!RESET! Dependencias del proyecto verificadas.
+) else (
+    echo !RED![ERROR]!RESET! Faltan las dependencias listadas arriba. Revisa los mensajes de pip.
+    pause
+)
 echo.
 
 :: ==============================================================================
@@ -637,24 +630,24 @@ goto :setup_both_section
 
 :: ------------------------------------------------------------------------------
 :setup_hunyuan_section
-echo [5/8] Configurando motor: Tencent Hunyuan3D-2 Turbo...
+echo [5/9] Configurando motor: Tencent Hunyuan3D-2 Turbo...
 call :check_and_install_hunyuan
-goto :step_gpu_check
+goto :step_weights
 
 :: ------------------------------------------------------------------------------
 :setup_sf3d_section
-echo [5/8] Configurando motor: Stability AI Stable Fast 3D (SF3D)...
+echo [5/9] Configurando motor: Stability AI Stable Fast 3D (SF3D)...
 call :check_and_install_sf3d
-goto :step_gpu_check
+goto :step_weights
 
 :: ------------------------------------------------------------------------------
 :setup_both_section
-echo [5/8] Configurando Motor 1 de 2: Tencent Hunyuan3D-2 Turbo...
+echo [5/9] Configurando Motor 1 de 2: Tencent Hunyuan3D-2 Turbo...
 call :check_and_install_hunyuan
 echo.
-echo [6/8] Configurando Motor 2 de 2: Stability AI Stable Fast 3D (SF3D)...
+echo [5/9] Configurando Motor 2 de 2: Stability AI Stable Fast 3D (SF3D)...
 call :check_and_install_sf3d
-goto :step_gpu_check
+goto :step_weights
 
 :: ==============================================================================
 :: SUBRUTINAS DE INSTALACION DE MOTORES
@@ -666,27 +659,21 @@ if !errorlevel! equ 0 goto :hy3dgen_ok
 echo [INFO] hy3dgen no encontrado. Verificando Git para instalacion...
 where git.exe >nul 2>&1
 if !errorlevel! equ 0 (
-    "!VENV_PY!" -m pip install git+https://github.com/Tencent-Hunyuan/Hunyuan3D-2.git --cache-dir "!PIP_CACHE_DIR!"
+    "!VENV_PY!" -m pip install git+https://github.com/Tencent-Hunyuan/Hunyuan3D-2.git -c "!CONSTRAINTS_FILE!" --cache-dir "!PIP_CACHE_DIR!"
 ) else (
-    "!VENV_PY!" -m pip install https://github.com/Tencent-Hunyuan/Hunyuan3D-2/archive/refs/heads/main.zip --cache-dir "!PIP_CACHE_DIR!"
+    "!VENV_PY!" -m pip install https://github.com/Tencent-Hunyuan/Hunyuan3D-2/archive/refs/heads/main.zip -c "!CONSTRAINTS_FILE!" --cache-dir "!PIP_CACHE_DIR!"
 )
-goto :hy3dgen_weights_check
+"!VENV_PY!" -c "import hy3dgen" >nul 2>&1
+if !errorlevel! equ 0 (
+    echo !GREEN![OK]!RESET! Modulo oficial hy3dgen instalado.
+) else (
+    echo !RED![ERROR]!RESET! No se pudo instalar hy3dgen. Revisa los mensajes de pip de arriba.
+)
+exit /b 0
 
 :hy3dgen_ok
 echo !GREEN![OK]!RESET! Modulo oficial hy3dgen ya instalado en el entorno.
-
-:hy3dgen_weights_check
-if exist "!MODELS_ROOT!\tencent\Hunyuan3D-2\hunyuan3d-dit-v2-0-turbo\model.fp16.safetensors" goto :hy_weights_local
-if exist "!HUGGINGFACE_HUB_CACHE!\models--tencent--Hunyuan3D-2" goto :hy_weights_cache
-echo [INFO] Los pesos DiT de Hunyuan3D-2 (~4.93 GB) se descargaran de forma automatica en el primer uso a Disco !TARGET_DRIVE!:\.
-exit /b 0
-
-:hy_weights_local
-echo !GREEN![OK]!RESET! Pesos Hunyuan3D-2 Turbo detectados (~4.93 GB en !MODELS_ROOT!\tencent\Hunyuan3D-2). Omitiendo descarga.
-exit /b 0
-
-:hy_weights_cache
-echo !GREEN![OK]!RESET! Pesos Hunyuan3D-2 Turbo detectados en cache HuggingFace.
+:: Los pesos se verifican y descargan en el paso 6 (preparar_modelos.py)
 exit /b 0
 
 :check_and_install_sf3d
@@ -711,7 +698,7 @@ echo !GREEN![OK]!RESET! Repositorio oficial de Stable Fast 3D presente en "!REPO
 if !errorlevel! equ 0 goto :sf3d_deps_ok
 
 echo [INFO] Instalando dependencias especializadas de SF3D...
-"!VENV_PY!" -m pip install jaxtyping open-clip-torch gpytoolbox pynanoinstantmeshes numba xatlas --cache-dir "!PIP_CACHE_DIR!"
+"!VENV_PY!" -m pip install jaxtyping open-clip-torch gpytoolbox pynanoinstantmeshes numba xatlas -c "!CONSTRAINTS_FILE!" --cache-dir "!PIP_CACHE_DIR!"
 echo !GREEN![OK]!RESET! Dependencias especializadas de SF3D instaladas.
 goto :sf3d_token_check
 
@@ -746,11 +733,76 @@ echo [INFO] Podras configurar el token mas adelante con: huggingface-cli login
 exit /b 0
 
 :: ==============================================================================
-:: 7. VERIFICACION DE GPU CUDA Y HARDWARE
+:: 6. PESOS DE LOS MODELOS (descarga previa: el primer uso no se queda esperando)
+:: ==============================================================================
+:step_weights
+echo.
+echo [6/9] Verificando pesos de los modelos...
+"!VENV_PY!" "%~dp0preparar_modelos.py" status
+echo.
+if "!ENGINE_CHOICE!"=="2" goto :weights_sf3d
+call :ensure_weights dit "Geometria Hunyuan3D-2 Turbo" "4.9 GB"
+call :ensure_weights paint "Textura Hunyuan3D-Paint" "9 GB"
+if "!ENGINE_CHOICE!"=="1" goto :step_paint
+:weights_sf3d
+call :ensure_weights sf3d "Stable Fast 3D" "3.8 GB"
+goto :step_paint
+
+:: Subrutina: %1 = item de preparar_modelos.py, %2 = nombre, %3 = tamano
+:ensure_weights
+"!VENV_PY!" "%~dp0preparar_modelos.py" check %~1
+if !errorlevel! equ 0 exit /b 0
+set "DL_ANSWER=S"
+set /p "DL_ANSWER=Descargar ahora %~2 [%~3]? [S/N] (Enter = S): "
+if /i not "!DL_ANSWER:~0,1!"=="S" (
+    echo [INFO] Omitido: se descargara automaticamente la primera vez que se use.
+    exit /b 0
+)
+"!VENV_PY!" "%~dp0preparar_modelos.py" download %~1
+if !errorlevel! equ 0 (
+    echo !GREEN![OK]!RESET! %~2 descargado.
+) else (
+    echo !YELLOW![AVISO]!RESET! No se pudo descargar %~2. Se reintentara en el primer uso.
+)
+exit /b 0
+
+:: ==============================================================================
+:: 7. TEXTURA HUNYUAN3D-PAINT (extension CUDA custom_rasterizer, opcional)
+:: ==============================================================================
+:step_paint
+echo.
+echo [7/9] Verificando textura Hunyuan3D-Paint (extension custom_rasterizer)...
+if "!ENGINE_CHOICE!"=="2" goto :paint_skip
+if "!GPU_OPT!"=="2" goto :paint_skip
+"!VENV_PY!" "%~dp0preparar_modelos.py" check rasterizer
+if !errorlevel! equ 0 (
+    echo !GREEN![OK]!RESET! custom_rasterizer instalado: textura Hunyuan3D-Paint disponible.
+    goto :step_gpu_check
+)
+echo La textura de Hunyuan3D necesita compilar una extension CUDA. Requiere:
+echo   - Visual Studio 2022 Build Tools con C++  [~7 GB en C:]
+echo   - CUDA Toolkit 12.4  [~4 GB en C:, NO cambia el driver de video]
+echo Sin ella todo funciona igual: la textura Hunyuan usa el horneado de contingencia.
+set "PAINT_ANSWER=N"
+set /p "PAINT_ANSWER=Instalar ahora? Tambien puedes hacerlo luego con instalar_textura_hunyuan.bat [S/N] (Enter = N): "
+if /i not "!PAINT_ANSWER:~0,1!"=="S" goto :paint_later
+call "%~dp0instalar_textura_hunyuan.bat" --from-setup
+goto :step_gpu_check
+
+:paint_later
+echo [INFO] Puedes instalarla cuando quieras ejecutando instalar_textura_hunyuan.bat
+goto :step_gpu_check
+
+:paint_skip
+echo [INFO] Omitido: solo aplica al motor Hunyuan3D-2 con GPU NVIDIA.
+goto :step_gpu_check
+
+:: ==============================================================================
+:: 8. VERIFICACION DE GPU CUDA Y HARDWARE
 :: ==============================================================================
 :step_gpu_check
 echo.
-echo [7/8] Verificando aceleracion por hardware GPU (NVIDIA CUDA)...
+echo [8/9] Verificando aceleracion por hardware GPU (NVIDIA CUDA)...
 
 where nvidia-smi.exe >nul 2>&1
 if !errorlevel! neq 0 (
@@ -779,120 +831,25 @@ if !errorlevel! equ 0 (
 echo.
 
 :: ==============================================================================
-:: 8. GENERACION Y ACTUALIZACION DE LANZADORES DINAMICOS
+:: 9. CONFIGURACION (.env) Y LANZADORES
 :: ==============================================================================
-echo [8/8] Generando y actualizando lanzadores ejecutables (.bat)...
-
-:: Sincronizar configuracion con .env
-if exist "%~dp0.env" (
-    findstr /i "CUDA_VISIBLE_DEVICES" "%~dp0.env" >nul 2>&1
-    if !errorlevel! neq 0 (
-        echo CUDA_VISIBLE_DEVICES=!CUDA_VISIBLE_DEVICES!>> "%~dp0.env"
+:: Los lanzadores (.bat) estan versionados en git y son la fuente oficial: setup.bat
+:: no los regenera. Las rutas se leen del .env (studio_env.py) y la GPU se elige al
+:: arrancar (gpu_select.py).
+echo [9/9] Guardando configuracion en .env y verificando lanzadores...
+"!VENV_PY!" "%~dp0studio_env.py" --set-root "!MODELS_ROOT!"
+set "MISSING_LAUNCHER="
+for %%L in (webui.bat webui-kambo.bat run_webui.bat run_webui_kambo.bat run_cli.bat instalar_textura_hunyuan.bat) do (
+    if not exist "%~dp0%%L" (
+        echo !RED![ERROR]!RESET! Falta el lanzador %%L. Restauralo con: git checkout -- %%L
+        set "MISSING_LAUNCHER=1"
     )
 )
+if not defined MISSING_LAUNCHER echo !GREEN![OK]!RESET! Lanzadores presentes.
+echo.
 
-:: 1. webui.bat (WebUI General: Hunyuan3D-2 + Sin Textura por defecto)
-echo @echo off > "%~dp0webui.bat"
-echo setlocal >> "%~dp0webui.bat"
-echo cd /d "%%~dp0" >> "%~dp0webui.bat"
-echo chcp 65001 ^>nul >> "%~dp0webui.bat"
-echo echo ============================================================================== >> "%~dp0webui.bat"
-echo echo       3D AI STUDIO - INTERFAZ WEB GENERAL >> "%~dp0webui.bat"
-echo echo       Motor Predeterminado: Hunyuan3D-2 Turbo • Modo Arcilla / Sin Textura >> "%~dp0webui.bat"
-echo echo       Almacenamiento de Modelos y Cache: 100%%%% en Disco !TARGET_DRIVE!:\ >> "%~dp0webui.bat"
-echo echo ============================================================================== >> "%~dp0webui.bat"
-echo set "HF_HOME=!HF_HOME!" >> "%~dp0webui.bat"
-echo set "HUGGINGFACE_HUB_CACHE=!HUGGINGFACE_HUB_CACHE!" >> "%~dp0webui.bat"
-echo set "TORCH_HOME=!TORCH_HOME!" >> "%~dp0webui.bat"
-echo set "U2NET_HOME=!U2NET_HOME!" >> "%~dp0webui.bat"
-echo set "PIP_CACHE_DIR=!PIP_CACHE_DIR!" >> "%~dp0webui.bat"
-echo set "TEMP=!TEMP!" >> "%~dp0webui.bat"
-echo set "TMP=!TMP!" >> "%~dp0webui.bat"
-echo set "TMPDIR=!TEMP!" >> "%~dp0webui.bat"
-echo set "HY3DGEN_MODELS=!MODELS_ROOT!" >> "%~dp0webui.bat"
-echo set "STUDIO_PROFILE=general" >> "%~dp0webui.bat"
-echo if exist "%%~dp0.venv\Scripts\activate.bat" ( >> "%~dp0webui.bat"
-echo     call "%%~dp0.venv\Scripts\activate.bat" >> "%~dp0webui.bat"
-echo ) else if exist "!MODELS_ROOT!\venv_3dgen\Scripts\activate.bat" ( >> "%~dp0webui.bat"
-echo     call "!MODELS_ROOT!\venv_3dgen\Scripts\activate.bat" >> "%~dp0webui.bat"
-echo ) else ( >> "%~dp0webui.bat"
-echo     echo [ERROR] No se encontro el entorno virtual. Ejecuta setup.bat. >> "%~dp0webui.bat"
-echo     pause >> "%~dp0webui.bat"
-echo     exit /b 1 >> "%~dp0webui.bat"
-echo ) >> "%~dp0webui.bat"
-echo python webui.py --mode general %%* >> "%~dp0webui.bat"
-echo pause >> "%~dp0webui.bat"
-
-:: 2. webui-kambo.bat (WebUI Kaboomi: SF3D + Con Textura PBR por defecto)
-echo @echo off > "%~dp0webui-kambo.bat"
-echo setlocal >> "%~dp0webui-kambo.bat"
-echo cd /d "%%~dp0" >> "%~dp0webui-kambo.bat"
-echo chcp 65001 ^>nul >> "%~dp0webui-kambo.bat"
-echo echo ============================================================================== >> "%~dp0webui-kambo.bat"
-echo echo       KABOOMI 3D STUDIO - EDICION KABOOMI PARTY (GODOT 4) >> "%~dp0webui-kambo.bat"
-echo echo       Motor Predeterminado: Stable Fast 3D (SF3D) • Con Textura PBR Completa >> "%~dp0webui-kambo.bat"
-echo echo       Almacenamiento de Modelos y Cache: 100%%%% en Disco !TARGET_DRIVE!:\ >> "%~dp0webui-kambo.bat"
-echo echo ============================================================================== >> "%~dp0webui-kambo.bat"
-echo set "HF_HOME=!HF_HOME!" >> "%~dp0webui-kambo.bat"
-echo set "HUGGINGFACE_HUB_CACHE=!HUGGINGFACE_HUB_CACHE!" >> "%~dp0webui-kambo.bat"
-echo set "TORCH_HOME=!TORCH_HOME!" >> "%~dp0webui-kambo.bat"
-echo set "U2NET_HOME=!U2NET_HOME!" >> "%~dp0webui-kambo.bat"
-echo set "PIP_CACHE_DIR=!PIP_CACHE_DIR!" >> "%~dp0webui-kambo.bat"
-echo set "TEMP=!TEMP!" >> "%~dp0webui-kambo.bat"
-echo set "TMP=!TMP!" >> "%~dp0webui-kambo.bat"
-echo set "TMPDIR=!TEMP!" >> "%~dp0webui-kambo.bat"
-echo set "HY3DGEN_MODELS=!MODELS_ROOT!" >> "%~dp0webui-kambo.bat"
-echo set "STUDIO_PROFILE=kambo" >> "%~dp0webui-kambo.bat"
-echo if exist "%%~dp0.venv\Scripts\activate.bat" ( >> "%~dp0webui-kambo.bat"
-echo     call "%%~dp0.venv\Scripts\activate.bat" >> "%~dp0webui-kambo.bat"
-echo ) else if exist "!MODELS_ROOT!\venv_3dgen\Scripts\activate.bat" ( >> "%~dp0webui-kambo.bat"
-echo     call "!MODELS_ROOT!\venv_3dgen\Scripts\activate.bat" >> "%~dp0webui-kambo.bat"
-echo ) else ( >> "%~dp0webui-kambo.bat"
-echo     echo [ERROR] No se encontro el entorno virtual. Ejecuta setup.bat. >> "%~dp0webui-kambo.bat"
-echo     pause >> "%~dp0webui-kambo.bat"
-echo     exit /b 1 >> "%~dp0webui-kambo.bat"
-echo ) >> "%~dp0webui-kambo.bat"
-echo python webui.py --mode kambo %%* >> "%~dp0webui-kambo.bat"
-echo pause >> "%~dp0webui-kambo.bat"
-
-:: 3. run_webui.bat (Acceso rapido a WebUI General)
-echo @echo off > "%~dp0run_webui.bat"
-echo setlocal >> "%~dp0run_webui.bat"
-echo cd /d "%%~dp0" >> "%~dp0run_webui.bat"
-echo chcp 65001 ^>nul >> "%~dp0run_webui.bat"
-echo call "%%~dp0webui.bat" >> "%~dp0run_webui.bat"
-
-:: 4. run_webui_kambo.bat (Acceso rapido a WebUI Kaboomi Party)
-echo @echo off > "%~dp0run_webui_kambo.bat"
-echo setlocal >> "%~dp0run_webui_kambo.bat"
-echo cd /d "%%~dp0" >> "%~dp0run_webui_kambo.bat"
-echo chcp 65001 ^>nul >> "%~dp0run_webui_kambo.bat"
-echo call "%%~dp0webui-kambo.bat" >> "%~dp0run_webui_kambo.bat"
-
-:: 5. run_cli.bat (Ejecutor CLI con soporte para --model y --no-texture)
-echo @echo off > "%~dp0run_cli.bat"
-echo setlocal >> "%~dp0run_cli.bat"
-echo chcp 65001 ^>nul >> "%~dp0run_cli.bat"
-echo set "HF_HOME=!HF_HOME!" >> "%~dp0run_cli.bat"
-echo set "HUGGINGFACE_HUB_CACHE=!HUGGINGFACE_HUB_CACHE!" >> "%~dp0run_cli.bat"
-echo set "TORCH_HOME=!TORCH_HOME!" >> "%~dp0run_cli.bat"
-echo set "U2NET_HOME=!U2NET_HOME!" >> "%~dp0run_cli.bat"
-echo set "PIP_CACHE_DIR=!PIP_CACHE_DIR!" >> "%~dp0run_cli.bat"
-echo set "TEMP=!TEMP!" >> "%~dp0run_cli.bat"
-echo set "TMP=!TMP!" >> "%~dp0run_cli.bat"
-echo set "TMPDIR=!TEMP!" >> "%~dp0run_cli.bat"
-echo set "HY3DGEN_MODELS=!MODELS_ROOT!" >> "%~dp0run_cli.bat"
-echo if exist "%%~dp0.venv\Scripts\activate.bat" ( >> "%~dp0run_cli.bat"
-echo     call "%%~dp0.venv\Scripts\activate.bat" >> "%~dp0run_cli.bat"
-echo ) else if exist "!MODELS_ROOT!\venv_3dgen\Scripts\activate.bat" ( >> "%~dp0run_cli.bat"
-echo     call "!MODELS_ROOT!\venv_3dgen\Scripts\activate.bat" >> "%~dp0run_cli.bat"
-echo ) else ( >> "%~dp0run_cli.bat"
-echo     echo [ERROR] No se encontro el entorno virtual. Ejecuta setup.bat. >> "%~dp0run_cli.bat"
-echo     exit /b 1 >> "%~dp0run_cli.bat"
-echo ) >> "%~dp0run_cli.bat"
-echo python img2glb.py %%* >> "%~dp0run_cli.bat"
-
-echo !GREEN![OK]!RESET! Todos los lanzadores actualizados y sincronizados con Disco !TARGET_DRIVE!:\ y GPU !CUDA_VISIBLE_DEVICES!.
+echo Estado final de los componentes:
+"!VENV_PY!" "%~dp0preparar_modelos.py" status
 echo.
 
 :: ==============================================================================

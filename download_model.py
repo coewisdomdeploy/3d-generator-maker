@@ -12,19 +12,22 @@ import json
 from pathlib import Path
 import requests
 
-MODEL_DIR = Path("D:/AI_Models/tencent/Hunyuan3D-2/hunyuan3d-dit-v2-0-turbo")
+from studio_env import MODELS_ROOT, HUNYUAN_LOCAL_DIR
+
+MODEL_DIR = HUNYUAN_LOCAL_DIR / "hunyuan3d-dit-v2-0-turbo"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 TARGET_FILE = MODEL_DIR / "model.fp16.safetensors"
 CONFIG_FILE = MODEL_DIR / "config.yaml"
-STATUS_FILE = Path("D:/AI_Models/download_status.json")
+STATUS_FILE = MODELS_ROOT / "download_status.json"
+LOCK_FILE = MODELS_ROOT / "download_status.lock"
 
 URL_SAFETENSORS = "https://huggingface.co/tencent/Hunyuan3D-2/resolve/main/hunyuan3d-dit-v2-0-turbo/model.fp16.safetensors"
 URL_CONFIG = "https://huggingface.co/tencent/Hunyuan3D-2/resolve/main/hunyuan3d-dit-v2-0-turbo/config.yaml"
 
 TOTAL_SIZE_EXPECTED = 4930777530 # 4.93 GB
 
-def update_status(downloaded: int, total: int, speed_mb: float, eta_sec: float, msg: str):
+def update_status(downloaded: int, total: int, speed_mb: float, eta_sec: float, msg: str, error: str = ""):
     percent = round((downloaded / total) * 100, 1) if total > 0 else 0
     data = {
         "downloaded_bytes": downloaded,
@@ -35,7 +38,9 @@ def update_status(downloaded: int, total: int, speed_mb: float, eta_sec: float, 
         "speed_mb": round(speed_mb, 2),
         "eta_seconds": int(eta_sec),
         "message": msg,
-        "is_complete": downloaded >= total and total > 0
+        "is_complete": downloaded >= total and total > 0 and not error,
+        "error": error,
+        "pid": os.getpid()
     }
     try:
         with open(STATUS_FILE, "w", encoding="utf-8") as f:
@@ -120,9 +125,47 @@ def download_safetensors():
         print("="*70 + "\n")
         update_status(TOTAL_SIZE_EXPECTED, TOTAL_SIZE_EXPECTED, 0, 0, "✅ Pesos completos en disco D:")
     else:
-        print(f"[Error] Tamaño inconsistente: {part_file.stat().st_size} vs {TOTAL_SIZE_EXPECTED}")
+        raise RuntimeError(f"Tamaño inconsistente: {part_file.stat().st_size} vs {TOTAL_SIZE_EXPECTED} bytes")
+
+
+def acquire_lock() -> bool:
+    """Impide dos descargas simultáneas escribiendo sobre el mismo .part (lo corromperían)."""
+    try:
+        fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        # Bloqueo huérfano de una descarga que murió: se recupera si ese proceso ya no existe
+        try:
+            import psutil
+            old_pid = int(LOCK_FILE.read_text().strip() or 0)
+            if old_pid and psutil.pid_exists(old_pid):
+                return False
+        except Exception:
+            return False
+        LOCK_FILE.unlink(missing_ok=True)
+        return acquire_lock()
+
+
+def main() -> int:
+    """Descarga config.yaml y model.fp16.safetensors. Devuelve 0 si los pesos quedan completos."""
+    if not acquire_lock():
+        print("[Aviso] Ya hay otra descarga de Hunyuan3D-2 en curso. Saliendo.")
+        return 0
+    try:
+        download_config()
+        download_safetensors()
+        return 0
+    except Exception as e:
+        print(f"[ERROR] La descarga de pesos falló: {e}")
+        part = MODEL_DIR / "model.fp16.safetensors.part"
+        done = part.stat().st_size if part.exists() else 0
+        update_status(done, TOTAL_SIZE_EXPECTED, 0, 0, "Descarga fallida", error=str(e))
+        return 1
+    finally:
+        LOCK_FILE.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
-    download_config()
-    download_safetensors()
+    sys.exit(main())
