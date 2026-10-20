@@ -166,7 +166,8 @@ webui-kambo.bat
   Todos los pesos y cachés residen en `D:\AI_Models\`. Si necesitas liberar espacio en el futuro, puedes limpiar esa carpeta sin afectar tu sistema operativo.
 - **Memoria: un solo modelo en la GPU a la vez, con validación antes de cada carga.**
   Flujo con textura: 1) se genera la geometría, 2) el modelo de forma sale de la VRAM y se comprueba que la VRAM quedó libre, 3) se valida que haya VRAM (~4.8 GB) y RAM (~7.5 GB + margen) libres para Hunyuan3D-Paint; si la RAM no alcanza, se libera también la copia en RAM del modelo de forma, 4) solo entonces se carga Paint. Si aun así no cabe, no se carga (se usa la textura de contingencia) para no trabar el equipo; con forma o SF3D se muestra un error claro.
-  Opciones en `.env` (ver `.env.example`): `KEEP_MODELS_IN_RAM`, `RAM_SAFETY_MARGIN_GB`, `RAM_PARK_MIN_FREE_GB`.
+  Opciones en `.env` (ver `.env.example`): `KEEP_MODELS_IN_RAM`, `RAM_SAFETY_MARGIN_GB`, `RAM_PARK_MIN_FREE_GB`, `SHAPE_LOAD_MODE`.
+- **Mínima RAM al cargar.** hy3dgen y SF3D cargan sus pesos pasando por la RAM (pico de ~14 GB y ~8 GB). El generador los carga directamente a la GPU: la geometría usa ~0 GB de RAM y se sirve en modo `full` (todo en GPU, si hay ~6 GB de VRAM libre) o `stream` (por partes desde el disco, ~3 GB de VRAM). Misma calidad en ambos modos. Diagnóstico sin usar la GPU: `.venv\Scripts\python.exe preparar_modelos.py memoria`.
 - **Perfiles de VRAM:**
   | Perfil | Pipeline de forma | Octree máx. | Textura |
   | :--- | :--- | :--- | :--- |

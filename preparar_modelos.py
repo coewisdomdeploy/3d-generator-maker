@@ -8,6 +8,7 @@ Uso:
     python preparar_modelos.py status              Tabla con el estado de cada componente
     python preparar_modelos.py check <item>        Código de salida 0 si <item> está listo
     python preparar_modelos.py download <item>     Descarga <item> (reanudable)
+    python preparar_modelos.py memoria             Diagnóstico de RAM/VRAM y qué cabrá al generar
 
 Items: dit (geometría Hunyuan3D-2), paint (textura Hunyuan3D-Paint),
        sf3d (Stable Fast 3D), rasterizer (extensión CUDA custom_rasterizer; solo check)
@@ -142,6 +143,77 @@ def download_sf3d() -> int:
 
 DOWNLOADS = {"dit": download_dit, "paint": download_paint, "sf3d": download_sf3d}
 
+# Debe coincidir con MODEL_MEMORY_GB / RAM_SAFETY_MARGIN_GB de img2glb.py (aquí no se importa
+# img2glb para no cargar torch ni inicializar CUDA)
+SHAPE_VRAM_FULL_GB = 6.0
+SHAPE_VRAM_MIN_GB = 3.2
+NEEDS_RAM_GB = {"forma (carga directa a GPU)": 1.0, "SF3D": 4.5, "textura Hunyuan3D-Paint": 5.5}
+
+
+def _nvidia_vram() -> list[tuple[str, float, float]]:
+    """(nombre, total GB, libre GB) por GPU según nvidia-smi (no inicializa CUDA)."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=15
+        ).stdout
+    except Exception:
+        return []
+    gpus = []
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 3:
+            gpus.append((parts[0], int(parts[1]) / 1024, int(parts[2]) / 1024))
+    return gpus
+
+
+def print_memory() -> None:
+    """Diagnóstico de RAM/VRAM y qué cabrá al generar."""
+    import psutil
+    margin = float(os.environ.get("RAM_SAFETY_MARGIN_GB", "2"))
+    vm = psutil.virtual_memory()
+    sw = psutil.swap_memory()
+    gb = 1024 ** 3
+    print("  RAM")
+    print(f"    Total: {vm.total / gb:.1f} GB | En uso: {vm.percent:.0f}% | Disponible: {vm.available / gb:.1f} GB")
+    print(f"    Archivo de paginación: {sw.total / gb:.1f} GB (usado {sw.percent:.0f}%)")
+    if sw.total < 8 * gb:
+        print("    [AVISO] Paginación pequeña o desactivada: actívala como 'Tamaño administrado por el sistema'.")
+
+    procs = []
+    for p in psutil.process_iter(["name", "memory_info"]):
+        try:
+            procs.append((p.info["memory_info"].rss, p.info["name"] or "?", p.pid))
+        except Exception:
+            pass
+    procs.sort(reverse=True)
+    print("  Procesos que más RAM usan:")
+    for rss, name, pid in procs[:8]:
+        print(f"    {rss / gb:5.2f} GB  {name} (PID {pid})")
+    pythons = [(rss, pid) for rss, name, pid in procs if name.lower().startswith("python") and pid not in (os.getpid(), os.getppid())]
+    if pythons:
+        print(f"    [AVISO] Hay {len(pythons)} proceso(s) python abiertos: si no tienes la app abierta, ciérralos")
+        print("            (Administrador de tareas > Detalles > python.exe > Finalizar tarea).")
+
+    gpus = _nvidia_vram()
+    print("  VRAM (nvidia-smi)")
+    if not gpus:
+        print("    No se detectó GPU NVIDIA.")
+    for name, total, free in gpus:
+        print(f"    {name}: {free:.1f} GB libres de {total:.1f} GB")
+
+    print("  Qué cabe ahora mismo")
+    avail = vm.available / gb
+    for label, need in NEEDS_RAM_GB.items():
+        mark = "OK " if avail >= need + margin else "NO "
+        print(f"    [{mark}] {label}: necesita ~{need + margin:.1f} GB de RAM libre (incluye {margin:.0f} GB de margen)")
+    if gpus:
+        free = max(g[2] for g in gpus)
+        mode = "full (todo en GPU)" if free >= SHAPE_VRAM_FULL_GB else (
+            "stream (por partes)" if free >= SHAPE_VRAM_MIN_GB else "insuficiente")
+        print(f"    Modo de carga de la forma con {free:.1f} GB de VRAM libre: {mode}")
+
 
 def print_status() -> None:
     print(f"  Carpeta de modelos: {MODELS_ROOT}  ({_free_gb():.0f} GB libres)")
@@ -154,6 +226,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Comprueba y descarga los pesos de los modelos 3D")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
+    sub.add_parser("memoria")
     p_check = sub.add_parser("check")
     p_check.add_argument("item", choices=list(CHECKS))
     p_dl = sub.add_parser("download")
@@ -162,6 +235,9 @@ def main() -> int:
 
     if args.cmd == "status":
         print_status()
+        return 0
+    if args.cmd == "memoria":
+        print_memory()
         return 0
     if args.cmd == "check":
         return 0 if CHECKS[args.item]() else 1
