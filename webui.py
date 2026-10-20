@@ -71,6 +71,7 @@ from img2glb import (
     detect_vram_profile,
     DEFAULT_OUTPUT_DIR
 )
+from thumbnails import get_thumbnail, make_placeholder, warm_thumbnails
 from export_profiles import (
     ALL_FORMATS,
     MODEL_FORMATS,
@@ -1231,6 +1232,90 @@ def restore_pref(prefs: Optional[dict], key: str, allowed=None, kind=None):
     return value
 
 
+# ------------------------------------------------------------------------------
+# Panel lateral de modelos generados (botón flotante a la derecha)
+# ------------------------------------------------------------------------------
+
+THUMBS_DIR = OUTPUT_DIR / "_thumbs"
+PLACEHOLDER_THUMB = make_placeholder(THUMBS_DIR / "_placeholder.png")
+SWITCH_TO_GENERATE_TAB_JS = f"""
+(...args) => {{
+    const tab = [...document.querySelectorAll('.custom-tabs [role="tab"]')].find(b => b.textContent.trim() === "Generar");
+    if (tab && !tab.classList.contains("selected")) tab.click();
+    try {{ localStorage.setItem("studio3d_tab_{MODE}", "Generar"); }} catch (e) {{}}
+    return args;
+}}
+"""
+
+
+def format_age(timestamp: float) -> str:
+    """'hace 5 min', 'hace 3 h', 'hace 2 d' o la fecha si es más antiguo."""
+    seconds = max(0, time.time() - timestamp)
+    if seconds < 60:
+        return "ahora"
+    if seconds < 3600:
+        return f"hace {int(seconds // 60)} min"
+    if seconds < 86400:
+        return f"hace {int(seconds // 3600)} h"
+    if seconds < 7 * 86400:
+        return f"hace {int(seconds // 86400)} d"
+    return time.strftime("%d/%m/%Y", time.localtime(timestamp))
+
+
+def render_drawer_title(count: int) -> str:
+    sub = "Sin modelos todavía" if count == 0 else f"{count} modelo{'s' if count != 1 else ''} · clic para verlo"
+    return f'<div class="drawer-title">Modelos generados</div><div class="drawer-sub">{sub}</div>'
+
+
+def drawer_items(render_budget_s: float = 4.0) -> Tuple[list, list]:
+    """
+    (valores de la galería [(miniatura, pie)], claves de la biblioteca) del más nuevo al más viejo.
+    Las miniaturas que falten se renderizan hasta agotar el presupuesto de tiempo; el resto
+    muestra un marcador y se completa en segundo plano (warm_thumbnails).
+    """
+    items, keys = [], []
+    started = time.time()
+    for key in list_existing_models():
+        path = load_existing_model_preview(key)
+        if not path:
+            continue
+        thumb = get_thumbnail(path, THUMBS_DIR, render_missing=time.time() - started < render_budget_s)
+        name = Path(key.split("] ", 1)[-1]).stem
+        items.append((str(thumb or PLACEHOLDER_THUMB), f"{name} · {format_age(Path(path).stat().st_mtime)}"))
+        keys.append(key)
+    return items, keys
+
+
+def on_toggle_drawer(is_open: bool, prefs: Optional[dict]):
+    """Abre (recargando la lista) o cierra el panel lateral; recuerda el estado en el navegador."""
+    prefs = dict(prefs or {}, drawer_open=not is_open)
+    if is_open:
+        return False, gr.update(visible=False), gr.update(elem_classes=["drawer-toggle"]), gr.skip(), gr.skip(), gr.skip(), prefs
+    items, keys = drawer_items()
+    return (True, gr.update(visible=True), gr.update(elem_classes=["drawer-toggle", "is-open"]),
+            items, keys, render_drawer_title(len(keys)), prefs)
+
+
+def on_refresh_drawer():
+    items, keys = drawer_items()
+    return items, keys, render_drawer_title(len(keys))
+
+
+def on_drawer_pick(keys: list, settings: dict, evt: gr.SelectData):
+    """Carga el modelo elegido en el visor de Generar con sus descargas del perfil activo."""
+    global CURRENT_GENERATED_GLB
+    key = keys[evt.index] if keys and 0 <= evt.index < len(keys) else None
+    result = on_select_library_model(key, settings)
+    if result[1]:
+        # 'Guardar en el juego' (Kaboomi) usa el modelo activo del generador
+        CURRENT_GENERATED_GLB = Path(result[1])
+        status = render_progress_html(f"Viendo {Path(result[1]).name}", 100)
+    else:
+        status = render_progress_html("No se encontró el modelo seleccionado.", 0)
+    return (*result, status)
+
+
+
 # ==============================================================================
 # 5. Estilos CSS Profesionales, Sin Emojis y con Animaciones de Alta Fidelidad
 # ==============================================================================
@@ -1896,6 +1981,100 @@ footer { display: none !important; }
 .btn-accent { border-color: rgba(139, 92, 246, 0.45) !important; color: #fff !important; }
 .action-bar .btn-accent { flex: 0 0 auto !important; width: auto !important; }
 
+/* ==============================================================================
+   Botón flotante (borde derecho, a media altura) y panel de modelos generados
+   ============================================================================== */
+:root { --drawer-w: min(340px, 88vw); }
+.drawer-toggle {
+    position: fixed !important;
+    top: 50% !important;
+    right: 0 !important;
+    transform: translateY(-50%) !important;
+    z-index: 900 !important;
+    width: 34px !important;
+    min-width: 34px !important;
+    max-width: 34px !important;
+    height: auto !important;
+    min-height: 0 !important;
+    padding: 14px 0 !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    gap: 10px !important;
+    writing-mode: vertical-rl !important;
+    border: 1px solid var(--s-border-strong) !important;
+    border-right: none !important;
+    border-radius: 10px 0 0 10px !important;
+    background: var(--s-surface) !important;
+    color: var(--s-muted) !important;
+    font-size: 0.72rem !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.08em !important;
+    text-transform: uppercase !important;
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.35) !important;
+    transition: right 0.22s ease, color 0.15s ease, border-color 0.15s ease !important;
+}
+.drawer-toggle img {
+    writing-mode: horizontal-tb !important;
+    margin: 0 !important;
+    width: 15px !important;
+    height: 15px !important;
+    filter: invert(1) !important;
+    opacity: 0.8 !important;
+}
+.drawer-toggle:hover { color: #fff !important; border-color: var(--s-accent) !important; }
+.drawer-toggle.is-open {
+    right: var(--drawer-w) !important;
+    color: #fff !important;
+    border-color: rgba(139, 92, 246, 0.6) !important;
+}
+
+.models-drawer {
+    position: fixed !important;
+    top: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    width: var(--drawer-w) !important;
+    z-index: 890 !important;
+    margin: 0 !important;
+    padding: 12px !important;
+    gap: 10px !important;
+    background: var(--s-surface) !important;
+    border: none !important;
+    border-left: 1px solid var(--s-border-strong) !important;
+    border-radius: 0 !important;
+    box-shadow: -24px 0 64px rgba(0, 0, 0, 0.5) !important;
+    animation: s-slide-in 0.22s ease-out;
+}
+@keyframes s-slide-in { from { transform: translateX(100%); } }
+.models-drawer > * { flex: 0 0 auto !important; }
+.models-drawer .block,
+.models-drawer .row { background: transparent !important; border: none !important; box-shadow: none !important; }
+.drawer-head { align-items: center !important; flex-wrap: nowrap !important; gap: 6px !important; }
+.drawer-head > .block:first-child { flex: 1 1 auto !important; min-width: 0 !important; }
+.drawer-head .btn-icon { flex: 0 0 34px !important; width: 34px !important; height: 34px !important; min-height: 34px !important; }
+.drawer-title { font-size: 0.92rem; font-weight: 700; color: #fff; }
+.drawer-sub { margin-top: 2px; font-size: 0.74rem; color: var(--s-muted); }
+
+.drawer-gallery { padding: 0 !important; }
+.drawer-gallery .grid-wrap { padding: 0 !important; }
+.drawer-gallery .grid-container { gap: 8px !important; }
+.drawer-gallery .thumbnail-item {
+    border: 1px solid var(--s-border) !important;
+    border-radius: var(--s-radius-sm) !important;
+    background: radial-gradient(circle at 50% 40%, #1c1f29, #121419) !important;
+    box-shadow: none !important;
+    transition: border-color 0.15s ease, transform 0.15s ease !important;
+}
+.drawer-gallery .thumbnail-item:hover { border-color: rgba(139, 92, 246, 0.6) !important; transform: translateY(-1px); }
+.drawer-gallery .thumbnail-item.selected { border-color: var(--s-accent) !important; box-shadow: 0 0 0 1px var(--s-accent) !important; }
+.drawer-gallery .caption-label {
+    font-size: 0.68rem !important;
+    color: var(--s-text) !important;
+    background: rgba(10, 11, 15, 0.78) !important;
+    border-radius: 6px !important;
+}
+
 /* Pestaña Sistema */
 .sys-card {
     max-width: 760px !important;
@@ -2215,6 +2394,42 @@ with gr.Blocks(title=page_title) as demo:
                 btn_cancel_settings = gr.Button("Cancelar", scale=0, min_width=100, elem_classes=["btn-ghost"])
                 btn_save_settings = gr.Button("Guardar", scale=0, min_width=120, elem_classes=["btn-generate", "btn-save"])
 
+    # Botón flotante (borde derecho, a media altura) y panel lateral de modelos generados
+    drawer_open = gr.State(False)
+    drawer_keys = gr.State([])
+    btn_drawer = gr.Button(
+        "Modelos",
+        icon="assets/icons/layers.svg",
+        elem_classes=["drawer-toggle"]
+    )
+    with gr.Column(visible=False, elem_classes=["models-drawer"]) as models_drawer:
+        with gr.Row(elem_classes=["drawer-head"]):
+            drawer_title = gr.HTML(render_drawer_title(0), padding=False)
+            btn_drawer_refresh = gr.Button(
+                "",
+                icon="assets/icons/refresh.svg",
+                scale=0,
+                min_width=34,
+                elem_classes=["btn-ghost", "btn-icon"]
+            )
+            btn_drawer_close = gr.Button(
+                "",
+                icon="assets/icons/x.svg",
+                scale=0,
+                min_width=34,
+                elem_classes=["btn-ghost", "btn-icon"]
+            )
+        drawer_gallery = gr.Gallery(
+            show_label=False,
+            columns=2,
+            height="calc(100vh - 84px)",
+            allow_preview=False,
+            object_fit="contain",
+            buttons=[],
+            interactive=False,
+            elem_classes=["drawer-gallery"]
+        )
+
     _initial_preview = get_initial_preview_model()
     _has_real_model = bool(_initial_preview and not _initial_preview.endswith("placeholder.glb") and not _initial_preview.endswith("empty.glb"))
 
@@ -2453,6 +2668,12 @@ with gr.Blocks(title=page_title) as demo:
         inputs=[gen_export_state, export_settings],
         outputs=[btn_generate, active_model_path, mesh_stats_display, viewer_shading_mode,
                  gen_export_state, status_widget, *gen_dl_buttons, gen_slicer_btn]
+    ).then(
+        # El modelo nuevo aparece en el panel lateral si está abierto
+        fn=lambda is_open: on_refresh_drawer() if is_open else (gr.skip(), gr.skip(), gr.skip()),
+        inputs=[drawer_open],
+        outputs=[drawer_gallery, drawer_keys, drawer_title],
+        show_progress="hidden"
     )
 
     # 3. Controles del visor (sombreado, fondo, cámara)
@@ -2591,19 +2812,49 @@ with gr.Blocks(title=page_title) as demo:
             if key == "lib_model":
                 allowed = [m for m in list_existing_models() if not m.startswith("(")]
             values.append(restore_pref(prefs, key, allowed, kind))
+        if isinstance(prefs, dict) and prefs.get("drawer_open") is True:
+            items, keys = drawer_items()
+            drawer = (True, gr.update(visible=True), gr.update(elem_classes=["drawer-toggle", "is-open"]),
+                      items, keys, render_drawer_title(len(keys)))
+        else:
+            drawer = (gr.skip(),) * 6
         return (
             *values,
             gr.update(value=profile_label(settings)),
             *download_updates({}, settings), slicer_button_update({}, settings),
             *download_updates({}, settings), slicer_button_update({}, settings),
+            *drawer,
         )
 
     demo.load(
         fn=restore_session,
         inputs=[ui_prefs, export_settings],
         outputs=[*[c for c, _, _ in persisted_controls.values()], btn_settings,
-                 *gen_dl_buttons, gen_slicer_btn, *lib_dl_buttons, lib_slicer_btn],
+                 *gen_dl_buttons, gen_slicer_btn, *lib_dl_buttons, lib_slicer_btn,
+                 drawer_open, models_drawer, btn_drawer, drawer_gallery, drawer_keys, drawer_title],
         show_progress="hidden"
+    )
+
+    # 8. Panel lateral de modelos generados
+    for _btn, _forced_open in ((btn_drawer, None), (btn_drawer_close, True)):
+        _btn.click(
+            fn=(lambda is_open, prefs, forced=_forced_open:
+                on_toggle_drawer(is_open if forced is None else forced, prefs)),
+            inputs=[drawer_open, ui_prefs],
+            outputs=[drawer_open, models_drawer, btn_drawer, drawer_gallery, drawer_keys, drawer_title, ui_prefs],
+            show_progress="hidden"
+        )
+    btn_drawer_refresh.click(
+        fn=on_refresh_drawer,
+        inputs=[],
+        outputs=[drawer_gallery, drawer_keys, drawer_title]
+    )
+    drawer_gallery.select(
+        fn=on_drawer_pick,
+        inputs=[drawer_keys, export_settings],
+        outputs=[viewer_3d, active_model_path, mesh_stats_display, viewer_shading_mode,
+                 gen_export_state, *gen_dl_buttons, gen_slicer_btn, status_widget],
+        js=SWITCH_TO_GENERATE_TAB_JS
     )
 
 
@@ -2612,6 +2863,8 @@ with gr.Blocks(title=page_title) as demo:
 # ==============================================================================
 
 if __name__ == "__main__":
+    # Miniaturas del panel lateral: se generan en segundo plano las que falten
+    warm_thumbnails([p for p in map(load_existing_model_preview, list_existing_models()) if p], THUMBS_DIR)
     print("\n" + "="*70)
     if MODE == "kambo":
         print(" KABOOMI 3D STUDIO (GRADIO WEBUI)")
