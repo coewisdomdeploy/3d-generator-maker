@@ -120,7 +120,9 @@ SHAPE_LOAD_MODE = os.environ.get("SHAPE_LOAD_MODE", "auto").strip().lower()
 # apenas se usa; "ram_staged" es lo que ocupa si se guarda entero en RAM.
 MODEL_MEMORY_GB = {
     "shape": {"ram_load": 1.0, "ram_staged": 5.0, "vram": 3.2, "vram_full": 6.0},
-    "paint": {"ram_load": 5.5, "vram": 4.8},   # Delight + Multivista (fp32 en disco, se cargan a fp16)
+    # Paint: delight (~2.1 GB) y multivista (~4.3 GB) se cargan directo a la GPU de uno en uno;
+    # el multivista baja hasta ~3.2 GB transmitiendo sus bloques (ver PAINT_MV_TIERS)
+    "paint": {"ram_load": 3.0, "vram": 3.5, "vram_full": 9.0},
     "sf3d":  {"ram_load": 4.5, "vram": 6.0},   # model.safetensors 3.8 GB (fp32)
 }
 
@@ -1508,25 +1510,313 @@ except ImportError:
 
 _PAINT_UNAVAILABLE_REASON: Optional[str] = None
 _PAINT_CHECKED = False
+PAINT_RASTERIZER = "ninguno"
 
 
 def hunyuan_paint_available() -> bool:
     """
-    Comprueba una sola vez si Hunyuan3D-Paint puede ejecutarse. Necesita la extensión CUDA
-    compilada `custom_rasterizer` (y `mesh_processor`) del repositorio de Hunyuan3D-2.
+    Comprueba una sola vez si Hunyuan3D-Paint puede ejecutarse. Si la extensión CUDA compilada
+    `custom_rasterizer` no está instalada, se usa el rasterizador PyTorch equivalente
+    (torch_rasterizer.py): no hace falta Visual Studio ni CUDA Toolkit.
     """
-    global _PAINT_UNAVAILABLE_REASON, _PAINT_CHECKED
+    global _PAINT_UNAVAILABLE_REASON, _PAINT_CHECKED, PAINT_RASTERIZER
     if not _PAINT_CHECKED:
         _PAINT_CHECKED = True
         try:
             import custom_rasterizer  # noqa: F401
+            PAINT_RASTERIZER = "custom_rasterizer (CUDA compilado)"
+        except Exception:
+            import torch_rasterizer
+            sys.modules["custom_rasterizer"] = torch_rasterizer
+            PAINT_RASTERIZER = "PyTorch en GPU (torch_rasterizer.py, sin compilar)"
+        try:
             from hy3dgen.texgen import Hunyuan3DPaintPipeline  # noqa: F401
         except Exception as e:
-            _PAINT_UNAVAILABLE_REASON = (
-                f"{e}. Compila la extensión: cd hy3dgen/texgen/custom_rasterizer && python setup.py install "
-                "(requiere CUDA Toolkit y Visual Studio Build Tools)"
-            )
+            _PAINT_UNAVAILABLE_REASON = f"no se pudo importar hy3dgen.texgen ({e})"
+        print(f" -> [Hunyuan3D-Paint] Rasterizador: {PAINT_RASTERIZER}")
     return _PAINT_UNAVAILABLE_REASON is None
+
+
+# Dispositivo destino del UNet multivista durante su carga (lo fija _paint_lowmem_loading)
+_PAINT_UNET_TARGET = "cuda"
+
+
+def _lowmem_unet2p5d_from_pretrained(unet_cls):
+    """
+    Sustituye UNet2p5DConditionModel.from_pretrained (el modules.py que trae el modelo) por una
+    carga sin pico de RAM. El original crea el UNet en fp32 (~7 GB), lee el .bin entero (3.5 GB)
+    y luego convierte a fp16. Aquí se crea sin memoria (meta) y el .bin se lee con mmap:
+      - destino "cuda": cada tensor va directo a la GPU.
+      - destino "cpu" : los tensores siguen respaldados por el archivo (caché de disco de Windows,
+                        no RAM reservada); se usa para transmitir los bloques a la GPU.
+    Mismo código de modelo y mismos pesos: resultado idéntico.
+    """
+    import json
+    original = unet_cls.from_pretrained
+    module = sys.modules[unet_cls.__module__]
+
+    def from_pretrained(pretrained_model_name_or_path, **kwargs):
+        torch_dtype = kwargs.pop("torch_dtype", torch.float32)
+        target = _PAINT_UNET_TARGET if torch.cuda.is_available() else "cpu"
+        try:
+            with open(os.path.join(pretrained_model_name_or_path, "config.json"), "r", encoding="utf-8") as fh:
+                config = json.load(fh)
+            with torch.device("meta"):
+                unet = unet_cls(module.UNet2DConditionModel(**config))
+            ckpt = torch.load(
+                os.path.join(pretrained_model_name_or_path, "diffusion_pytorch_model.bin"),
+                map_location="cpu", weights_only=True, mmap=True
+            )
+            state = {k: (v.to(target, torch_dtype) if v.is_floating_point() else v.to(target)) for k, v in ckpt.items()}
+            del ckpt
+            unet.load_state_dict(state, strict=True, assign=True)
+            del state
+            if any(t.is_meta for t in list(unet.parameters()) + list(unet.buffers())):
+                raise RuntimeError("quedaron pesos sin cargar")
+            print(f" -> [Carga] UNet multivista -> {target} sin pasar por la RAM")
+            return unet
+        except Exception as e:
+            print(f" -> [Carga] Carga directa del UNet no disponible ({e}); se usa la carga original.")
+            flush_vram()
+            return original(pretrained_model_name_or_path, torch_dtype=torch_dtype, **kwargs)
+
+    return staticmethod(from_pretrained)
+
+
+class _paint_lowmem_loading:
+    """Contexto: mientras diffusers monta el pipeline multivista, su UNet se carga con poca RAM."""
+
+    def __init__(self, unet_target: str = "cuda"):
+        self.unet_target = unet_target
+
+    def __enter__(self):
+        global _PAINT_UNET_TARGET
+        import diffusers.pipelines.pipeline_loading_utils as plu
+        self._plu = plu
+        self._orig = plu.get_class_obj_and_candidates
+        self._prev_target = _PAINT_UNET_TARGET
+        _PAINT_UNET_TARGET = self.unet_target
+
+        def patched(*args, **kwargs):
+            class_obj, candidates = self._orig(*args, **kwargs)
+            if getattr(class_obj, "__name__", "") == "UNet2p5DConditionModel" and not getattr(class_obj, "_studio_lowmem", False):
+                class_obj.from_pretrained = _lowmem_unet2p5d_from_pretrained(class_obj)
+                class_obj._studio_lowmem = True
+            return class_obj, candidates
+
+        plu.get_class_obj_and_candidates = patched
+        return self
+
+    def __exit__(self, *exc):
+        global _PAINT_UNET_TARGET
+        self._plu.get_class_obj_and_candidates = self._orig
+        _PAINT_UNET_TARGET = self._prev_target
+        return False
+
+
+# ------------------------------------------------------------------------------
+# Ubicación del modelo multivista según la VRAM libre (de más rápido a menos VRAM).
+# Si una se queda sin VRAM durante la inferencia, se reintenta con la siguiente.
+# El UNet multivista tiene dos copias: "unet" (1.8 GB, 30 pasos) y "unet_dual" (1.6 GB, usada
+# UNA vez por generación para la imagen de referencia). Bloque más grande: 0.56 GB.
+#   gpu     : todo en la GPU (~4.2 GB de pesos).
+#   lean    : "unet" fijo en GPU; "unet_dual" se transmite por bloques (solo se usa una vez) y
+#             el text encoder (0.65 GB) sube solo al codificar el prompt. Prácticamente igual
+#             de rápido que "gpu" con ~2.3 GB menos de VRAM.
+#   bloques : también "unet" se transmite por bloques en cada uno de los 30 pasos: solo el
+#             bloque en curso (<= 0.56 GB) está en la GPU. Cabe en GPUs de 6 GB con holgura;
+#             añade unos segundos por generación. Misma calidad en los tres.
+# Los pesos transmitidos se leen del archivo (mmap): Windows los mantiene en su caché de disco
+# si sobra RAM, sin reservarla.
+# ------------------------------------------------------------------------------
+PAINT_MV_VRAM_GB = {"gpu": 7.0, "lean": 5.2, "bloques": 3.2}
+PAINT_MV_TIERS = ("gpu", "lean", "bloques")
+
+
+def _on_demand_gpu(module: torch.nn.Module, device: str) -> None:
+    """El módulo vive en CPU y sube a la GPU solo mientras se ejecuta su forward."""
+    module.to("cpu")
+
+    def pre(mod, args):
+        mod.to(device)
+
+    def post(mod, args, output):
+        mod.to("cpu")
+        return output
+
+    module.register_forward_pre_hook(pre)
+    module.register_forward_hook(post)
+
+
+def _stream_unet_blocks(unet2p5d: torch.nn.Module, device: str, stream=("unet", "unet_dual")) -> int:
+    """
+    Los bloques grandes del UNet conservan sus pesos en CPU (respaldados por el archivo) y se
+    copian a la GPU al entrar en su forward; al salir se suelta la copia. Todo lo demás
+    (embeddings, conv_in/out, parámetros directos como learned_text_clip_*) queda fijo en GPU,
+    porque el código del modelo los lee fuera de cualquier forward.
+    Las copias que no están en `stream` quedan enteras y fijas en la GPU.
+    Devuelve el número de bloques transmitidos.
+    """
+    streamed = 0
+    for inner_name in ("unet", "unet_dual"):
+        inner = getattr(unet2p5d, inner_name, None)
+        if inner is None:
+            continue
+        if inner_name not in stream:
+            inner.to(device)
+            continue
+        blocks = [*inner.down_blocks, inner.mid_block, *inner.up_blocks]
+
+        # Lo pequeño, a la GPU de forma fija
+        for name, child in inner.named_children():
+            if name not in ("down_blocks", "up_blocks", "mid_block"):
+                child.to(device)
+        for name, p in inner._parameters.items():
+            if p is not None:
+                p.data = p.data.to(device)
+        for name, b in list(inner._buffers.items()):
+            if b is not None:
+                inner._buffers[name] = b.to(device)
+
+        for block in blocks:
+            if block is None:
+                continue
+            slots = []
+            for m in block.modules():
+                for n, p in m._parameters.items():
+                    if p is not None:
+                        slots.append((m, n, True, p.data))
+                for n, b in m._buffers.items():
+                    if b is not None:
+                        slots.append((m, n, False, b))
+
+            def pre(mod, args, _slots=slots):
+                with torch.inference_mode(False), torch.no_grad():
+                    for m, n, is_param, cpu in _slots:
+                        gpu = cpu.to(device, non_blocking=True)
+                        if is_param:
+                            m._parameters[n].data = gpu
+                        else:
+                            m._buffers[n] = gpu
+
+            def post(mod, args, output, _slots=slots):
+                for m, n, is_param, cpu in _slots:
+                    if is_param:
+                        m._parameters[n].data = cpu
+                    else:
+                        m._buffers[n] = cpu
+                return output
+
+            block.register_forward_pre_hook(pre)
+            block.register_forward_hook(post)
+            streamed += 1
+
+    # Otros hijos del envoltorio (si los hay) también fijos en GPU
+    for name, child in unet2p5d.named_children():
+        if name not in ("unet", "unet_dual"):
+            child.to(device)
+    return streamed
+
+
+def _build_multiview_net(config, tier: str):
+    """Monta Multiview_Diffusion_Net (mismo comportamiento que su __init__) con la ubicación `tier`."""
+    import hy3dgen.texgen.utils.multiview_utils as mvu
+    from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler
+
+    device = config.device
+    net = mvu.Multiview_Diffusion_Net.__new__(mvu.Multiview_Diffusion_Net)
+    net.device = device
+    net.view_size = 512
+    custom_pipeline_path = os.path.join(os.path.dirname(os.path.abspath(mvu.__file__)), "..", "hunyuanpaint")
+
+    # gpu: directo a la GPU. lean/bloques: respaldados por el archivo; luego se reparten
+    unet_target = device if tier == "gpu" else "cpu"
+    with _paint_lowmem_loading(unet_target):
+        pipe = DiffusionPipeline.from_pretrained(
+            config.multiview_ckpt_path, custom_pipeline=custom_pipeline_path, torch_dtype=torch.float16
+        )
+    pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
+    pipe.set_progress_bar_config(disable=True)
+
+    # El VAE siempre en GPU: pipeline.device (y el generador de ruido) se toman de él
+    pipe.vae.to(device)
+    if tier == "gpu" or "cuda" not in device:
+        pipe.to(device)
+    else:
+        _on_demand_gpu(pipe.text_encoder, device)
+        stream = ("unet", "unet_dual") if tier == "bloques" else ("unet_dual",)
+        n = _stream_unet_blocks(pipe.unet, device, stream=stream)
+        print(f" -> [Carga] UNet multivista: {n} bloques ({', '.join(stream)}) se transmiten a la GPU al usarse")
+    net.pipeline = pipe
+    return net
+
+
+class _LazyPaintModel:
+    """
+    Submodelo de Hunyuan3D-Paint (delight o multivista) que se carga directo a la GPU solo
+    cuando el pipeline lo llama, en la ubicación que quepa en la VRAM libre. Si se queda sin
+    VRAM, se reintenta con la siguiente ubicación. Con keep=False (modo "stream") se libera
+    al terminar, así delight y multivista nunca coinciden en la VRAM.
+    """
+
+    def __init__(self, name: str, factory: Callable[[str], Any], device: str, tiers: tuple, vram_gb: dict):
+        self.name = name
+        self.factory = factory
+        self.device = device
+        self.tiers = tiers
+        self.vram_gb = vram_gb
+        self.keep = False
+        self.instance = None
+        self.tier = None
+
+    @property
+    def pipeline(self):
+        return getattr(self.instance, "pipeline", None)
+
+    def _pick_tiers(self) -> list:
+        free = _vram_free_gb() if "cuda" in self.device else float("inf")
+        fitting = [t for t in self.tiers if free >= self.vram_gb.get(t, 0.0)]
+        start = self.tiers.index(fitting[0]) if fitting else len(self.tiers) - 1
+        return list(self.tiers[start:])
+
+    def _load(self, tier: str) -> None:
+        t0 = time.time()
+        flush_vram()
+        self.instance = self.factory(tier)
+        self.tier = tier
+        for opt in ("enable_vae_slicing", "enable_vae_tiling"):
+            if hasattr(self.pipeline, opt):
+                try:
+                    getattr(self.pipeline, opt)()
+                except Exception:
+                    pass
+        print(f" -> [Carga] Paint '{self.name}' (ubicación '{tier}') en {time.time() - t0:.1f}s")
+        print_real_vram_status(f"Paint '{self.name}' cargado")
+
+    def _drop(self) -> None:
+        self.instance = None
+        self.tier = None
+        flush_vram()
+
+    def __call__(self, *args, **kwargs):
+        if self.instance is not None and self.tier in ("gpu",) and self.pipeline is not None:
+            self.pipeline.to(self.device)  # Venía aparcado en RAM
+        tiers = [self.tier] if self.instance is not None else self._pick_tiers()
+        try:
+            for i, tier in enumerate(tiers):
+                if self.instance is None:
+                    self._load(tier)
+                try:
+                    return self.instance(*args, **kwargs)
+                except torch.cuda.OutOfMemoryError:
+                    self._drop()
+                    if i + 1 >= len(tiers):
+                        raise
+                    print(f" -> [Memoria] Paint '{self.name}' sin VRAM en '{tier}': reintentando con '{tiers[i + 1]}'...")
+        finally:
+            if not self.keep and self.instance is not None:
+                self._drop()
+                print_real_vram_status(f"Paint '{self.name}' liberado")
 
 
 class Hunyuan3DGenerator:
@@ -1902,10 +2192,18 @@ class Hunyuan3DGenerator:
             print_real_vram_status("Post-Etapa 1 (forma aparcada)")
 
     def _get_paint_pipeline(self):
-        """Devuelve Hunyuan3D-Paint (reutilizando la copia aparcada en RAM) con la forma ya fuera de la VRAM."""
-        paint_pipeline = activate_model("paint", strict_vram=True)
+        """
+        Prepara Hunyuan3D-Paint con la forma ya fuera de la VRAM. Los submodelos (delight y
+        multivista) se cargan directo a la GPU solo cuando se usan:
+          stream: uno a la vez; cada uno se libera al terminar. El multivista elige su
+                  ubicación (gpu / lean / bloques) según la VRAM libre: cabe en 6 GB.
+          full  : se quedan cargados durante la pintura (si sobra VRAM, ~9 GB).
+        """
+        mem = MODEL_MEMORY_GB["paint"]
+        paint_pipeline = activate_model("paint", vram_needed_gb=mem["vram"], strict_vram=True)
         if paint_pipeline is None:
             from hy3dgen.texgen import Hunyuan3DPaintPipeline
+            from hy3dgen.texgen.utils.dehighlight_utils import Light_Shadow_Remover
 
             local_model_dir = HUNYUAN_LOCAL_DIR
             if (local_model_dir / "hunyuan3d-delight-v2-0").exists() and (local_model_dir / self.paint_subfolder).exists():
@@ -1913,43 +2211,47 @@ class Hunyuan3DGenerator:
             else:
                 paint_source = self.model_id
 
-            print(f" -> Cargando Hunyuan3DPaintPipeline ({paint_source}) en float16...")
-            t_load = time.time()
-            paint_pipeline = Hunyuan3DPaintPipeline.from_pretrained(paint_source)
+            # from_pretrained resuelve/descarga las rutas; se evita que cargue los dos submodelos
+            # a la vez (load_models) y se sustituyen por cargas perezosas
+            original_load_models = Hunyuan3DPaintPipeline.load_models
+            Hunyuan3DPaintPipeline.load_models = lambda pipe_self: None
+            try:
+                paint_pipeline = Hunyuan3DPaintPipeline.from_pretrained(paint_source)
+            finally:
+                Hunyuan3DPaintPipeline.load_models = original_load_models
 
-            # Offload de diffusers: delight y multivista suben a la GPU solo mientras se ejecutan
-            if "cuda" in str(self.device) and hasattr(paint_pipeline, "enable_model_cpu_offload"):
-                try:
-                    paint_pipeline.enable_model_cpu_offload()
-                    print(" -> [Paint Low-VRAM] Model CPU Offload activado en Hunyuan3D-Paint.")
-                except Exception as e_off:
-                    print(f" -> [Paint Low-VRAM] Offload no disponible ({e_off}); se usa la GPU directamente.")
+            config = paint_pipeline.config
+            config.device = "cuda" if "cuda" in str(self.device) else "cpu"
 
-            # VAE Slicing y VAE Tiling en los componentes internos de difusión
-            for sub in getattr(paint_pipeline, "models", {}).values():
-                sub_p = getattr(sub, "pipeline", None)
-                for opt in ("enable_vae_slicing", "enable_vae_tiling"):
-                    if sub_p is not None and hasattr(sub_p, opt):
-                        try:
-                            getattr(sub_p, opt)()
-                        except Exception:
-                            pass
-
+            paint_pipeline.models = {
+                "delight_model": _LazyPaintModel(
+                    "delight", lambda tier: Light_Shadow_Remover(config), config.device,
+                    tiers=("gpu",), vram_gb={"gpu": 3.2}
+                ),
+                "multiview_model": _LazyPaintModel(
+                    "multiview", lambda tier: _build_multiview_net(config, tier), config.device,
+                    tiers=PAINT_MV_TIERS, vram_gb=PAINT_MV_VRAM_GB
+                ),
+            }
             register_model("paint", paint_pipeline)
-            print(f" -> Hunyuan3D-Paint cargado desde disco en {time.time() - t_load:.1f}s (se conservará en RAM).")
+            print(f" -> Hunyuan3D-Paint preparado ({paint_source}); los submodelos se cargan al usarse.")
         else:
-            print(" -> Hunyuan3D-Paint reutilizado desde RAM (sin leer el disco).")
+            print(" -> Hunyuan3D-Paint reutilizado.")
+
+        mode = "full" if _vram_free_gb() >= mem["vram_full"] else "stream"
+        for sub in paint_pipeline.models.values():
+            sub.keep = mode == "full"
+        print(f" -> [Carga] Modo de carga de la pintura: '{mode}'")
 
         from hy3dgen.texgen.differentiable_renderer.mesh_render import MeshRender
 
         # Resolución de render/textura según el perfil de VRAM
         res = self.paint_resolution
-        if hasattr(paint_pipeline, "config"):
-            paint_pipeline.config.render_size = res
-            paint_pipeline.config.texture_size = res
-            paint_pipeline.config.candidate_camera_azims = [0, 90, 180, 270, 0, 180]
-            paint_pipeline.config.candidate_camera_elevs = [0, 0, 0, 0, 90, -90]
-            paint_pipeline.config.candidate_view_weights = [1.0, 0.1, 0.5, 0.1, 0.05, 0.05]
+        paint_pipeline.config.render_size = res
+        paint_pipeline.config.texture_size = res
+        paint_pipeline.config.candidate_camera_azims = [0, 90, 180, 270, 0, 180]
+        paint_pipeline.config.candidate_camera_elevs = [0, 0, 0, 0, 90, -90]
+        paint_pipeline.config.candidate_view_weights = [1.0, 0.1, 0.5, 0.1, 0.05, 0.05]
         paint_pipeline.render = MeshRender(
             default_resolution=res,
             texture_size=res,
@@ -1965,7 +2267,8 @@ class Hunyuan3DGenerator:
         """
         Etapa 2 - Texturizado Nativo Multivista (Hunyuan3D-Paint):
         1. Saca de la VRAM el pipeline de forma y SF3D (nunca coexisten con Paint).
-        2. Reutiliza Paint desde RAM o lo carga una vez, con offload de diffusers y VAE slicing/tiling.
+        2. Carga delight y multivista directo a la GPU, de uno en uno, con VAE slicing/tiling.
+           Sin la extensión custom_rasterizer usa el rasterizador PyTorch (torch_rasterizer.py).
         3. Render/textura a la resolución del perfil de VRAM (1024 en 6-12 GB, 2048 en 16 GB+).
         4. Si Paint no está disponible o se queda sin VRAM, recurre al horneado UV de contingencia.
         5. Aparca Paint en RAM al terminar y aplica acabado PBR mate.

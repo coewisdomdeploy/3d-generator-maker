@@ -49,7 +49,8 @@ ITEMS = {
     "dit": "Geometría Hunyuan3D-2 Turbo (DiT, ~4.9 GB)",
     "paint": "Textura Hunyuan3D-Paint (delight + multivista, ~9 GB)",
     "sf3d": "Stable Fast 3D (~3.8 GB, requiere licencia en Hugging Face)",
-    "rasterizer": "Extensión CUDA custom_rasterizer (necesaria para la textura Hunyuan)",
+    "rasterizer": "Extensión CUDA custom_rasterizer (OPCIONAL: sin ella se usa el rasterizador PyTorch)",
+    "meshproc": "mesh_processor nativo C++ (OPCIONAL: acelera el horneado; sin él se usa la versión Python)",
 }
 
 
@@ -87,7 +88,44 @@ def rasterizer_ready() -> bool:
     return importlib.util.find_spec("custom_rasterizer") is not None
 
 
-CHECKS = {"dit": dit_ready, "paint": paint_ready, "sf3d": sf3d_ready, "rasterizer": rasterizer_ready}
+def meshproc_ready() -> bool:
+    """
+    mesh_processor compilado (.pyd) junto a hy3dgen, y además da el MISMO resultado que la
+    versión Python en una malla diminuta (un .pyd incompatible nunca se da por bueno).
+    Se carga el archivo directamente: no importa torch ni hy3dgen.texgen.
+    """
+    spec = importlib.util.find_spec("hy3dgen")
+    if spec is None or not spec.submodule_search_locations:
+        return False
+    folder = Path(list(spec.submodule_search_locations)[0]) / "texgen" / "differentiable_renderer"
+    natives = sorted(folder.glob("mesh_processor*.pyd")) + sorted(folder.glob("mesh_processor*.so"))
+    if not natives:
+        return False
+    try:
+        import numpy as np
+        from importlib.machinery import ExtensionFileLoader
+        loader = ExtensionFileLoader("mesh_processor", str(natives[0]))
+        native = importlib.util.module_from_spec(importlib.util.spec_from_loader("mesh_processor", loader))
+        loader.exec_module(native)
+        py_spec = importlib.util.spec_from_file_location("_mesh_processor_py", folder / "mesh_processor.py")
+        python_impl = importlib.util.module_from_spec(py_spec)
+        py_spec.loader.exec_module(python_impl)
+
+        tex = np.zeros((8, 8, 3), np.float32)
+        mask = np.zeros((8, 8), np.uint8)
+        tex[5, 2] = (1.0, 0.5, 0.25)
+        mask[5, 2] = 255
+        pos = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], np.float32)
+        uv = np.array([[2 / 7, 1 - 5 / 7], [0.9, 0.9], [0.5, 0.1], [0.1, 0.6]], np.float32)
+        idx = np.array([[0, 1, 2], [1, 3, 2]], np.int32)
+        a_tex, a_mask = native.meshVerticeInpaint(tex.copy(), mask.copy(), pos, uv, idx, idx)
+        b_tex, b_mask = python_impl.meshVerticeInpaint(tex.copy(), mask.copy(), pos, uv, idx, idx)
+        return bool(np.allclose(a_tex, b_tex, atol=1e-4) and np.array_equal(a_mask, b_mask))
+    except Exception:
+        return False
+
+
+CHECKS = {"dit": dit_ready, "paint": paint_ready, "sf3d": sf3d_ready, "rasterizer": rasterizer_ready, "meshproc": meshproc_ready}
 
 
 def _free_gb() -> float:
@@ -147,7 +185,8 @@ DOWNLOADS = {"dit": download_dit, "paint": download_paint, "sf3d": download_sf3d
 # img2glb para no cargar torch ni inicializar CUDA)
 SHAPE_VRAM_FULL_GB = 6.0
 SHAPE_VRAM_MIN_GB = 3.2
-NEEDS_RAM_GB = {"forma (carga directa a GPU)": 1.0, "SF3D": 4.5, "textura Hunyuan3D-Paint": 5.5}
+NEEDS_RAM_GB = {"forma (carga directa a GPU)": 1.0, "SF3D": 4.5, "textura Hunyuan3D-Paint (carga directa a GPU)": 3.0}
+PAINT_MV_VRAM_GB = {"gpu": 7.0, "lean": 5.2, "bloques": 3.2}   # = PAINT_MV_VRAM_GB de img2glb.py
 
 
 def _nvidia_vram() -> list[tuple[str, float, float]]:
@@ -213,6 +252,10 @@ def print_memory() -> None:
         mode = "full (todo en GPU)" if free >= SHAPE_VRAM_FULL_GB else (
             "stream (por partes)" if free >= SHAPE_VRAM_MIN_GB else "insuficiente")
         print(f"    Modo de carga de la forma con {free:.1f} GB de VRAM libre: {mode}")
+        tier = next((t for t, need in PAINT_MV_VRAM_GB.items() if free >= need), None)
+        paint = {"gpu": "gpu (todo en GPU, el más rápido)", "lean": "lean (unet fijo, unet_dual y text encoder al usarse)",
+                 "bloques": "bloques (UNet transmitido por bloques; unos segundos más)"}.get(tier, "no cabe: textura de contingencia")
+        print(f"    Textura Hunyuan3D-Paint (multivista) con {free:.1f} GB de VRAM libre: {paint}")
 
 
 def print_status() -> None:

@@ -771,18 +771,20 @@ exit /b 0
 :: ==============================================================================
 :step_paint
 echo.
-echo [7/9] Verificando textura Hunyuan3D-Paint (extension custom_rasterizer)...
+echo [7/9] Textura Hunyuan3D-Paint: aceleradores nativos opcionales...
 if "!ENGINE_CHOICE!"=="2" goto :paint_skip
 if "!GPU_OPT!"=="2" goto :paint_skip
 "!VENV_PY!" "%~dp0preparar_modelos.py" check rasterizer
 if !errorlevel! equ 0 (
-    echo !GREEN![OK]!RESET! custom_rasterizer instalado: textura Hunyuan3D-Paint disponible.
+    echo !GREEN![OK]!RESET! custom_rasterizer instalado: rasterizado de la textura acelerado.
     goto :step_gpu_check
 )
-echo La textura de Hunyuan3D necesita compilar una extension CUDA. Requiere:
+echo La textura Hunyuan3D-Paint YA FUNCIONA sin instalar nada (rasterizador PyTorch en GPU).
+echo Opcionalmente se compilan las versiones nativas, mas rapidas (mesh_processor C++ y
+echo custom_rasterizer CUDA). Requieren:
 echo   - Visual Studio 2022 Build Tools con C++  [~7 GB en C:]
 echo   - CUDA Toolkit 12.4  [~4 GB en C:, NO cambia el driver de video]
-echo Sin ella todo funciona igual: la textura Hunyuan usa el horneado de contingencia.
+echo No es necesaria: el resultado es el mismo.
 set "PAINT_ANSWER=N"
 set /p "PAINT_ANSWER=Instalar ahora? Tambien puedes hacerlo luego con instalar_textura_hunyuan.bat [S/N] (Enter = N): "
 if /i not "!PAINT_ANSWER:~0,1!"=="S" goto :paint_later

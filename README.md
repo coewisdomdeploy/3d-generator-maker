@@ -175,5 +175,18 @@ webui-kambo.bat
   | 12 GB | Completo en GPU | 320 | 1024 |
   | 16 GB+ | Completo en GPU | 384 | 2048 |
 - **Calidad y caras:** "Máxima Calidad HD" conserva la malla completa **sin textura**. Con textura, cualquier preset se limita a 40.000 caras (el mismo tope que usa Hunyuan3D-2 antes de pintar).
-- **Textura Hunyuan3D-Paint no disponible:** necesita la extensión CUDA `custom_rasterizer` compilada. Instala CUDA Toolkit 12.4 y Visual Studio 2022 Build Tools (C++), abre una consola nueva y ejecuta `instalar_textura_hunyuan.bat`. Sin ella se usa automáticamente el horneado UV de contingencia y la consola indica el motivo.
+- **Textura Hunyuan3D-Paint en GPUs de 6 GB, sin compilar nada:**
+  - `custom_rasterizer` se sustituye por `torch_rasterizer.py` (PyTorch en GPU, reproduce el kernel original: mismo z-buffer y baricéntricas con corrección de perspectiva).
+  - Delight y multivista se cargan directo a la GPU de uno en uno (RAM de pico ~3 GB).
+  - El multivista elige su ubicación según la VRAM libre y, si se queda sin VRAM, reintenta con la siguiente:
+
+    | Ubicación | Qué hay en la GPU durante los 30 pasos | VRAM aprox. |
+    | :--- | :--- | :--- |
+    | `gpu` | UNet (2 copias), text encoder y VAE | ~7 GB |
+    | `lean` | UNet principal; la copia de referencia (`unet_dual`, se usa 1 vez) y el text encoder suben solo al usarse | ~5 GB |
+    | `bloques` | solo el bloque del UNet en curso (≤ 0.56 GB), leído del archivo con mmap | ~3 GB |
+
+    Misma calidad en las tres. Los pesos transmitidos se apoyan en la caché de disco de Windows, sin reservar RAM.
+  - Aceleradores nativos opcionales (`instalar_textura_hunyuan.bat`): `mesh_processor` en C++ (solo Visual Studio Build Tools) y `custom_rasterizer` en CUDA (además CUDA Toolkit 12.4).
+  - Recomendado en Windows: Panel de control de NVIDIA → Administrar configuración 3D → *Política de respaldo de memoria del sistema CUDA* = **Preferir sin respaldo**. Así, si falta VRAM, la app cambia de ubicación en vez de desbordar a la RAM compartida (muy lento).
 - **La descarga automática de pesos falla:** la interfaz muestra el error (no se queda colgada) si la descarga falla, termina sin completar o pasa 5 minutos sin avanzar. Reintenta con `descargar_modelos.bat`.
