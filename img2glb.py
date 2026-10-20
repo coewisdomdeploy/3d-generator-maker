@@ -1470,11 +1470,12 @@ try:
     _orig_single_encoder_load = SingleImageEncoder.load_state_dict
     _orig_dual_encoder_load = DualImageEncoder.load_state_dict
 
-    def _tolerant_single_encoder_load(self, state_dict, strict=True):
-        return _orig_single_encoder_load(self, state_dict, strict=False)
+    # *args/**kwargs: reenvía assign=True (carga directa a GPU sin pasar por RAM)
+    def _tolerant_single_encoder_load(self, state_dict, strict=True, *args, **kwargs):
+        return _orig_single_encoder_load(self, state_dict, False, *args, **kwargs)
 
-    def _tolerant_dual_encoder_load(self, state_dict, strict=True):
-        return _orig_dual_encoder_load(self, state_dict, strict=False)
+    def _tolerant_dual_encoder_load(self, state_dict, strict=True, *args, **kwargs):
+        return _orig_dual_encoder_load(self, state_dict, False, *args, **kwargs)
 
     SingleImageEncoder.load_state_dict = _tolerant_single_encoder_load
     DualImageEncoder.load_state_dict = _tolerant_dual_encoder_load
@@ -1630,6 +1631,10 @@ class Hunyuan3DGenerator:
                     state[key[len(prefix):]] = f.get_tensor(key).to(self.dtype)
         module.load_state_dict(state, strict=True, assign=(comp != "vae"))
         del state
+        # El parche tolerante de los encoders usa strict=False: validar que no quedó nada vacío
+        empty = [n for n, t in list(module.named_parameters()) + list(module.named_buffers()) if t.is_meta]
+        if empty:
+            raise RuntimeError(f"state_dict incompleto para '{comp}': faltan {len(empty)} pesos (ej. {empty[:3]})")
         module.to(device=device, dtype=self.dtype).eval()
         print(f" -> [Carga] '{comp}' -> {device} en {time.time() - t0:.1f}s ({_model_size_gb('sf3d', module):.2f} GB)")
         return module
