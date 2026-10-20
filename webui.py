@@ -1087,7 +1087,7 @@ PRINT_FORMAT_CHOICES = [(f.upper(), f) for f in PRINT_FORMATS]
 def slicer_choices() -> list:
     installed = detect_slicers()
     choices = [("Automático (según impresora)", "auto")]
-    for key, (name, _) in SLICERS.items():
+    for key, (name, *_rest) in SLICERS.items():
         choices.append((f"{name}" + ("" if key in installed else " (no instalado)"), key))
     choices.append(("Programa predeterminado de Windows", "default"))
     return choices

@@ -149,6 +149,23 @@ def _vram_free_gb() -> float:
     return free_b / (1024 ** 3)
 
 
+def cap_vram_to_physical(margin_gb: float = 0.25) -> None:
+    """
+    Impide que PyTorch pida más VRAM de la que queda libre físicamente. En Windows, el driver
+    de NVIDIA desborda en silencio a la RAM compartida (muy lento) en lugar de dar error; con
+    este límite se produce un OutOfMemoryError real y los modelos bajan de ubicación
+    (lean / bloques / stream) en vez de arrastrarse durante minutos.
+    """
+    if not torch.cuda.is_available():
+        return
+    total = torch.cuda.get_device_properties(0).total_memory
+    free, _ = torch.cuda.mem_get_info(0)
+    limit = torch.cuda.memory_reserved(0) + free - int(margin_gb * 1024 ** 3)
+    fraction = max(0.1, min(1.0, limit / total))
+    torch.cuda.set_per_process_memory_fraction(fraction, 0)
+    print(f" -> [VRAM Guard] Límite de VRAM para PyTorch: {limit / 1024 ** 3:.1f} GB (sin desbordar a memoria compartida)")
+
+
 def _vram_held_mb() -> float:
     """VRAM ocupada por tensores de ESTE proceso."""
     return torch.cuda.memory_allocated(0) / (1024 ** 2) if torch.cuda.is_available() else 0.0
@@ -286,6 +303,7 @@ def activate_model(
     for other in others:
         park_model(other)
     flush_vram()
+    cap_vram_to_physical()
 
     # 2. Validar VRAM
     if torch.cuda.is_available():
@@ -1782,6 +1800,7 @@ class _LazyPaintModel:
     def _load(self, tier: str) -> None:
         t0 = time.time()
         flush_vram()
+        cap_vram_to_physical()
         self.instance = self.factory(tier)
         self.tier = tier
         for opt in ("enable_vae_slicing", "enable_vae_tiling"):

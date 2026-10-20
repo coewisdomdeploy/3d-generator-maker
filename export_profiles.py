@@ -30,36 +30,92 @@ import trimesh
 
 CUSTOM_PRINTER = "Personalizada"
 
-# nombre: (X mm, Y mm, Z mm, tecnología, slicer preferido)
+
+def _printer(bed, tech="FDM", motion="CoreXY", enclosed=False, multicolor=None, slicer="orca"):
+    """bed: (X, Y, Z) mm · motion: CoreXY / Cama móvil / CoreXZ / Resina · multicolor: sistema o None."""
+    return {"bed": tuple(bed), "tech": tech, "motion": motion, "enclosed": enclosed,
+            "multicolor": multicolor, "slicer": slicer}
+
+
+def _resin(bed, slicer="chitubox"):
+    return _printer(bed, tech="Resina", motion="Resina (LCD)", enclosed=True, slicer=slicer)
+
+
+# Volúmenes de impresión según las fichas de los fabricantes (verificados en octubre 2026).
+# Las velocidades no se incluyen: las fichas mezclan velocidad de impresión y de desplazamiento.
 PRINTERS = {
-    "Bambu Lab X1 Carbon": (256, 256, 256, "FDM", "bambu"),
-    "Bambu Lab P1S": (256, 256, 256, "FDM", "bambu"),
-    "Bambu Lab P1P": (256, 256, 256, "FDM", "bambu"),
-    "Bambu Lab A1": (256, 256, 256, "FDM", "bambu"),
-    "Bambu Lab A1 mini": (180, 180, 180, "FDM", "bambu"),
-    "Prusa MK4S": (250, 210, 220, "FDM", "prusa"),
-    "Prusa CORE One": (250, 220, 270, "FDM", "prusa"),
-    "Prusa MINI+": (180, 180, 180, "FDM", "prusa"),
-    "Prusa XL": (360, 360, 360, "FDM", "prusa"),
-    "Creality Ender-3 V3": (220, 220, 250, "FDM", "creality"),
-    "Creality K1C": (220, 220, 250, "FDM", "creality"),
-    "Creality K1 Max": (300, 300, 300, "FDM", "creality"),
-    "Creality K2 Plus": (350, 350, 350, "FDM", "creality"),
-    "Elegoo Neptune 4 Pro": (225, 225, 265, "FDM", "orca"),
-    "Anycubic Kobra 3": (250, 250, 260, "FDM", "orca"),
-    "Elegoo Saturn 4 Ultra": (218.88, 122.88, 220, "Resina", "chitubox"),
-    "Anycubic Photon Mono M7 Pro": (223.78, 126.38, 230, "Resina", "chitubox"),
-    CUSTOM_PRINTER: (220, 220, 250, "FDM", "orca"),
+    # Bambu Lab
+    "Bambu Lab X1 Carbon": _printer((256, 256, 256), enclosed=True, multicolor="AMS (opcional)", slicer="bambu"),
+    "Bambu Lab P1S": _printer((256, 256, 256), enclosed=True, multicolor="AMS (opcional)", slicer="bambu"),
+    "Bambu Lab P1P": _printer((256, 256, 256), multicolor="AMS (opcional)", slicer="bambu"),
+    "Bambu Lab P2S": _printer((256, 256, 256), enclosed=True, multicolor="AMS 2 Pro (opcional)", slicer="bambu"),
+    "Bambu Lab A1": _printer((256, 256, 256), motion="Cama móvil", multicolor="AMS lite (opcional)", slicer="bambu"),
+    "Bambu Lab A1 mini": _printer((180, 180, 180), motion="Cama móvil", multicolor="AMS lite (opcional)", slicer="bambu"),
+    "Bambu Lab H2D": _printer((325, 320, 325), enclosed=True, multicolor="Doble boquilla + AMS", slicer="bambu"),
+    "Bambu Lab H2S": _printer((340, 320, 340), enclosed=True, multicolor="AMS (opcional)", slicer="bambu"),
+    # Prusa
+    "Prusa MK4S": _printer((250, 210, 220), motion="Cama móvil", multicolor="MMU3 (opcional)", slicer="prusa"),
+    "Prusa MK3S+": _printer((250, 210, 210), motion="Cama móvil", multicolor="MMU3 (opcional)", slicer="prusa"),
+    "Prusa CORE One": _printer((250, 220, 270), enclosed=True, multicolor="MMU3 (opcional)", slicer="prusa"),
+    "Prusa MINI+": _printer((180, 180, 180), motion="Cama móvil", slicer="prusa"),
+    "Prusa XL": _printer((360, 360, 360), multicolor="Cambio de herramienta (hasta 5)", slicer="prusa"),
+    # Creality
+    "Creality Ender-3 V3": _printer((220, 220, 250), motion="CoreXZ", slicer="creality"),
+    "Creality Ender-3 V3 SE": _printer((220, 220, 250), motion="Cama móvil", slicer="creality"),
+    "Creality Ender-3 V3 KE": _printer((220, 220, 240), motion="Cama móvil", slicer="creality"),
+    "Creality K1C": _printer((220, 220, 250), enclosed=True, slicer="creality"),
+    "Creality K1 Max": _printer((300, 300, 300), enclosed=True, slicer="creality"),
+    "Creality K2 Plus": _printer((350, 350, 350), enclosed=True, multicolor="CFS (opcional)", slicer="creality"),
+    "Creality Hi": _printer((260, 260, 300), motion="Cama móvil", multicolor="CFS (versión Combo)", slicer="creality"),
+    # Flashforge
+    "Flashforge Adventurer 5M (AD5M)": _printer((220, 220, 220), slicer="flashforge"),
+    "Flashforge Adventurer 5M Pro (AD5M Pro)": _printer((220, 220, 220), enclosed=True, slicer="flashforge"),
+    "Flashforge AD5X": _printer((220, 220, 220), multicolor="IFS 4 colores (integrado)", slicer="flashforge"),
+    # Elegoo
+    "Elegoo Centauri Carbon": _printer((256, 256, 256), enclosed=True, slicer="elegoo"),
+    "Elegoo Neptune 4 Pro": _printer((225, 225, 265), motion="Cama móvil", slicer="elegoo"),
+    "Elegoo Neptune 4 Plus": _printer((320, 320, 385), motion="Cama móvil", slicer="elegoo"),
+    "Elegoo Neptune 4 Max": _printer((420, 420, 480), motion="Cama móvil", slicer="elegoo"),
+    "Elegoo Saturn 4 Ultra": _resin((218.88, 122.88, 220)),
+    "Elegoo Saturn 4 Ultra 16K": _resin((211.68, 118.37, 220)),
+    "Elegoo Mars 5 Ultra": _resin((153.36, 77.76, 165)),
+    # Anycubic
+    "Anycubic Kobra 3": _printer((250, 250, 260), motion="Cama móvil", multicolor="ACE Pro (versión Combo)", slicer="anycubic"),
+    "Anycubic Kobra 2 Neo": _printer((220, 220, 250), motion="Cama móvil", slicer="anycubic"),
+    "Anycubic Kobra S1": _printer((250, 250, 250), enclosed=True, multicolor="ACE Pro (versión Combo)", slicer="anycubic"),
+    "Anycubic Photon Mono M7 Pro": _resin((223, 126, 230)),
+    # QIDI
+    "QIDI Q1 Pro": _printer((245, 245, 240), enclosed=True, slicer="qidi"),
+    "QIDI Plus4": _printer((305, 305, 280), enclosed=True, slicer="qidi"),
+    # Sovol
+    "Sovol SV06": _printer((220, 220, 250), motion="Cama móvil", slicer="orca"),
+    "Sovol SV08": _printer((350, 350, 345), slicer="orca"),
+    CUSTOM_PRINTER: _printer((220, 220, 250), motion="—", slicer="orca"),
 }
 
-# clave: (nombre visible, rutas relativas a Program Files / AppData\Local\Programs, admite comodines)
+# clave: (nombre visible, carpetas de instalación con comodines, palabras del .exe)
+# Se busca en Program Files, Program Files (x86) y AppData\Local\Programs
 SLICERS = {
-    "bambu": ("Bambu Studio", ["Bambu Studio/bambu-studio.exe"]),
-    "orca": ("OrcaSlicer", ["OrcaSlicer/orca-slicer.exe"]),
-    "prusa": ("PrusaSlicer", ["Prusa3D/PrusaSlicer/prusa-slicer.exe"]),
-    "creality": ("Creality Print", ["Creality/Creality Print*/CrealityPrint.exe", "Creality Print*/CrealityPrint.exe"]),
-    "cura": ("UltiMaker Cura", ["UltiMaker Cura*/UltiMaker-Cura.exe", "Ultimaker Cura*/Ultimaker-Cura.exe"]),
-    "chitubox": ("CHITUBOX", ["CHITUBOX*/CHITUBOX.exe", "ChituBox*/CHITUBOX.exe"]),
+    "bambu": ("Bambu Studio", ["Bambu Studio*"], ["bambu-studio"]),
+    "orca": ("OrcaSlicer", ["OrcaSlicer*"], ["orca-slicer"]),
+    "prusa": ("PrusaSlicer", ["Prusa3D/PrusaSlicer*", "PrusaSlicer*"], ["prusa-slicer"]),
+    "creality": ("Creality Print", ["Creality/Creality Print*", "Creality Print*"], ["crealityprint", "creality print"]),
+    "flashforge": ("Orca-Flashforge", ["Orca-Flashforge*", "Flashforge/Orca-Flashforge*", "Flash Studio*",
+                                       "Flashforge/Flash Studio*"], ["orca-flashforge", "flashstudio", "flash studio"]),
+    "flashprint": ("FlashPrint 5", ["FlashForge/FlashPrint*", "FlashPrint*"], ["flashprint"]),
+    "elegoo": ("ElegooSlicer", ["ElegooSlicer*", "ELEGOO/ElegooSlicer*", "Elegoo Slicer*"], ["elegoo"]),
+    "anycubic": ("Anycubic Slicer Next", ["AnycubicSlicerNext*", "Anycubic/AnycubicSlicer*", "AnycubicSlicer*"], ["anycubic"]),
+    "qidi": ("QIDI Studio", ["QIDIStudio*", "QIDI*/QIDIStudio*", "QIDI Studio*"], ["qidi"]),
+    "cura": ("UltiMaker Cura", ["UltiMaker Cura*", "Ultimaker Cura*"], ["ultimaker-cura", "cura"]),
+    "chitubox": ("CHITUBOX", ["CHITUBOX*", "ChituBox*"], ["chitubox"]),
+}
+_EXE_SKIP_WORDS = ("unins", "uninstall", "crash", "update", "console", "helper", "setup", "elevate")
+SLICER_FALLBACK = {
+    "flashforge": ["flashprint", "orca"],
+    "elegoo": ["orca"],
+    "anycubic": ["orca"],
+    "qidi": ["orca"],
+    "creality": ["orca"],
 }
 SLICER_FALLBACK_FDM = ["orca", "prusa", "bambu", "cura", "creality"]
 SLICER_FALLBACK_RESIN = ["chitubox"]
@@ -142,7 +198,8 @@ def active_formats(settings: dict) -> list:
 def printer_dims(settings: dict) -> tuple:
     """(X, Y, Z, tecnología, slicer preferido) de la impresora elegida."""
     name = settings.get("print_printer", CUSTOM_PRINTER)
-    x, y, z, tech, slicer = PRINTERS.get(name, PRINTERS[CUSTOM_PRINTER])
+    spec = PRINTERS.get(name, PRINTERS[CUSTOM_PRINTER])
+    (x, y, z), tech, slicer = spec["bed"], spec["tech"], spec["slicer"]
     if name == CUSTOM_PRINTER:
         x, y, z = [float(v) for v in settings.get("print_custom_bed", [x, y, z])]
     return x, y, z, tech, slicer
@@ -170,12 +227,17 @@ def _search_roots() -> list:
 def detect_slicers() -> dict:
     """{clave: ruta del ejecutable} de los slicers instalados (se busca una sola vez)."""
     found = {}
-    for key, (_, patterns) in SLICERS.items():
+    for key, (_, folders, words) in SLICERS.items():
         for root in _search_roots():
-            for pattern in patterns:
-                matches = sorted(root.glob(pattern), reverse=True)  # versión más reciente primero
-                if matches:
-                    found[key] = str(matches[0])
+            for folder in folders:
+                for install_dir in sorted(root.glob(folder), reverse=True):  # versión más reciente primero
+                    exes = [e for e in install_dir.glob("*.exe")
+                            if any(w in e.name.lower() for w in words)
+                            and not any(s in e.name.lower() for s in _EXE_SKIP_WORDS)]
+                    if exes:
+                        found[key] = str(exes[0])
+                        break
+                if key in found:
                     break
             if key in found:
                 break
@@ -192,7 +254,7 @@ def resolve_slicer(settings: dict) -> tuple:
         return choice, SLICERS.get(choice, (choice,))[0], installed.get(choice)
     _, _, _, tech, preferred = printer_dims(settings)
     fallback = SLICER_FALLBACK_RESIN if tech == "Resina" else SLICER_FALLBACK_FDM
-    for key in [preferred] + fallback:
+    for key in [preferred] + SLICER_FALLBACK.get(preferred, []) + fallback:
         if key in installed:
             return key, SLICERS[key][0], installed[key]
     return "default", "programa predeterminado", None
