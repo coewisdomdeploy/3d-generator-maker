@@ -743,6 +743,18 @@ echo.
 if "!ENGINE_CHOICE!"=="2" goto :weights_sf3d
 call :ensure_weights dit "Geometria Hunyuan3D-2 Turbo" "4.9 GB"
 call :ensure_weights paint "Textura Hunyuan3D-Paint" "9 GB"
+call :ensure_weights dit_fast "Hunyuan3D-2 Fast para la casilla Profundidad mejorada" "4.6 GB"
+call :ensure_weights depth "Depth Anything V2 para el refuerzo guiado de Profundidad mejorada" "100 MB"
+call :ensure_weights dit_full "Hunyuan3D-2 completo para la casilla Maxima calidad" "4.6 GB"
+
+:: Cache fp16 de Hunyuan3D-Paint: se crea una vez y la carga de la textura pasa de ~2 min a ~10 s
+"!VENV_PY!" "%~dp0preparar_modelos.py" check paint
+if !errorlevel! neq 0 goto :weights_opt_done
+"!VENV_PY!" "%~dp0preparar_modelos.py" check paint_opt
+if !errorlevel! equ 0 goto :weights_opt_done
+echo [INFO] Creando la cache optimizada de Hunyuan3D-Paint: una sola vez, unos 5 minutos...
+"!VENV_PY!" "%~dp0preparar_modelos.py" optimize paint
+:weights_opt_done
 if "!ENGINE_CHOICE!"=="1" goto :step_paint
 :weights_sf3d
 call :ensure_weights sf3d "Stable Fast 3D" "3.8 GB"

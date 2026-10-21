@@ -12,6 +12,7 @@ Perfiles de Exportación (estilo Meshy): Modelos 3D o Impresión 3D
 ==============================================================================
 """
 
+import collections
 import json
 import os
 import subprocess
@@ -137,6 +138,8 @@ DEFAULT_SETTINGS = {
     "print_repair": True,
     "print_formats": ["3mf", "stl"],
     "print_slicer": "auto",       # "auto" | clave de SLICERS | "default"
+    "print_slicer_path": "",      # ejecutable elegido a mano (tiene prioridad si existe)
+    "print_colors": 0,            # filamentos/colores a exportar; 0 = automático según la impresora
 }
 
 
@@ -205,6 +208,20 @@ def printer_dims(settings: dict) -> tuple:
     return x, y, z, tech, slicer
 
 
+def printer_features(name: str) -> list:
+    """Características legibles de la impresora para mostrar en la configuración."""
+    spec = PRINTERS.get(name, PRINTERS[CUSTOM_PRINTER])
+    if name == CUSTOM_PRINTER:
+        return []
+    features = [spec["tech"]]
+    if spec["tech"] != "Resina":
+        features.append(spec["motion"])
+        features.append("Cerrada" if spec["enclosed"] else "Abierta")
+    if spec["multicolor"]:
+        features.append(f"Multicolor: {spec['multicolor']}")
+    return features
+
+
 def profile_label(settings: dict) -> str:
     """Texto corto del perfil activo para el botón de configuración."""
     if settings["mode"] == "impresion":
@@ -246,6 +263,9 @@ def detect_slicers() -> dict:
 
 def resolve_slicer(settings: dict) -> tuple:
     """(clave, nombre visible, ejecutable o None). None = programa predeterminado del sistema."""
+    custom = str(settings.get("print_slicer_path") or "").strip().strip('"')
+    if custom and Path(custom).is_file():
+        return "custom", Path(custom).stem, custom
     choice = settings.get("print_slicer", "auto")
     installed = detect_slicers()
     if choice == "default":
@@ -313,18 +333,178 @@ def prepare_model_mesh(mesh: trimesh.Trimesh, settings: dict) -> trimesh.Trimesh
     return mesh
 
 
+# ------------------------------------------------------------------------------
+# Color para impresión multicolor: textura -> colores por cara -> N filamentos
+# ------------------------------------------------------------------------------
+
+def print_color_count(settings: dict) -> int:
+    """Número de colores (filamentos) a exportar. 0 = automático según la impresora."""
+    n = int(settings.get("print_colors") or 0)
+    if n > 0:
+        return max(1, min(n, 16))
+    spec = PRINTERS.get(settings.get("print_printer"), PRINTERS[CUSTOM_PRINTER])
+    if not spec["multicolor"]:
+        return 1
+    return 5 if "hasta 5" in spec["multicolor"] else 4
+
+
+def _face_colors(mesh: trimesh.Trimesh) -> Optional[np.ndarray]:
+    """Color RGB (0-1) de cada cara: textura (promedio de 4 muestras), color de vértice o de cara."""
+    visual = getattr(mesh, "visual", None)
+    material = getattr(visual, "material", None)
+    img = getattr(material, "baseColorTexture", None) or getattr(material, "image", None)
+    uv = getattr(visual, "uv", None)
+    faces = mesh.faces
+    if img is not None and uv is not None and len(uv) == len(mesh.vertices):
+        tex = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
+        th, tw = tex.shape[:2]
+        fuv = np.asarray(uv)[faces]                                   # (F, 3, 2)
+        samples = np.concatenate([fuv, fuv.mean(axis=1, keepdims=True)], axis=1)
+        tx = np.clip((samples[..., 0] % 1.0) * (tw - 1), 0, tw - 1).astype(np.int64)
+        ty = np.clip((1.0 - samples[..., 1] % 1.0) * (th - 1), 0, th - 1).astype(np.int64)
+        rgb = tex[ty, tx].mean(axis=1)
+        factor = getattr(material, "baseColorFactor", None)
+        if factor is not None and len(factor) >= 3:
+            f = np.asarray(factor[:3], dtype=np.float32)
+            rgb = rgb * (f / 255.0 if f.max() > 1.0 else f)
+        return np.clip(rgb, 0, 1)
+    kind = getattr(visual, "kind", None)
+    if kind == "vertex":
+        vc = np.asarray(visual.vertex_colors[:, :3], dtype=np.float32) / 255.0
+        return vc[faces].mean(axis=1)
+    if kind == "face":
+        return np.asarray(visual.face_colors[:, :3], dtype=np.float32) / 255.0
+    return None
+
+
+def _rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
+    """sRGB (0-1) -> CIELAB (D65)."""
+    lin = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+    m = np.array([[0.4124, 0.3576, 0.1805], [0.2126, 0.7152, 0.0722], [0.0193, 0.1192, 0.9505]])
+    xyz = lin @ m.T / np.array([0.95047, 1.0, 1.08883])
+    f = np.where(xyz > 0.008856, np.cbrt(xyz), 7.787 * xyz + 16 / 116)
+    return np.stack([116 * f[:, 1] - 16, 500 * (f[:, 0] - f[:, 1]), 200 * (f[:, 1] - f[:, 2])], axis=1)
+
+
+def _quantize_colors(colors: np.ndarray, weights: np.ndarray, k: int, iterations: int = 20) -> tuple:
+    """
+    k-means ponderado por área en espacio Lab con la luminosidad atenuada: la sombra horneada
+    en la textura no debe partir un mismo color en dos filamentos.
+    Retorna (etiqueta por cara, paleta RGB (k, 3)) con el filamento 1 = color dominante.
+    """
+    feats = _rgb_to_lab(colors) * np.array([0.45, 1.0, 1.0])
+    rng = np.random.default_rng(0)
+    sample, sw = feats, weights
+    if len(feats) > 60000:
+        idx = rng.choice(len(feats), 60000, replace=False, p=weights / weights.sum())
+        sample, sw = feats[idx], np.ones(len(idx))
+    centers = [sample[rng.choice(len(sample), p=sw / sw.sum())]]
+    for _ in range(1, k):
+        d = np.min(((sample[:, None, :] - np.array(centers)[None]) ** 2).sum(-1), axis=1) * sw
+        if d.sum() <= 1e-9:
+            break
+        centers.append(sample[rng.choice(len(sample), p=d / d.sum())])
+    centers = np.array(centers)
+    for _ in range(iterations):
+        labels = np.argmin(((sample[:, None, :] - centers[None]) ** 2).sum(-1), axis=1)
+        for c in range(len(centers)):
+            m = labels == c
+            if m.any():
+                centers[c] = np.average(sample[m], axis=0, weights=sw[m])
+    labels = np.argmin(((feats[:, None, :] - centers[None]) ** 2).sum(-1), axis=1)
+    area = np.bincount(labels, weights=weights, minlength=len(centers))
+    order = [i for i in np.argsort(-area) if area[i] > 0]
+    remap = np.zeros(len(centers), dtype=np.int64)
+    remap[order] = np.arange(len(order))
+    labels = remap[labels]
+    palette = np.array([np.average(colors[labels == i], axis=0, weights=weights[labels == i])
+                        for i in range(len(order))])
+    return labels, palette
+
+
+def _smooth_labels(mesh: trimesh.Trimesh, labels: np.ndarray, k: int,
+                   iterations: int = 6, min_island: float = 0.004) -> np.ndarray:
+    """
+    Limpieza de regiones de color para imprimir:
+    1) filtro de moda: una cara toma el color de 2+ vecinas que coinciden entre sí
+    2) islas conectadas con menos de min_island del área total se funden con su vecino dominante
+    Evita cambios de filamento por manchas sueltas.
+    """
+    adj = mesh.face_adjacency
+    if len(adj) == 0:
+        return labels
+    labels = labels.copy()
+    n = len(labels)
+    rows = np.arange(n)
+    for _ in range(iterations):
+        counts = np.zeros((n, k), dtype=np.int32)
+        np.add.at(counts, (adj[:, 0], labels[adj[:, 1]]), 1)
+        np.add.at(counts, (adj[:, 1], labels[adj[:, 0]]), 1)
+        best = counts.argmax(axis=1)
+        switch = (counts[rows, best] >= 2) & (best != labels) & (counts[rows, best] > counts[rows, labels])
+        if not switch.any():
+            break
+        labels[switch] = best[switch]
+
+    areas = mesh.area_faces
+    limit = float(areas.sum()) * min_island
+    for _ in range(3):
+        same = labels[adj[:, 0]] == labels[adj[:, 1]]
+        comps = trimesh.graph.connected_components(adj[same], nodes=rows, min_len=1)
+        comp_id = np.empty(n, dtype=np.int64)
+        for ci, faces_in in enumerate(comps):
+            comp_id[faces_in] = ci
+        comp_area = np.bincount(comp_id, weights=areas, minlength=len(comps))
+        small = comp_area < limit
+        if not small.any():
+            break
+        # Vecino dominante de cada isla: color al otro lado del borde, ponderado por área
+        border = ~same
+        a, b = adj[border, 0], adj[border, 1]
+        votes = collections.defaultdict(lambda: np.zeros(k))
+        for fa, fb in ((a, b), (b, a)):
+            sel = small[comp_id[fa]]
+            for c, lab, w in zip(comp_id[fa][sel], labels[fb][sel], areas[fb][sel]):
+                votes[c][lab] += w
+        changed = False
+        for c, v in votes.items():
+            target = int(v.argmax())
+            faces_in = comps[c]
+            if target != labels[faces_in[0]]:
+                labels[faces_in] = target
+                changed = True
+        if not changed:
+            break
+    return labels
+
+
 def prepare_print_mesh(mesh: trimesh.Trimesh, settings: dict) -> tuple:
     """
-    Impresión 3D: solo geometría, reparada, Z-up, en milímetros, apoyada en la cama
-    y centrada en el volumen de la impresora. Retorna (malla, info).
+    Impresión 3D: geometría reparada, Z-up, en milímetros, apoyada en la cama y centrada
+    en el volumen de la impresora. Con 2+ colores, la textura se convierte en N colores
+    por cara (uno por filamento). Retorna (malla, info) con info["labels"] / info["palette"].
     """
+    k = print_color_count(settings)
+    face_rgb = _face_colors(mesh) if k > 1 else None
+    labels = palette = None
+    if face_rgb is not None:
+        labels, palette = _quantize_colors(face_rgb, np.maximum(mesh.area_faces, 1e-12), k)
+
     geo = trimesh.Trimesh(vertices=np.array(mesh.vertices), faces=np.array(mesh.faces), process=True)
+    if labels is not None:
+        # El color viaja como color de cara para sobrevivir a la reparación (que borra o añade caras)
+        rgba = np.c_[(palette[labels] * 255).round(), np.full(len(labels), 255)].astype(np.uint8)
+        geo.visual = trimesh.visual.ColorVisuals(geo, face_colors=rgba)
     if settings.get("print_repair", True):
         geo.update_faces(geo.nondegenerate_faces())
         geo.update_faces(geo.unique_faces())
         geo.remove_unreferenced_vertices()
         trimesh.repair.fill_holes(geo)
         trimesh.repair.fix_normals(geo)
+    if labels is not None:
+        fc = np.asarray(geo.visual.face_colors[:, :3], dtype=np.float32) / 255.0
+        labels = np.argmin(((fc[:, None, :] - palette[None]) ** 2).sum(-1), axis=1)
+        labels = _smooth_labels(geo, labels, len(palette))
 
     # glTF es Y-up; las impresoras trabajan en Z-up (la cabeza pasa a +Z, el frente a -Y)
     geo.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0]))
@@ -350,6 +530,9 @@ def prepare_print_mesh(mesh: trimesh.Trimesh, settings: dict) -> tuple:
         "size_mm": tuple(round(float(e), 1) for e in geo.extents),
         "fitted": fitted,
         "watertight": bool(geo.is_watertight),
+        "labels": labels,
+        "palette": palette,
+        "colors_requested": k,
     }
     return geo, info
 
@@ -376,6 +559,86 @@ def _export_obj(mesh: trimesh.Trimesh, out_base: Path) -> Path:
     return out_file
 
 
+def _hex(rgb) -> str:
+    return "#" + "".join(f"{int(round(float(c) * 255)):02X}" for c in rgb)
+
+
+def _paint_code(extruder: int) -> str:
+    """
+    Código de pintura por triángulo de PrusaSlicer/Bambu/Orca (TriangleSelector serializado)
+    para un triángulo sin subdividir: filamento 1 -> "4", 2 -> "8", 3 -> "0C", 4 -> "1C"...
+    """
+    if extruder <= 2:
+        return "4" if extruder == 1 else "8"
+    return f"{extruder - 3:X}C"
+
+
+def _export_3mf_colored(mesh: trimesh.Trimesh, labels: np.ndarray, palette: np.ndarray, out_file: Path) -> Path:
+    """
+    3MF en milímetros con cada triángulo pintado por filamento:
+    - paint_color: lo leen Bambu Studio, OrcaSlicer y derivados (Orca-Flashforge, ElegooSlicer...)
+    - slic3rpe:mmu_segmentation: lo lee PrusaSlicer
+    - basematerials (estándar 3MF): colores de visualización para el resto de programas
+    """
+    codes = [_paint_code(i + 1) for i in range(len(palette))]
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<model unit="millimeter" xml:lang="en-US" '
+        'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" '
+        'xmlns:slic3rpe="http://schemas.slic3r.org/3mf/2017/06">\n'
+        ' <metadata name="Application">3D AI Studio</metadata>\n'
+        ' <resources>\n  <basematerials id="1">\n'
+    ]
+    parts += [f'   <base name="Filamento {i + 1}" displaycolor="{_hex(c)}FF"/>\n' for i, c in enumerate(palette)]
+    parts.append('  </basematerials>\n  <object id="2" type="model" pid="1" pindex="0">\n   <mesh>\n    <vertices>\n')
+    parts += [f'     <vertex x="{x:.4f}" y="{y:.4f}" z="{z:.4f}"/>\n' for x, y, z in mesh.vertices]
+    parts.append('    </vertices>\n    <triangles>\n')
+    parts += [
+        f'     <triangle v1="{a}" v2="{b}" v3="{c}" pid="1" p1="{l}" '
+        f'paint_color="{codes[l]}" slic3rpe:mmu_segmentation="{codes[l]}"/>\n'
+        for (a, b, c), l in zip(mesh.faces, labels)
+    ]
+    parts.append('    </triangles>\n   </mesh>\n  </object>\n </resources>\n'
+                 ' <build>\n  <item objectid="2"/>\n </build>\n</model>\n')
+    content_types = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+                     '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                     '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                     '<Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>'
+                     '</Types>')
+    rels = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Target="/3D/3dmodel.model" Id="rel0" '
+            'Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>')
+    with zipfile.ZipFile(out_file, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", rels)
+        zf.writestr("3D/3dmodel.model", "".join(parts))
+    return out_file
+
+
+def _export_obj_colored(mesh: trimesh.Trimesh, labels: np.ndarray, palette: np.ndarray, out_base: Path) -> Path:
+    """
+    OBJ + MTL con un material por filamento (Bambu Studio y Orca muestran el diálogo de
+    asignación de colores al importarlo). Quedan .obj/.mtl sueltos para abrir en el slicer
+    y un .zip con ambos para la descarga.
+    """
+    mtl_name = f"{out_base.name}.mtl"
+    mtl = "".join(f"newmtl filamento_{i + 1}\nKd {c[0]:.4f} {c[1]:.4f} {c[2]:.4f}\n\n" for i, c in enumerate(palette))
+    lines = [f"mtllib {mtl_name}\n"]
+    lines += [f"v {x:.4f} {y:.4f} {z:.4f}\n" for x, y, z in mesh.vertices]
+    for i in range(len(palette)):
+        lines.append(f"usemtl filamento_{i + 1}\n")
+        lines += [f"f {a + 1} {b + 1} {c + 1}\n" for a, b, c in mesh.faces[labels == i]]
+    obj_text = "".join(lines)
+    out_base.with_suffix(".obj").write_text(obj_text, encoding="utf-8")
+    (out_base.parent / mtl_name).write_text(mtl, encoding="utf-8")
+    out_zip = out_base.parent / f"{out_base.name}_obj.zip"
+    with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"{out_base.name}.obj", obj_text)
+        zf.writestr(mtl_name, mtl)
+    return out_zip
+
+
 def export_with_profile(
     source: Union[str, Path, trimesh.Trimesh, trimesh.Scene],
     out_dir: Union[str, Path],
@@ -400,10 +663,20 @@ def export_with_profile(
         if info["fitted"]:
             summary += " (ajustado a la cama)"
         summary += " · estanca" if info["watertight"] else " · no estanca"
+        if info["palette"] is not None and len(info["palette"]) > 1:
+            summary += f" · {len(info['palette'])} colores (el STL no guarda color: usa 3MF u OBJ)"
+            if print_color_count(dict(settings, print_colors=0)) == 1:
+                summary += " · ojo: esta impresora es de un solo color"
+        elif info["colors_requested"] > 1:
+            summary += " · el modelo no tiene textura: se exporta en un color"
     else:
         mesh = prepare_model_mesh(mesh, settings)
         out_base = out_dir / stem
         summary = f"Modelos 3D · {float(settings.get('model_height_m') or 0):g} m · origen {settings.get('model_pivot')}"
+
+    print_labels = print_palette = None
+    if settings["mode"] == "impresion" and info["palette"] is not None and len(info["palette"]) > 1:
+        print_labels, print_palette = info["labels"], info["palette"]
 
     for fmt in formats:
         try:
@@ -415,6 +688,10 @@ def export_with_profile(
                     postprocess_and_validate_glb(out_file, asset_name=stem, target_faces=len(mesh.faces))
                 except Exception as e_post:
                     print(f"    [Aviso pygltflib] {e_post}")
+            elif fmt == "3mf" and print_palette is not None:
+                out_file = _export_3mf_colored(mesh, print_labels, print_palette, out_base.with_suffix(".3mf"))
+            elif fmt == "obj" and print_palette is not None:
+                out_file = _export_obj_colored(mesh, print_labels, print_palette, out_base)
             elif fmt == "obj":
                 out_file = _export_obj(mesh, out_base)
             else:

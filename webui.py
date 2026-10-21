@@ -53,6 +53,12 @@ from img2glb import (
     unload_all_models,
     park_all_models,
     TEXTURE_SAFE_MAX_FACES,
+    DEPTH_MIN_RATIO,
+    measure_depth_ratio,
+    reinforce_depth,
+    shape_quality_settings,
+    follow_frame,
+    bake_normal_map,
     apply_taubin_smoothing,
     inpaint_edge_padding,
     preprocess_and_remove_background,
@@ -66,6 +72,10 @@ from img2glb import (
     convert_glb_to_format,
     Hunyuan3DGenerator,
     SF3DGenerator,
+    SF3D_FACE_TOLERANCE,
+    MATERIAL_PRESETS,
+    TEXTURE_RELIEF_LEVELS,
+    apply_material_preset,
     is_dit_cached,
     VRAM_PROFILES,
     detect_vram_profile,
@@ -86,6 +96,7 @@ from export_profiles import (
     normalize_settings,
     open_in_slicer,
     printer_dims,
+    printer_features,
     profile_label,
     resolve_slicer,
     save_settings,
@@ -245,6 +256,8 @@ ENGINE_HUNYUAN = "Hunyuan3D-2 (Secuencial 2 Etapas • Máxima Calidad)"
 ENGINE_SF3D = "Stable Fast 3D (SF3D • Rápido 1 Paso)"
 ENGINE_UI_CHOICES = [("Hunyuan3D-2", ENGINE_HUNYUAN), ("SF3D · Rápido", ENGINE_SF3D)]
 VRAM_UI_CHOICES = list(zip(["Auto", "6 GB", "8 GB", "12 GB", "16 GB+", "CPU"], VRAM_PROFILE_CHOICES))
+MATERIAL_UI_CHOICES = [("Mate · cartoon", "mate"), ("Satinado · plástico", "satinado"), ("Metal · oro/plata", "metal")]
+RELIEF_UI_CHOICES = [("Sin relieve", "none"), ("Suave", "suave"), ("Marcado", "marcado")]
 
 GENERATE_LABEL = "Generar modelo 3D"
 VIEWER_DARK_BG = [0.07, 0.08, 0.10, 1.0]
@@ -390,6 +403,35 @@ def on_image_uploaded(image: Optional[Image.Image]) -> Tuple[Optional[Image.Imag
     return display_img, clean_img, msg
 
 
+def _run_in_worker(task, step_yield):
+    """
+    Ejecuta task(progress) en un hilo y emite su avance a la interfaz en vivo.
+    progress(msg, pct) puede llamarse desde el hilo; devuelve el resultado de task o relanza su error.
+    """
+    progress_q = queue.Queue()
+    result = {"value": None, "error": None}
+
+    def worker():
+        try:
+            result["value"] = task(lambda msg, pct: progress_q.put((msg, pct)))
+        except Exception as err:
+            result["error"] = err
+        finally:
+            progress_q.put(("__DONE__", None))
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    while True:
+        msg, pct = progress_q.get()
+        if msg == "__DONE__":
+            break
+        yield step_yield(render_progress_html(msg, pct))
+    thread.join()
+    if result["error"] is not None:
+        raise result["error"]
+    return result["value"]
+
+
 def _ui_generate_3d_impl(
     image: Optional[Image.Image],
     clean_silhouette: Optional[Image.Image],
@@ -397,7 +439,12 @@ def _ui_generate_3d_impl(
     ai_model_choice: str,
     generate_texture: bool,
     model_name: str,
-    vram_profile_choice: str = "Auto-detectar (Recomendado)"
+    vram_profile_choice: str = "Auto-detectar (Recomendado)",
+    improved_depth: bool = False,
+    max_quality: bool = False,
+    material: str = "mate",
+    relief: str = "suave",
+    project_input: bool = True
 ) -> Generator[Tuple[Optional[str], any, any, any, str], None, None]:
     """
     Función generadora interna en streaming que emite actualizaciones en vivo etapa por etapa:
@@ -420,6 +467,7 @@ def _ui_generate_3d_impl(
     dit_steps = cfg["steps"]
     octree_res = cfg["octree"]
     total_start = time.time()
+    result_notes: list = []  # Informe de calidad/tiempos que se muestra al terminar
     
     print("\n" + "=" * 76)
     print("   [BOTÓN GENERAR PULSADO - INICIANDO PROCESAMIENTO]")
@@ -475,13 +523,18 @@ def _ui_generate_3d_impl(
                 clean_img,
                 texture_resolution=2048,
                 generate_texture=generate_texture,
-                foreground_ratio=0.82
+                foreground_ratio=0.82,
+                target_faces=target_faces,
+                material=material,
+                relief=relief,
+                project_input=project_input
             )
         except Exception as e:
             yield step_yield(render_progress_html(f"Error en inferencia SF3D: {e}", 0))
             return
 
-        if target_faces and target_faces < len(raw_mesh.faces):
+        # SF3D ya remalla a ~target_faces antes de hornear; solo se decima si el remallado falló
+        if target_faces and len(raw_mesh.faces) > target_faces * SF3D_FACE_TOLERANCE:
             yield step_yield(render_progress_html(f"[3/4] Optimización PBR: Decimando a {target_faces:,} caras con textura nativa...", 88))
             decimated_mesh = decimate_mesh_preserving_texture(raw_mesh, target_faces=target_faces)
         else:
@@ -504,10 +557,7 @@ def _ui_generate_3d_impl(
             aligned_mesh.visual.material = neutral_mat
             final_mesh = aligned_mesh
         else:
-            if hasattr(aligned_mesh, "visual") and hasattr(aligned_mesh.visual, "material") and aligned_mesh.visual.material is not None:
-                aligned_mesh.visual.material.metallicFactor = 0.0
-                aligned_mesh.visual.material.roughnessFactor = 0.90
-                aligned_mesh.visual.material.doubleSided = True
+            # El acabado (mate, satinado o metal) ya viene aplicado por SF3DGenerator
             final_mesh = aligned_mesh
     else:
         # Pipeline Tencent Hunyuan3D-2 Turbo
@@ -528,10 +578,22 @@ def _ui_generate_3d_impl(
         yield step_yield(render_progress_html(f"[2/4] Perfil VRAM: {profile_info['desc']}...", 25))
 
         target_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        quality = shape_quality_settings(octree_res, improved_depth, max_quality)
+        shape_subfolder, taubin_iters, octree_res = quality["shape_subfolder"], quality["taubin_iterations"], quality["octree"]
+        if quality["steps"]:
+            dit_steps = quality["steps"]
+        if improved_depth or max_quality:
+            print(f" -> [Calidad] {shape_subfolder} · {dit_steps} pasos · octree {octree_res} · Taubin {taubin_iters} · "
+                  f"semillas {quality['seeds']}" + (f" · guía {quality['guidance']}" if quality["guidance"] else ""))
+        if quality["missing"]:
+            item, label = quality["missing"]
+            print(f" -> [Calidad] Falta {label}: se usa {shape_subfolder}. "
+                  f"Descárgalo con: python preparar_modelos.py download {item}")
+            result_notes.append(f"Sugerencia: descarga {label} (preparar_modelos.py download {item})")
         try:
             generator = Hunyuan3DGenerator(
                 model_id="tencent/Hunyuan3D-2",
-                shape_subfolder="hunyuan3d-dit-v2-0-turbo",
+                shape_subfolder=shape_subfolder,
                 paint_subfolder="hunyuan3d-paint-v2-0",
                 use_fp16=profile_info.get("use_fp16", True),
                 low_vram_mode=None,  # Lo decide el perfil de VRAM
@@ -569,7 +631,12 @@ def _ui_generate_3d_impl(
                     seed=42,
                     target_faces=target_faces,
                     progress_callback=on_shape_progress,
-                    texture_safe_cap=texture_cap
+                    texture_safe_cap=texture_cap,
+                    taubin_iterations=taubin_iters,
+                    allow_high_octree=improved_depth or max_quality,
+                    guidance_scale=quality["guidance"],
+                    seed_candidates=quality["seeds"],
+                    keep_hd=quality["normal_map"]
                 )
                 gen_result["mesh"] = m
             except Exception as err:
@@ -597,6 +664,12 @@ def _ui_generate_3d_impl(
             return
 
         raw_mesh = gen_result["mesh"]
+        # Malla HD sin reducir: sigue a la malla final en cada paso y al final se hornea como normal map
+        hd_mesh, generator.last_hd_mesh = generator.last_hd_mesh, None
+        seed_report = generator.last_seed_report
+        if seed_report:
+            matches = " / ".join(f"{s:.0%}" for s in seed_report["scores"])
+            result_notes.append(f"Semillas (parecido a la silueta): {matches} → elegida la {seed_report['best'] + 1}")
 
         aligned_mesh = center_and_orient_mesh(
             raw_mesh,
@@ -604,6 +677,25 @@ def _ui_generate_3d_impl(
             normalize_scale=True,
             target_height=1.2
         )
+        if hd_mesh is not None:
+            hd_mesh.vertices = follow_frame(hd_mesh.vertices, raw_mesh, aligned_mesh)
+
+        # Informe de profundidad; con "Profundidad mejorada" se refuerza si salió tipo cartón
+        depth_method = ""
+        if improved_depth:
+            yield step_yield(render_progress_html("[3/4] Comprobando el fondo del modelo (Depth Anything V2 si hace falta)...", 86))
+            aligned_mesh, depth_before, depth_after, depth_method = reinforce_depth(
+                aligned_mesh, image=clean_img, companions=(hd_mesh,) if hd_mesh is not None else ()
+            )
+        else:
+            depth_before = depth_after = measure_depth_ratio(aligned_mesh)
+        if depth_after > depth_before:
+            how = " (guiado por la imagen)" if depth_method == "guiado" else ""
+            result_notes.append(f"Profundidad {depth_before:.0%} → reforzada a {depth_after:.0%}{how}")
+        else:
+            result_notes.append(f"Profundidad {depth_after:.0%}" + (" (plano: prueba 'Profundidad mejorada')"
+                                                                    if depth_after < DEPTH_MIN_RATIO and not improved_depth else ""))
+        print(f" -> [Profundidad] Fondo/alto: {depth_before:.2f}" + (f" → {depth_after:.2f}" if depth_after > depth_before else ""))
 
         # Purga total de VRAM entre Etapa 1 y Etapa 2
         flush_vram()
@@ -611,9 +703,22 @@ def _ui_generate_3d_impl(
 
         # ETAPA 2: Texturizado Nativo Multivista (Hunyuan3D-Paint en Low-VRAM)
         if generate_texture:
-            yield step_yield(render_progress_html("[4/4] [Etapa 2/2] Texturizado Multivista: Cargando Hunyuan3D-Paint en GPU...", 90))
+            yield step_yield(render_progress_html("[4/4] [Etapa 2/2] Texturizado Multivista: preparando Hunyuan3D-Paint...", 88))
             try:
-                final_mesh = generator.paint_and_texture_mesh(aligned_mesh, clean_img)
+                # En un hilo: la interfaz muestra cada etapa (delight, UV, multivista paso x/30, horneado...)
+                final_mesh = yield from _run_in_worker(
+                    lambda progress: generator.paint_and_texture_mesh(aligned_mesh, clean_img, progress_callback=progress),
+                    step_yield
+                )
+                paint_summary = getattr(generator, "last_paint_summary", None)
+                if paint_summary:
+                    result_notes.append(f"Textura: {paint_summary}")
+                paint_fallback = getattr(generator, "last_paint_fallback", None)
+                if paint_fallback:
+                    # La contingencia solo proyecta la imagen por delante y por detrás: avisar siempre
+                    result_notes.append(f"⚠ Textura de contingencia (solo frente): {paint_fallback}")
+                    gr.Warning(f"Hunyuan3D-Paint no se pudo usar: {paint_fallback}. Se aplicó la textura de "
+                               "contingencia, que solo colorea bien el frente.")
                 final_mesh = center_and_orient_mesh(
                     final_mesh,
                     align_floor=False,
@@ -637,10 +742,24 @@ def _ui_generate_3d_impl(
         park_all_models()
         print_real_vram_status("WebUI Fin Generación")
 
-    # Garantizar material PBR mate/limpio en la malla final
-    if hasattr(final_mesh, "visual") and hasattr(final_mesh.visual, "material") and final_mesh.visual.material is not None:
-        final_mesh.visual.material.metallicFactor = 0.0
-        final_mesh.visual.material.roughnessFactor = 0.90
+        # Detalle de la malla HD horneado en un normal map: la malla final conserva sus caras
+        if hd_mesh is not None:
+            yield step_yield(render_progress_html("[4/4] Horneando el detalle HD en un normal map...", 95))
+            hd_mesh.vertices = follow_frame(hd_mesh.vertices, aligned_mesh, final_mesh)
+            try:
+                baked_mesh = bake_normal_map(final_mesh, hd_mesh)
+                if baked_mesh is not None:
+                    final_mesh = baked_mesh
+                    result_notes.append("Normal map HD")
+            except Exception as e_bake:
+                print(f" -> [Aviso Normal map] {e_bake}")
+            hd_mesh = None
+
+    # Acabado elegido en la malla final: solo cambia los factores del material existente
+    # (conserva albedo y normal map); sin textura queda el material neutro mate
+    if generate_texture:
+        apply_material_preset(final_mesh, material)
+    elif hasattr(final_mesh, "visual") and getattr(final_mesh.visual, "material", None) is not None:
         final_mesh.visual.material.doubleSided = True
 
     yield step_yield(render_progress_html("[4/4] Guardando modelo .GLB en la biblioteca...", 97))
@@ -674,7 +793,7 @@ def _ui_generate_3d_impl(
         CURRENT_GENERATED_FILES["glb"] = glb_file
 
         elapsed = time.time() - total_start
-        LAST_GEN_SUMMARY = f"Generado en {elapsed:.1f}s · {len(final_mesh.faces):,} caras"
+        LAST_GEN_SUMMARY = " · ".join([f"Generado en {elapsed:.1f}s · {len(final_mesh.faces):,} caras", *result_notes])
         final_msg = render_progress_html(f"{LAST_GEN_SUMMARY} · Exportando con el perfil activo...", 100)
 
         # Purga estricta final de VRAM tras exportación completa
@@ -696,7 +815,12 @@ def ui_generate_3d(
     ai_model_choice: str,
     generate_texture: bool,
     model_name: str,
-    vram_profile_choice: str = "Auto-detectar (Recomendado)"
+    vram_profile_choice: str = "Auto-detectar (Recomendado)",
+    improved_depth: bool = False,
+    max_quality: bool = False,
+    material: str = "mate",
+    relief: str = "suave",
+    project_input: bool = True
 ) -> Generator[Tuple[Optional[str], str], None, None]:
     """
     Función generadora externa con bloqueo atómico anti-doble clic (mutex).
@@ -710,8 +834,13 @@ def ui_generate_3d(
     LAST_GEN_OK = False
     previous_glb = CURRENT_GENERATED_GLB
     try:
-        for out in _ui_generate_3d_impl(image, clean_silhouette, preset_label, ai_model_choice, generate_texture, model_name, vram_profile_choice):
-            yield out[0], out[4]
+        for out in _ui_generate_3d_impl(image, clean_silhouette, preset_label, ai_model_choice, generate_texture,
+                                        model_name, vram_profile_choice, improved_depth, max_quality,
+                                        material, relief, project_input):
+            # Un modelo nuevo siempre se muestra sólido: si el visor venía en modo Malla o Puntos
+            # se quedaba así y pintaba el modelo texturizado en alambre
+            viewer = gr.update(value=out[0], display_mode="solid") if isinstance(out[0], str) else out[0]
+            yield viewer, out[4]
         LAST_GEN_OK = CURRENT_GENERATED_GLB is not None and CURRENT_GENERATED_GLB != previous_glb
     finally:
         IS_GENERATING = False
@@ -1063,7 +1192,7 @@ def on_select_library_model(selection: str, settings: dict):
     glb_path = str(Path(glb_path_str).resolve())
     export_map, _ = export_for_downloads(glb_path, settings)
     return (
-        glb_path,
+        gr.update(value=glb_path, display_mode="solid"),
         glb_path,
         render_mesh_stats_html(glb_path),
         "Textura",
@@ -1082,6 +1211,8 @@ PIVOT_CHOICES = [("Base", "base"), ("Centro", "centro")]
 TEXTURE_CHOICES = [("1K", 1024), ("2K", 2048), ("4K", 4096)]
 MODEL_FORMAT_CHOICES = [(f.upper(), f) for f in MODEL_FORMATS]
 PRINT_FORMAT_CHOICES = [(f.upper(), f) for f in PRINT_FORMATS]
+PRINT_COLOR_CHOICES = ([("Automático (según impresora)", 0), ("1 · un solo color", 1)]
+                       + [(f"{n} colores", n) for n in range(2, 9)])
 
 
 def slicer_choices() -> list:
@@ -1093,14 +1224,23 @@ def slicer_choices() -> list:
     return choices
 
 
-def render_printer_info(printer: str, slicer: str, bx=None, by=None, bz=None) -> str:
-    """Línea informativa: volumen de impresión, tecnología y slicer que se usará."""
-    tmp = normalize_settings({"print_printer": printer, "print_slicer": slicer,
+def render_printer_info(printer: str, slicer: str, bx=None, by=None, bz=None, slicer_path: str = "") -> str:
+    """Ficha de la impresora: volumen, características y slicer que se usará."""
+    tmp = normalize_settings({"print_printer": printer, "print_slicer": slicer, "print_slicer_path": slicer_path or "",
                               "print_custom_bed": [bx or 220, by or 220, bz or 250]})
-    x, y, z, tech, _ = printer_dims(tmp)
+    x, y, z, _, recommended = printer_dims(tmp)
     _, name, exe = resolve_slicer(tmp)
-    slicer_txt = f"se abrirá en {name}" if exe else "slicer no detectado: se abrirá con el programa predeterminado"
-    return f'<div class="printer-info"><b>{x:g} × {y:g} × {z:g} mm</b> · {tech} · {slicer_txt}</div>'
+    chips = "".join(f'<span class="pi-chip">{f}</span>' for f in printer_features(printer))
+    recommended_name = SLICERS.get(recommended, (recommended,))[0]
+    if exe:
+        slicer_txt = f'Se abrirá en <b>{name}</b>'
+    else:
+        slicer_txt = (f'Slicer recomendado: <b>{recommended_name}</b> · no detectado, '
+                      'se abrirá con el programa predeterminado')
+    if slicer_path and not Path(str(slicer_path).strip().strip('"')).is_file():
+        slicer_txt += ' · <span class="pi-warn">la ruta indicada no existe</span>'
+    return (f'<div class="printer-info"><div class="pi-row"><span class="pi-vol">{x:g} × {y:g} × {z:g} mm</span>'
+            f'{chips}</div><div class="pi-slicer">{slicer_txt}</div></div>')
 
 
 def on_open_settings(settings: dict):
@@ -1125,14 +1265,16 @@ def on_open_settings(settings: dict):
         s["print_formats"],
         s["print_repair"],
         gr.update(choices=slicer_choices(), value=s["print_slicer"]),
-        render_printer_info(s["print_printer"], s["print_slicer"], *bed),
+        render_printer_info(s["print_printer"], s["print_slicer"], *bed, s["print_slicer_path"]),
+        s["print_slicer_path"],
+        s["print_colors"],
     )
 
 
 def on_save_settings(
     mode, model_formats, model_pivot, model_height_m, texture_max,
-    printer, bed_x, bed_y, bed_z, print_height_mm, fit_bed, print_formats, repair, slicer,
-    gen_model_path, lib_model_path
+    printer, bed_x, bed_y, bed_z, print_height_mm, fit_bed, print_formats, repair, slicer, slicer_path,
+    print_colors, gen_model_path, lib_model_path
 ):
     """
     Guarda el perfil en el navegador (y en disco como valor inicial para navegadores nuevos),
@@ -1155,6 +1297,8 @@ def on_save_settings(
         "print_formats": list(print_formats or []),
         "print_repair": bool(repair),
         "print_slicer": slicer or "auto",
+        "print_slicer_path": str(slicer_path or "").strip().strip('"'),
+        "print_colors": int(print_colors or 0),
     })
     try:
         save_settings(SETTINGS_FILE, settings)
@@ -1935,8 +2079,29 @@ footer { display: none !important; }
     border-radius: var(--s-radius-sm);
     background: var(--s-surface-2);
 }
-.printer-info { font-size: 0.76rem; color: var(--s-muted); }
+.printer-info {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding: 10px 12px;
+    border: 1px solid var(--s-border);
+    border-radius: var(--s-radius-sm);
+    background: var(--s-surface-2);
+    font-size: 0.76rem;
+    color: var(--s-muted);
+}
 .printer-info b { color: var(--s-text); }
+.pi-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.pi-vol { font-weight: 700; color: #fff; margin-right: 4px; font-variant-numeric: tabular-nums; }
+.pi-chip {
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--s-border-strong);
+    color: var(--s-text);
+    font-size: 0.7rem;
+    white-space: nowrap;
+}
+.pi-warn { color: var(--s-warn); }
 .modal-foot { justify-content: flex-end !important; padding-top: 4px; border-top: 1px solid var(--s-border) !important; }
 .modal-foot .btn-ghost { flex: 0 0 auto !important; width: auto !important; height: 38px !important; }
 .btn-save { flex: 0 0 auto !important; width: auto !important; min-height: 38px !important; padding: 0 22px !important; }
@@ -2349,8 +2514,17 @@ with gr.Blocks(title=page_title) as demo:
                         min_width=180
                     )
                 printer_info = gr.HTML(
-                    value=render_printer_info(INITIAL_SETTINGS["print_printer"], INITIAL_SETTINGS["print_slicer"], *INITIAL_SETTINGS["print_custom_bed"]),
+                    value=render_printer_info(INITIAL_SETTINGS["print_printer"], INITIAL_SETTINGS["print_slicer"],
+                                              *INITIAL_SETTINGS["print_custom_bed"], INITIAL_SETTINGS["print_slicer_path"]),
                     padding=False
+                )
+                set_slicer_path = gr.Textbox(
+                    value=INITIAL_SETTINGS["print_slicer_path"],
+                    placeholder="Ruta del slicer (opcional), ej. C:/Program Files/Orca-Flashforge/orca-flashforge.exe",
+                    show_label=False,
+                    container=False,
+                    lines=1,
+                    elem_classes=["compact-input"]
                 )
                 with gr.Row(visible=INITIAL_SETTINGS["print_printer"] == CUSTOM_PRINTER) as custom_bed_row:
                     set_bed_x = gr.Number(value=INITIAL_SETTINGS["print_custom_bed"][0], label="Cama X (mm)", minimum=10, min_width=90)
@@ -2371,6 +2545,13 @@ with gr.Blocks(title=page_title) as demo:
                         min_width=200,
                         elem_classes=["fmt-chips"]
                     )
+                set_print_colors = gr.Dropdown(
+                    choices=PRINT_COLOR_CHOICES,
+                    value=INITIAL_SETTINGS["print_colors"],
+                    label="Colores (filamentos)",
+                    info="La textura se convierte en un color por filamento en el 3MF y el OBJ",
+                    min_width=180
+                )
                 with gr.Row():
                     set_fit_bed = gr.Checkbox(
                         value=INITIAL_SETTINGS["print_fit_bed"],
@@ -2385,8 +2566,9 @@ with gr.Blocks(title=page_title) as demo:
                         elem_classes=["tex-check"]
                     )
                 gr.HTML(
-                    '<div class="modal-hint">Solo geometría, en milímetros y Z-up, apoyada en la cama y centrada '
-                    'en el volumen de la impresora. El 3MF lleva las unidades incluidas.</div>',
+                    '<div class="modal-hint">En milímetros y Z-up, apoyada en la cama y centrada en el volumen '
+                    'de la impresora. Con 2+ colores, el 3MF va pintado por filamento (lo leen Orca, Orca-Flashforge, '
+                    'Bambu Studio y PrusaSlicer) y el OBJ lleva un material por color. El STL nunca guarda color.</div>',
                     padding=False
                 )
 
@@ -2474,6 +2656,23 @@ with gr.Blocks(title=page_title) as demo:
                             interactive=True
                         )
 
+                    with gr.Row():
+                        material_dropdown = gr.Dropdown(
+                            choices=MATERIAL_UI_CHOICES,
+                            value="mate",
+                            label="Material",
+                            min_width=120,
+                            interactive=True
+                        )
+                        # Relieve sacado de la textura y sumado al normal map (solo SF3D)
+                        relief_dropdown = gr.Dropdown(
+                            choices=RELIEF_UI_CHOICES,
+                            value="suave",
+                            label="Relieve (SF3D)",
+                            min_width=90,
+                            interactive=True
+                        )
+
                     with gr.Row(equal_height=True):
                         chk_texture = gr.Checkbox(
                             value=False,
@@ -2481,6 +2680,35 @@ with gr.Blocks(title=page_title) as demo:
                             container=False,
                             scale=0,
                             min_width=120,
+                            elem_classes=["tex-check"]
+                        )
+                        chk_depth = gr.Checkbox(
+                            value=False,
+                            label="Profundidad mejorada",
+                            info=None,
+                            container=False,
+                            scale=0,
+                            min_width=170,
+                            elem_classes=["tex-check"]
+                        )
+                        # Modelo completo de 50 pasos con guía: más fiel a la imagen, ~1-2 min más
+                        chk_max_quality = gr.Checkbox(
+                            value=False,
+                            label="Máxima calidad",
+                            info=None,
+                            container=False,
+                            scale=0,
+                            min_width=140,
+                            elem_classes=["tex-check"]
+                        )
+                        # SF3D: pinta la imagen de entrada a resolución completa sobre el frente
+                        chk_projection = gr.Checkbox(
+                            value=True,
+                            label="Proyección HD",
+                            info=None,
+                            container=False,
+                            scale=0,
+                            min_width=140,
                             elem_classes=["tex-check"]
                         )
                         txt_model_name = gr.Textbox(
@@ -2660,7 +2888,12 @@ with gr.Blocks(title=page_title) as demo:
             ai_model_dropdown,
             chk_texture,
             txt_model_name,
-            vram_dropdown
+            vram_dropdown,
+            chk_depth,
+            chk_max_quality,
+            material_dropdown,
+            relief_dropdown,
+            chk_projection
         ],
         outputs=[viewer_3d, status_widget]
     ).then(
@@ -2746,7 +2979,8 @@ with gr.Blocks(title=page_title) as demo:
         outputs=[settings_modal, set_mode, model_group, print_group,
                  set_model_formats, set_pivot, set_height_m, set_texture,
                  set_printer, custom_bed_row, set_bed_x, set_bed_y, set_bed_z,
-                 set_height_mm, set_fit_bed, set_print_formats, set_repair, set_slicer, printer_info]
+                 set_height_mm, set_fit_bed, set_print_formats, set_repair, set_slicer, printer_info,
+                 set_slicer_path, set_print_colors]
     )
     for _btn in (btn_close_settings, btn_cancel_settings):
         _btn.click(fn=lambda: gr.update(visible=False), inputs=[], outputs=[settings_modal])
@@ -2756,10 +2990,10 @@ with gr.Blocks(title=page_title) as demo:
         inputs=[set_mode],
         outputs=[model_group, print_group]
     )
-    for _comp in (set_printer, set_slicer, set_bed_x, set_bed_y, set_bed_z):
+    for _comp in (set_printer, set_slicer, set_bed_x, set_bed_y, set_bed_z, set_slicer_path):
         _comp.change(
-            fn=lambda p, s, x, y, z: (render_printer_info(p, s, x, y, z), gr.update(visible=p == CUSTOM_PRINTER)),
-            inputs=[set_printer, set_slicer, set_bed_x, set_bed_y, set_bed_z],
+            fn=lambda p, s, x, y, z, sp: (render_printer_info(p, s, x, y, z, sp), gr.update(visible=p == CUSTOM_PRINTER)),
+            inputs=[set_printer, set_slicer, set_bed_x, set_bed_y, set_bed_z, set_slicer_path],
             outputs=[printer_info, custom_bed_row]
         )
 
@@ -2767,7 +3001,7 @@ with gr.Blocks(title=page_title) as demo:
         fn=on_save_settings,
         inputs=[set_mode, set_model_formats, set_pivot, set_height_m, set_texture,
                 set_printer, set_bed_x, set_bed_y, set_bed_z, set_height_mm, set_fit_bed,
-                set_print_formats, set_repair, set_slicer,
+                set_print_formats, set_repair, set_slicer, set_slicer_path, set_print_colors,
                 active_model_path, lib_active_model_path],
         outputs=[settings_modal, btn_settings, export_settings,
                  gen_export_state, *gen_dl_buttons, gen_slicer_btn,
@@ -2781,6 +3015,11 @@ with gr.Blocks(title=page_title) as demo:
         "engine": (ai_model_dropdown, [ENGINE_HUNYUAN, ENGINE_SF3D], str),
         "vram": (vram_dropdown, VRAM_PROFILE_CHOICES, str),
         "texture": (chk_texture, None, bool),
+        "depth": (chk_depth, None, bool),
+        "max_quality": (chk_max_quality, None, bool),
+        "material": (material_dropdown, list(MATERIAL_PRESETS), str),
+        "relief": (relief_dropdown, list(TEXTURE_RELIEF_LEVELS), str),
+        "projection": (chk_projection, None, bool),
         "model_name": (txt_model_name, None, str),
         "shading": (viewer_shading_mode, SHADING_CHOICES, str),
         "bg": (viewer_bg_choice, BG_CHOICES, str),

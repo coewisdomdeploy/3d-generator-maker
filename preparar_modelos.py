@@ -9,6 +9,7 @@ Uso:
     python preparar_modelos.py check <item>        Código de salida 0 si <item> está listo
     python preparar_modelos.py download <item>     Descarga <item> (reanudable)
     python preparar_modelos.py memoria             Diagnóstico de RAM/VRAM y qué cabrá al generar
+    python preparar_modelos.py optimize paint      Crea la caché fp16 de Hunyuan3D-Paint (una vez)
 
 Items: dit (geometría Hunyuan3D-2), paint (textura Hunyuan3D-Paint),
        sf3d (Stable Fast 3D), rasterizer (extensión CUDA custom_rasterizer; solo check)
@@ -28,6 +29,8 @@ import os
 
 HUNYUAN_REPO = "tencent/Hunyuan3D-2"
 SF3D_REPO = "stabilityai/stable-fast-3d"
+# Estimador de profundidad del refuerzo guiado de "Profundidad mejorada" (debe coincidir con mesh_detail.py)
+DEPTH_REPO = os.environ.get("DEPTH_ESTIMATOR_MODEL", "depth-anything/Depth-Anything-V2-Small-hf")
 
 # Archivos clave de Hunyuan3D-Paint (delight + multivista). El UNet multivista se carga
 # desde el .bin (hy3dgen/texgen/hunyuanpaint/unet/modules.py): su .safetensors duplicado
@@ -47,10 +50,14 @@ DIT_DOWNLOAD_GB = 5.0
 
 ITEMS = {
     "dit": "Geometría Hunyuan3D-2 Turbo (DiT, ~4.9 GB)",
+    "dit_fast": "Geometría Hunyuan3D-2 Fast (OPCIONAL, ~4.9 GB: casilla 'Profundidad mejorada')",
+    "dit_full": "Geometría Hunyuan3D-2 completo (OPCIONAL, ~4.9 GB: casilla 'Máxima calidad')",
+    "depth": "Depth Anything V2 Small (OPCIONAL, ~100 MB: refuerzo guiado de 'Profundidad mejorada')",
     "paint": "Textura Hunyuan3D-Paint (delight + multivista, ~9 GB)",
     "sf3d": "Stable Fast 3D (~3.8 GB, requiere licencia en Hugging Face)",
     "rasterizer": "Extensión CUDA custom_rasterizer (OPCIONAL: sin ella se usa el rasterizador PyTorch)",
-    "meshproc": "mesh_processor nativo C++ (OPCIONAL: acelera el horneado; sin él se usa la versión Python)",
+    "meshproc": "mesh_processor nativo C++ (OPCIONAL: sin él se usa la versión Numba, igual de rápida)",
+    "paint_opt": "Caché optimizada fp16 de Hunyuan3D-Paint (carga más rápida; crear con: optimize paint)",
 }
 
 
@@ -71,6 +78,24 @@ def dit_ready() -> bool:
     rel = Path("hunyuan3d-dit-v2-0-turbo") / "model.fp16.safetensors"
     roots = [HUNYUAN_LOCAL_DIR, *_hf_snapshots(HUNYUAN_REPO)]
     return any(_file_ok(r / rel, 4 * 1024 ** 3) for r in roots)
+
+
+def _dit_variant_ready(subfolder: str) -> bool:
+    # La app carga las variantes desde HUNYUAN_LOCAL_DIR (smart_load_model)
+    rel = Path(subfolder) / "model.fp16.safetensors"
+    return _file_ok(HUNYUAN_LOCAL_DIR / rel, 4 * 1024 ** 3) and _file_ok(HUNYUAN_LOCAL_DIR / rel.parent / "config.yaml")
+
+
+def dit_fast_ready() -> bool:
+    return _dit_variant_ready("hunyuan3d-dit-v2-0-fast")
+
+
+def dit_full_ready() -> bool:
+    return _dit_variant_ready("hunyuan3d-dit-v2-0")
+
+
+def depth_ready() -> bool:
+    return any(_file_ok(s / "model.safetensors", 10 * 1024 ** 2) for s in _hf_snapshots(DEPTH_REPO))
 
 
 def paint_ready() -> bool:
@@ -125,7 +150,8 @@ def meshproc_ready() -> bool:
         return False
 
 
-CHECKS = {"dit": dit_ready, "paint": paint_ready, "sf3d": sf3d_ready, "rasterizer": rasterizer_ready, "meshproc": meshproc_ready}
+CHECKS = {"dit": dit_ready, "dit_fast": dit_fast_ready, "dit_full": dit_full_ready, "depth": depth_ready,
+          "paint": paint_ready, "sf3d": sf3d_ready, "rasterizer": rasterizer_ready, "meshproc": meshproc_ready}
 
 
 def _free_gb() -> float:
@@ -146,6 +172,41 @@ def download_dit() -> int:
         return 1
     import download_model
     return download_model.main()
+
+
+def _download_dit_variant(subfolder: str, label: str) -> int:
+    if not _ensure_space(DIT_DOWNLOAD_GB):
+        return 1
+    from huggingface_hub import snapshot_download
+    print(f"[INFO] Descargando {label} (~4.6 GB) a {HUNYUAN_LOCAL_DIR} (reanudable)...")
+    try:
+        snapshot_download(HUNYUAN_REPO, local_dir=str(HUNYUAN_LOCAL_DIR), allow_patterns=[
+            f"{subfolder}/config.yaml", f"{subfolder}/model.fp16.safetensors"])
+    except Exception as e:
+        print(f"[ERROR] No se pudo descargar {label}: {e}")
+        return 1
+    return 0 if _dit_variant_ready(subfolder) else 1
+
+
+def download_dit_fast() -> int:
+    """Variante Fast (destilada de guía, ~30 pasos): más fiel al volumen que la Turbo de 5 pasos."""
+    return _download_dit_variant("hunyuan3d-dit-v2-0-fast", "Hunyuan3D-2 Fast")
+
+
+def download_dit_full() -> int:
+    """Modelo completo (sin destilar, 50 pasos con guía): el más fiel a la imagen ("Máxima calidad")."""
+    return _download_dit_variant("hunyuan3d-dit-v2-0", "Hunyuan3D-2 completo")
+
+
+def download_depth() -> int:
+    from huggingface_hub import snapshot_download
+    print(f"[INFO] Descargando {DEPTH_REPO} (~100 MB) a {os.environ['HUGGINGFACE_HUB_CACHE']}...")
+    try:
+        snapshot_download(DEPTH_REPO)
+    except Exception as e:
+        print(f"[ERROR] No se pudo descargar Depth Anything V2: {e}")
+        return 1
+    return 0 if depth_ready() else 1
 
 
 def download_paint() -> int:
@@ -179,7 +240,128 @@ def download_sf3d() -> int:
     return 0 if sf3d_ready() else 1
 
 
-DOWNLOADS = {"dit": download_dit, "paint": download_paint, "sf3d": download_sf3d}
+DOWNLOADS = {"dit": download_dit, "dit_fast": download_dit_fast, "dit_full": download_dit_full,
+             "depth": download_depth, "paint": download_paint, "sf3d": download_sf3d}
+
+# ------------------------------------------------------------------------------
+# Caché optimizada de Hunyuan3D-Paint: pesos en fp16 + safetensors, convertidos UNA vez.
+# El modelo se ejecuta en fp16, así que el resultado es idéntico; cada generación lee
+# ~2.5 GB menos del disco y no convierte fp32 -> fp16 en la CPU.
+# ------------------------------------------------------------------------------
+PAINT_OPT_DIR = MODELS_ROOT / "optimized" / "Hunyuan3D-2"
+PAINT_OPT_MARKER = PAINT_OPT_DIR / "optimized_ok.json"
+PAINT_OPT_VERSION = 1
+PAINT_SUBFOLDERS = ("hunyuan3d-delight-v2-0", "hunyuan3d-paint-v2-0")
+
+
+def _paint_source_root() -> Path | None:
+    for root in [HUNYUAN_LOCAL_DIR, *_hf_snapshots(HUNYUAN_REPO)]:
+        if all(_file_ok(root / f) for f in PAINT_KEY_FILES):
+            return root
+    return None
+
+
+def paint_opt_ready() -> bool:
+    import json
+    try:
+        info = json.loads(PAINT_OPT_MARKER.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return info.get("version") == PAINT_OPT_VERSION and all((PAINT_OPT_DIR / s).is_dir() for s in PAINT_SUBFOLDERS)
+
+
+def _stream_save_safetensors(state: dict, dst: Path) -> None:
+    """
+    Escribe un .safetensors estándar tensor a tensor. safetensors.save_file arma el archivo
+    entero en memoria (hasta +3.5 GB de RAM); así el pico es solo el tensor en curso.
+    Formato: u64 longitud de cabecera + cabecera JSON (alineada a 8) + datos en orden.
+    """
+    import json
+    import struct
+    import torch
+    names = {torch.float16: "F16", torch.float32: "F32", torch.bfloat16: "BF16", torch.float64: "F64",
+             torch.int64: "I64", torch.int32: "I32", torch.int16: "I16", torch.int8: "I8",
+             torch.uint8: "U8", torch.bool: "BOOL"}
+    header, offset = {}, 0
+    for key, t in state.items():
+        size = t.numel() * t.element_size()
+        header[key] = {"dtype": names[t.dtype], "shape": list(t.shape), "data_offsets": [offset, offset + size]}
+        offset += size
+    header["__metadata__"] = {"format": "pt"}
+    blob = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    blob += b" " * (-len(blob) % 8)
+    with open(dst, "wb") as fh:
+        fh.write(struct.pack("<Q", len(blob)))
+        fh.write(blob)
+        for t in state.values():
+            raw = t.detach().contiguous().cpu()
+            # bytes del tensor sin conversión de tipo (bf16/bool incluidos)
+            fh.write(raw.view(torch.uint8).numpy().tobytes() if raw.dtype != torch.bool else raw.numpy().tobytes())
+
+
+def optimize_paint() -> int:
+    """Convierte los pesos de Hunyuan3D-Paint a fp16 safetensors en <modelos>/optimized (solo CPU)."""
+    import json
+    import shutil as _sh
+    src_root = _paint_source_root()
+    if src_root is None:
+        print("[ERROR] Faltan los pesos de Hunyuan3D-Paint. Ejecuta primero: preparar_modelos.py download paint")
+        return 1
+    if not _ensure_space(7.0):
+        return 1
+    import torch
+    from safetensors import safe_open
+
+
+    def read_fp16(path: Path) -> dict:
+        """Lee tensor a tensor (mmap) y convierte a fp16: la RAM solo aloja la versión fp16."""
+        if path.suffix == ".bin":
+            state = torch.load(str(path.resolve()), map_location="cpu", weights_only=True, mmap=True)
+            return {k: (v.to(torch.float16) if v.is_floating_point() else v).contiguous() for k, v in state.items()}
+        out = {}
+        with safe_open(str(path.resolve()), framework="pt", device="cpu") as f:
+            for k in f.keys():
+                v = f.get_tensor(k)
+                out[k] = (v.to(torch.float16) if v.is_floating_point() else v).contiguous()
+        return out
+
+    def save(state: dict, dst: Path) -> None:
+        _stream_save_safetensors(state, dst)
+
+    tmp_dir = PAINT_OPT_DIR.with_name(PAINT_OPT_DIR.name + ".tmp")
+    _sh.rmtree(tmp_dir, ignore_errors=True)
+    t0 = __import__("time").time()
+    for sub in PAINT_SUBFOLDERS:
+        for src_dir in sorted({p.parent for p in (src_root / sub).rglob("*")} | {src_root / sub}):
+            if not src_dir.is_dir():
+                continue
+            rel = src_dir.relative_to(src_root)
+            dst_dir = tmp_dir / rel
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            files = [f for f in src_dir.iterdir() if f.is_file() or f.is_symlink()]
+            weights = [f for f in files if f.suffix in (".safetensors", ".bin")]
+            for f in files:
+                if f not in weights:
+                    _sh.copyfile(f.resolve(), dst_dir / f.name)
+            if not weights:
+                continue
+            # El UNet multivista se carga desde su .bin (su .safetensors no es el que usa hy3dgen)
+            is_mv_unet = rel.as_posix() == "hunyuan3d-paint-v2-0/unet"
+            bins = [f for f in weights if f.suffix == ".bin"]
+            sts = [f for f in weights if f.suffix == ".safetensors"]
+            source = bins[0] if (is_mv_unet and bins) else (sts[0] if sts else bins[0])
+            state = read_fp16(source)
+            out_name = "model.safetensors" if rel.name == "text_encoder" else "diffusion_pytorch_model.safetensors"
+            save(state, dst_dir / out_name)
+            del state
+            print(f"  [OK] {rel.as_posix()}/{out_name} <- {source.name}")
+    _sh.rmtree(PAINT_OPT_DIR, ignore_errors=True)
+    PAINT_OPT_DIR.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir.rename(PAINT_OPT_DIR)
+    PAINT_OPT_MARKER.write_text(json.dumps({"version": PAINT_OPT_VERSION, "source": str(src_root)}), encoding="utf-8")
+    size = sum(f.stat().st_size for f in PAINT_OPT_DIR.rglob("*") if f.is_file()) / (1024 ** 3)
+    print(f"[OK] Caché optimizada de Hunyuan3D-Paint lista en {PAINT_OPT_DIR} ({size:.1f} GB, {__import__('time').time() - t0:.0f}s)")
+    return 0
 
 # Debe coincidir con MODEL_MEMORY_GB / RAM_SAFETY_MARGIN_GB de img2glb.py (aquí no se importa
 # img2glb para no cargar torch ni inicializar CUDA)
@@ -265,11 +447,16 @@ def print_status() -> None:
         print(f"  {mark} {label}")
 
 
+CHECKS["paint_opt"] = paint_opt_ready
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Comprueba y descarga los pesos de los modelos 3D")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
     sub.add_parser("memoria")
+    p_opt = sub.add_parser("optimize")
+    p_opt.add_argument("item", choices=["paint"])
     p_check = sub.add_parser("check")
     p_check.add_argument("item", choices=list(CHECKS))
     p_dl = sub.add_parser("download")
@@ -282,6 +469,11 @@ def main() -> int:
     if args.cmd == "memoria":
         print_memory()
         return 0
+    if args.cmd == "optimize":
+        if paint_opt_ready():
+            print(f"[OK] La caché optimizada de Hunyuan3D-Paint ya existe en {PAINT_OPT_DIR}")
+            return 0
+        return optimize_paint()
     if args.cmd == "check":
         return 0 if CHECKS[args.item]() else 1
     if CHECKS[args.item]():

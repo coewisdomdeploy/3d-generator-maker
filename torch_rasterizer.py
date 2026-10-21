@@ -10,7 +10,8 @@ lo único que impide usar Hunyuan3D-Paint sin Visual Studio Build Tools + CUDA T
 Reproduce el kernel original (hy3dgen/texgen/custom_rasterizer):
   - Coordenadas de pantalla: x = (X/W*0.5+0.5)*(ancho-1)+0.5, y = (0.5+0.5*Y/W)*(alto-1)+0.5,
     z = Z/W*0.49999+0.5, muestreo en el centro del píxel (px+0.5, py+0.5).
-  - Baricéntricas por cocientes de áreas con signo (sin descarte de caras traseras).
+  - Baricéntricas por cocientes de áreas con signo (sin descarte de caras traseras);
+    se descartan los fragmentos con profundidad < 0, como el kernel sin depth prior.
   - Z-buffer con token int64 = z_cuantizada * MAXINT + (cara + 1) y mínimo atómico
     (aquí scatter_reduce "amin"), z cuantizada con 2^18 como en el original.
   - Baricéntricas finales con corrección de perspectiva (divididas por W y normalizadas).
@@ -100,9 +101,12 @@ def rasterize(pos: torch.Tensor, tri: torch.Tensor, resolution, clamp_depth=None
 
             a, b, c = _barycentric(fx[rep, 0], fy[rep, 0], fx[rep, 1], fy[rep, 1], fx[rep, 2], fy[rep, 2], pxc, pyc)
             inside = (a >= 0) & (a <= 1) & (b >= 0) & (b <= 1) & (c >= 0) & (c <= 1)
+            depth = a * fz[rep, 0] + b * fz[rep, 1] + c * fz[rep, 2]
+            # El kernel original descarta depth < 0 (umbral 0 sin depth prior)
+            inside &= depth >= 0
             if inside.any():
                 rep, px, py = rep[inside], px[inside], py[inside]
-                depth = a[inside] * fz[rep, 0] + b[inside] * fz[rep, 1] + c[inside] * fz[rep, 2]
+                depth = depth[inside]
                 zq = (depth * _Z_SCALE).to(torch.int64)          # Truncado hacia cero, como en C
                 token = zq * _MAXINT + (rep + 1)
                 zbuf.scatter_reduce_(0, py * width + px, token, reduce="amin", include_self=True)

@@ -41,6 +41,8 @@ import trimesh
 import trimesh.smoothing
 import pygltflib
 
+from mesh_detail import estimate_relative_depth, depth_guided_warp, follow_frame, bake_normal_map, silhouette_iou
+
 # Desactivar OpenCL en OpenCV para evitar que utilice la GPU integrada Intel
 try:
     import cv2
@@ -122,8 +124,10 @@ MODEL_MEMORY_GB = {
     "shape": {"ram_load": 1.0, "ram_staged": 5.0, "vram": 3.2, "vram_full": 6.0},
     # Paint: delight (~2.1 GB) y multivista (~4.3 GB) se cargan directo a la GPU de uno en uno;
     # el multivista baja hasta ~3.2 GB transmitiendo sus bloques (ver PAINT_MV_TIERS)
-    "paint": {"ram_load": 3.0, "vram": 3.5, "vram_full": 9.0},
-    "sf3d":  {"ram_load": 4.5, "vram": 6.0},   # model.safetensors 3.8 GB (fp32)
+    "paint": {"ram_load": 3.0, "ram_load_opt": 1.5, "vram": 3.5, "vram_full": 9.0},
+    # SF3D: 3.8 GB fp32 en disco; en GPU ~2.6 GB (codificador y backbone en bf16, ver
+    # _sf3d_prepare_inference) + ~1 GB de horneado por lotes
+    "sf3d":  {"ram_load": 4.5, "vram": 4.0},
 }
 
 _MODEL_CACHE: dict = {}
@@ -793,6 +797,10 @@ def apply_taubin_smoothing(
 
     print(f" -> [Taubin Smoothing] Suavizando geometría ({len(mesh.faces):,} caras, lamb={lamb}, nu={nu}, {iterations} iters)...")
     try:
+        # trimesh aplica el paso inverso como "vertices -= nu * laplaciano": con nu negativo los dos
+        # pasos suavizan, así que en la práctica es un Laplaciano. Es intencionado: quita los bultos
+        # de pocos vóxeles del generador mucho mejor que un Taubin real (nu positivo) y apenas
+        # adelgaza (~1 % de fondo en 5 iteraciones). No cambiar el signo sin volver a medirlo.
         smoothed = trimesh.smoothing.filter_taubin(
             mesh,
             lamb=float(lamb),
@@ -1334,9 +1342,8 @@ def decimate_mesh_preserving_texture(
             if orig_mat is not None:
                 decimated_mesh.visual.material = orig_mat
 
+            # Se conserva el material original con su acabado (mate, satinado o metal)
             if hasattr(decimated_mesh.visual, "material") and decimated_mesh.visual.material is not None:
-                decimated_mesh.visual.material.metallicFactor = 0.0
-                decimated_mesh.visual.material.roughnessFactor = 0.90
                 decimated_mesh.visual.material.doubleSided = True
 
             reduction = (1.0 - (len(decimated_mesh.faces) / current_faces)) * 100.0
@@ -1437,6 +1444,119 @@ def decimate_mesh_to_target_faces(
 # ==============================================================================
 # 4. Centrado en el Origen (0,0,0) y Normalización para Godot
 # ==============================================================================
+
+# ==============================================================================
+# Profundidad del modelo: medición, refuerzo y ajustes de "Profundidad mejorada" / "Máxima calidad"
+# ==============================================================================
+# Tras center_and_orient_mesh el modelo queda con Y hacia arriba y Z como eje de fondo
+# (el eje de la cámara de la imagen de entrada).
+# Solo se engorda lo que sale casi de papel: una moneda o una placa miden ~8-12 % de fondo de
+# verdad y forzar más las infla. Para personajes que salen tipo cartón, subirlo en .env (~0.30).
+DEPTH_MIN_RATIO = float(os.environ.get("DEPTH_MIN_RATIO", "0.08"))
+DEPTH_FAST_STEPS = 30
+# Semillas que se prueban con "Profundidad mejorada"; gana la que más se parece a la silueta de la imagen
+DEPTH_SEED_CANDIDATES = max(1, int(os.environ.get("DEPTH_SEED_CANDIDATES", "3")))
+# Octree con el que se decodifica cada semilla candidata solo para medir su fondo (rápido)
+DEPTH_SCORE_OCTREE = 128
+# "Máxima calidad": modelo completo (sin destilar) con guía; cada pasada cuesta ~3x la Fast
+MAX_QUALITY_SUBFOLDER = "hunyuan3d-dit-v2-0"
+MAX_QUALITY_STEPS = 50
+MAX_QUALITY_GUIDANCE = float(os.environ.get("MAX_QUALITY_GUIDANCE", "6.0"))
+MAX_QUALITY_SEED_CANDIDATES = 2
+
+
+def measure_depth_ratio(mesh: trimesh.Trimesh) -> float:
+    """Fondo (Z) respecto a la mayor dimensión frontal (X/Y): ~0.15 = cartón, >0.4 = volumen normal."""
+    ext = np.asarray(mesh.extents, dtype=np.float64)
+    front = max(ext[0], ext[1])
+    return float(ext[2] / front) if front > 1e-9 else 0.0
+
+
+def reinforce_depth(
+    mesh: trimesh.Trimesh,
+    min_ratio: float = DEPTH_MIN_RATIO,
+    image: Optional[Image.Image] = None,
+    companions: tuple = ()
+) -> Tuple[trimesh.Trimesh, float, float, str]:
+    """
+    Si el modelo salió plano (fondo < min_ratio), lo engorda en Z hasta min_ratio:
+      - Con `image`: guiado por la profundidad estimada (Depth Anything V2): crece más donde la
+        imagen sobresale y se redondea hacia los bordes, en vez de estirar todo por igual.
+      - Lo que falte (o sin estimador) se completa estirando solo en Z alrededor del centro.
+    `companions` (p. ej. la malla HD del normal map) reciben exactamente la misma deformación.
+    Devuelve (malla, proporción antes, proporción después, método: "", "guiado" o "uniforme").
+    """
+    before = measure_depth_ratio(mesh)
+    if before <= 0 or before >= min_ratio:
+        return mesh, before, before, ""
+    method = "uniforme"
+    estimate = estimate_relative_depth(image) if image is not None else None
+    if estimate is not None:
+        front = float(max(mesh.extents[0], mesh.extents[1]))
+        warp = depth_guided_warp(mesh, *estimate, target_depth=min_ratio * front)
+        if warp is not None:
+            for m in (mesh, *companions):
+                m.vertices = warp(m.vertices)
+            method = "guiado"
+
+    current = measure_depth_ratio(mesh)
+    if 0 < current < min_ratio:
+        factor = min_ratio / current
+        center_z = float(mesh.bounds.mean(axis=0)[2])
+        transform = np.eye(4)
+        transform[2, 2] = factor
+        transform[2, 3] = center_z * (1.0 - factor)
+        for m in (mesh, *companions):
+            m.apply_transform(transform)
+    return mesh, before, measure_depth_ratio(mesh), method
+
+
+def _dit_variant_ready(subfolder: str) -> bool:
+    folder = HUNYUAN_LOCAL_DIR / subfolder
+    return (folder / "model.fp16.safetensors").exists() and (folder / "config.yaml").exists()
+
+
+def shape_quality_settings(octree_requested: int, improved_depth: bool = False, max_quality: bool = False) -> dict:
+    """
+    Ajustes de la geometría Hunyuan3D según las casillas (sin ninguna: Turbo, como siempre):
+      Profundidad mejorada: variante Fast (30 pasos, reconstruye mejor el volumen que no se ve),
+        DEPTH_SEED_CANDIDATES semillas (gana la que más se parece a la silueta), suavizado ligero (2) y refuerzo guiado.
+      Máxima calidad: modelo completo hunyuan3d-dit-v2-0 (50 pasos, guía MAX_QUALITY_GUIDANCE)
+        y suavizado ligero (2). Con las dos casillas, MAX_QUALITY_SEED_CANDIDATES semillas.
+      Cualquiera de las dos: octree 384 (si la decodificación no cabe se reintenta con 256) y el
+        detalle de la malla HD se hornea en un normal map de la malla final.
+    Si falta un modelo se usa el mejor descargado y "missing" dice cuál descargar.
+    """
+    settings = {
+        "shape_subfolder": "hunyuan3d-dit-v2-0-turbo",
+        "steps": None,
+        "guidance": None,
+        "octree": int(octree_requested or 256),
+        "taubin_iterations": 5,
+        "seeds": 1,
+        "normal_map": False,
+        "missing": None,
+    }
+    if not (improved_depth or max_quality):
+        return settings
+    has_fast = _dit_variant_ready("hunyuan3d-dit-v2-0-fast")
+    fast = {"shape_subfolder": "hunyuan3d-dit-v2-0-fast", "steps": DEPTH_FAST_STEPS} if has_fast else {}
+    settings.update(octree=max(settings["octree"], 384), normal_map=True)
+    if improved_depth:
+        settings.update(taubin_iterations=2, seeds=DEPTH_SEED_CANDIDATES, **fast)
+        if not has_fast:
+            settings["missing"] = ("dit_fast", "Hunyuan3D-2 Fast")
+    if max_quality:
+        settings["taubin_iterations"] = 2
+        if _dit_variant_ready(MAX_QUALITY_SUBFOLDER):
+            settings.update(shape_subfolder=MAX_QUALITY_SUBFOLDER, steps=MAX_QUALITY_STEPS,
+                            guidance=MAX_QUALITY_GUIDANCE,
+                            seeds=min(settings["seeds"], MAX_QUALITY_SEED_CANDIDATES))
+        else:
+            settings.update(**fast)
+            settings["missing"] = ("dit_full", "Hunyuan3D-2 completo")
+    return settings
+
 
 def center_and_orient_mesh(
     mesh: trimesh.Trimesh,
@@ -1552,6 +1672,19 @@ def hunyuan_paint_available() -> bool:
         except Exception as e:
             _PAINT_UNAVAILABLE_REASON = f"no se pudo importar hy3dgen.texgen ({e})"
         print(f" -> [Hunyuan3D-Paint] Rasterizador: {PAINT_RASTERIZER}")
+        # Relleno de huecos por vértice: la versión Python de hy3dgen tarda 40-80 s; si no está
+        # la versión C++ compilada se usa la de Numba (mismo algoritmo y resultado, <1 s)
+        try:
+            import hy3dgen.texgen.differentiable_renderer.mesh_processor as mesh_processor_mod
+            import hy3dgen.texgen.differentiable_renderer.mesh_render as mesh_render_mod
+            if str(getattr(mesh_processor_mod, "__file__", "")).endswith(".py"):
+                import fast_mesh_inpaint
+                mesh_render_mod.meshVerticeInpaint = fast_mesh_inpaint.meshVerticeInpaint
+                print(" -> [Hunyuan3D-Paint] Relleno de huecos: Numba (compilado al vuelo)")
+            else:
+                print(" -> [Hunyuan3D-Paint] Relleno de huecos: mesh_processor nativo C++")
+        except Exception as e_mp:
+            print(f" -> [Hunyuan3D-Paint] Relleno de huecos: versión Python ({e_mp})")
     return _PAINT_UNAVAILABLE_REASON is None
 
 
@@ -1581,12 +1714,20 @@ def _lowmem_unet2p5d_from_pretrained(unet_cls):
                 config = json.load(fh)
             with torch.device("meta"):
                 unet = unet_cls(module.UNet2DConditionModel(**config))
-            ckpt = torch.load(
-                os.path.join(pretrained_model_name_or_path, "diffusion_pytorch_model.bin"),
-                map_location="cpu", weights_only=True, mmap=True
-            )
-            state = {k: (v.to(target, torch_dtype) if v.is_floating_point() else v.to(target)) for k, v in ckpt.items()}
-            del ckpt
+            bin_path = os.path.join(pretrained_model_name_or_path, "diffusion_pytorch_model.bin")
+            st_path = os.path.join(pretrained_model_name_or_path, "diffusion_pytorch_model.safetensors")
+            if not os.path.exists(bin_path) and os.path.exists(st_path):
+                # Caché optimizada (fp16 safetensors): lectura directa al dispositivo destino
+                from safetensors import safe_open
+                state = {}
+                with safe_open(st_path, framework="pt", device=str(target)) as f:
+                    for k in f.keys():
+                        v = f.get_tensor(k)
+                        state[k] = v.to(torch_dtype) if v.is_floating_point() else v
+            else:
+                ckpt = torch.load(bin_path, map_location="cpu", weights_only=True, mmap=True)
+                state = {k: (v.to(target, torch_dtype) if v.is_floating_point() else v.to(target)) for k, v in ckpt.items()}
+                del ckpt
             unet.load_state_dict(state, strict=True, assign=True)
             del state
             if any(t.is_meta for t in list(unet.parameters()) + list(unet.buffers())):
@@ -1666,6 +1807,20 @@ def _on_demand_gpu(module: torch.nn.Module, device: str) -> None:
     module.register_forward_hook(post)
 
 
+def _pin_pipeline_device(pipe, device: str) -> None:
+    """
+    diffusers deduce pipe.device / _execution_device del "primer" componente, en el orden de un
+    set (cambia en cada arranque de Python). Con el text encoder en CPU a veces devolvía "cpu":
+    la imagen se quedaba en CPU con el VAE en la GPU. Se fija al dispositivo de cálculo.
+    """
+    dev = torch.device(device)
+    cls = type(pipe)
+    pipe.__class__ = type(cls.__name__, (cls,), {
+        "device": property(lambda self: dev),
+        "_execution_device": property(lambda self: dev),
+    })
+
+
 def _stream_unet_blocks(unet2p5d: torch.nn.Module, device: str, stream=("unet", "unet_dual")) -> int:
     """
     Los bloques grandes del UNet conservan sus pesos en CPU (respaldados por el archivo) y se
@@ -1709,7 +1864,9 @@ def _stream_unet_blocks(unet2p5d: torch.nn.Module, device: str, stream=("unet", 
                         slots.append((m, n, False, b))
 
             def pre(mod, args, _slots=slots):
-                with torch.inference_mode(False), torch.no_grad():
+                # Hereda el modo de quien llama: forzar inference_mode(False) aquí rompe el
+                # conv2d si los pesos se crearon dentro de inference_mode
+                with torch.no_grad():
                     for m, n, is_param, cpu in _slots:
                         gpu = cpu.to(device, non_blocking=True)
                         if is_param:
@@ -1762,6 +1919,7 @@ def _build_multiview_net(config, tier: str):
         pipe.to(device)
     else:
         _on_demand_gpu(pipe.text_encoder, device)
+        _pin_pipeline_device(pipe, device)
         stream = ("unet", "unet_dual") if tier == "bloques" else ("unet_dual",)
         n = _stream_unet_blocks(pipe.unet, device, stream=stream)
         print(f" -> [Carga] UNet multivista: {n} bloques ({', '.join(stream)}) se transmiten a la GPU al usarse")
@@ -1769,12 +1927,103 @@ def _build_multiview_net(config, tier: str):
     return net
 
 
+class _PaintProgress:
+    """Cronómetro y avance en vivo de las etapas de Hunyuan3D-Paint (consola + WebUI)."""
+
+    def __init__(self, callback: Optional[Callable[[str, int], None]] = None):
+        self.callback = callback
+        self.times: list = []
+
+    def report(self, msg: str, pct: int) -> None:
+        if self.callback:
+            try:
+                self.callback(f"[4/4] {msg}", int(pct))
+            except Exception:
+                pass
+
+    def stage(self, label: str, fn: Callable, pct: int) -> Callable:
+        def timed(*args, **kwargs):
+            print(f" -> [Paint] {label}...")
+            self.report(f"{label}...", pct)
+            t0 = time.time()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                self.times.append((label, time.time() - t0))
+        return timed
+
+    def submodel(self, label: str, pct_start: int, pct_end: int, steps: int) -> "_SubmodelProgress":
+        return _SubmodelProgress(self, label, pct_start, pct_end, steps)
+
+    def summary(self, total_s: float) -> str:
+        merged: dict = {}
+        for label, secs in self.times:
+            merged[label] = merged.get(label, 0.0) + secs
+        parts = [f"{label.split(' (')[0]} {secs:.0f}s" for label, secs in merged.items()]
+        return " | ".join(parts + [f"total {total_s:.0f}s"])
+
+
+class _SubmodelProgress:
+    """Avance de un submodelo de Paint: carga y cada paso de difusión (cuenta llamadas al UNet)."""
+
+    def __init__(self, tracker: _PaintProgress, label: str, pct_start: int, pct_end: int, steps: int):
+        self.tracker = tracker
+        self.label = label
+        self.pct_start = pct_start
+        self.pct_end = pct_end
+        self.steps = steps
+        self.count = 0
+        self.tier: Optional[str] = None
+        self.t0 = 0.0
+
+    def begin(self, tier: Optional[str]) -> None:
+        self.count = 0
+        self.t0 = time.time()
+        self.tier = tier
+        self.tracker.report(f"{self.label}: cargando modelo en GPU...", self.pct_start)
+
+    def step(self) -> None:
+        self.count += 1
+        done = min(self.count, self.steps)
+        pct = self.pct_start + (self.pct_end - self.pct_start) * done / max(self.steps, 1)
+        where = f" ({self.tier})" if self.tier else ""
+        self.tracker.report(f"{self.label}{where}: paso {done}/{self.steps}", int(pct))
+
+    def end(self) -> None:
+        self.tracker.times.append((self.label, time.time() - self.t0))
+
+
+def _paint_vram_stats_file() -> Path:
+    return MODELS_ROOT / "paint_vram_stats.json"
+
+
+def _load_paint_vram_stats() -> dict:
+    import json
+    try:
+        return json.loads(_paint_vram_stats_file().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_paint_vram_stat(key: str, peak_gb: float) -> None:
+    import json
+    stats = _load_paint_vram_stats()
+    stats[key] = round(peak_gb, 2)
+    try:
+        _paint_vram_stats_file().write_text(json.dumps(stats, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 class _LazyPaintModel:
     """
     Submodelo de Hunyuan3D-Paint (delight o multivista) que se carga directo a la GPU solo
     cuando el pipeline lo llama, en la ubicación que quepa en la VRAM libre. Si se queda sin
-    VRAM, se reintenta con la siguiente ubicación. Con keep=False (modo "stream") se libera
-    al terminar, así delight y multivista nunca coinciden en la VRAM.
+    VRAM, se reintenta con la siguiente ubicación. Con keep=False (modo "stream") no coincide
+    en la VRAM con el otro submodelo: al terminar se libera o, en ubicación "gpu" y si sobra
+    RAM, se conserva en RAM para no releerlo del disco en la siguiente generación.
+    La VRAM real de cada ubicación se mide y se guarda (paint_vram_stats.json): las siguientes
+    generaciones eligen con datos reales en lugar de estimaciones.
     """
 
     def __init__(self, name: str, factory: Callable[[str], Any], device: str, tiers: tuple, vram_gb: dict):
@@ -1786,16 +2035,26 @@ class _LazyPaintModel:
         self.keep = False
         self.instance = None
         self.tier = None
+        self.parked = False
+        self.progress: Optional[_SubmodelProgress] = None
 
     @property
     def pipeline(self):
         return getattr(self.instance, "pipeline", None)
 
+    def _need_gb(self, tier: str) -> float:
+        measured = _load_paint_vram_stats().get(f"{self.name}:{tier}")
+        return measured * 1.05 + 0.2 if measured else self.vram_gb.get(tier, 0.0)
+
     def _pick_tiers(self) -> list:
         free = _vram_free_gb() if "cuda" in self.device else float("inf")
-        fitting = [t for t in self.tiers if free >= self.vram_gb.get(t, 0.0)]
+        fitting = [t for t in self.tiers if free >= self._need_gb(t)]
         start = self.tiers.index(fitting[0]) if fitting else len(self.tiers) - 1
         return list(self.tiers[start:])
+
+    def _on_unet_forward(self, *_):
+        if self.progress:
+            self.progress.step()
 
     def _load(self, tier: str) -> None:
         t0 = time.time()
@@ -1803,39 +2062,93 @@ class _LazyPaintModel:
         cap_vram_to_physical()
         self.instance = self.factory(tier)
         self.tier = tier
+        self.parked = False
         for opt in ("enable_vae_slicing", "enable_vae_tiling"):
             if hasattr(self.pipeline, opt):
                 try:
                     getattr(self.pipeline, opt)()
                 except Exception:
                     pass
+        unet = getattr(self.pipeline, "unet", None)
+        if isinstance(unet, torch.nn.Module):
+            unet.register_forward_hook(self._on_unet_forward)
         print(f" -> [Carga] Paint '{self.name}' (ubicación '{tier}') en {time.time() - t0:.1f}s")
         print_real_vram_status(f"Paint '{self.name}' cargado")
 
     def _drop(self) -> None:
         self.instance = None
         self.tier = None
+        self.parked = False
         flush_vram()
 
+    def _size_gb(self) -> float:
+        mods = (getattr(self.pipeline, n, None) for n in ("unet", "text_encoder", "vae"))
+        return sum(_model_size_gb("sf3d", m) for m in mods if isinstance(m, torch.nn.Module))
+
+    def _park_or_drop(self) -> None:
+        """Tras usarse: a la RAM si es ubicación "gpu" y sobra memoria; si no, se libera."""
+        size = self._size_gb()
+        if KEEP_MODELS_IN_RAM and self.tier == "gpu" and _system_ram_free_gb() - size >= RAM_PARK_MIN_FREE_GB:
+            self.pipeline.to("cpu")
+            self.parked = True
+            flush_vram()
+            print(f" -> [Memoria] Paint '{self.name}' ({size:.1f} GB) conservado en RAM para la próxima generación")
+        else:
+            self._drop()
+            print_real_vram_status(f"Paint '{self.name}' liberado")
+
+    def _start_measure(self) -> float:
+        """VRAM del proceso antes de cargar/subir el submodelo; el pico medido incluye sus pesos."""
+        if not torch.cuda.is_available():
+            return 0.0
+        flush_vram()
+        torch.cuda.reset_peak_memory_stats(0)
+        return torch.cuda.memory_reserved(0) / (1024 ** 3)
+
     def __call__(self, *args, **kwargs):
-        if self.instance is not None and self.tier in ("gpu",) and self.pipeline is not None:
-            self.pipeline.to(self.device)  # Venía aparcado en RAM
+        start_gb = self._start_measure()
+        if self.instance is not None and self.parked:
+            if self.tier in self._pick_tiers():
+                cap_vram_to_physical()
+                self.pipeline.to(self.device)  # Venía aparcado en RAM: sin leer el disco
+                self.parked = False
+                print(f" -> [Carga] Paint '{self.name}' reutilizado desde RAM")
+            else:
+                self._drop()
         tiers = [self.tier] if self.instance is not None else self._pick_tiers()
+        if self.progress:
+            self.progress.begin(tiers[0])
         try:
             for i, tier in enumerate(tiers):
+                if i > 0:
+                    start_gb = self._start_measure()
                 if self.instance is None:
-                    self._load(tier)
+                    # Paint se llama dentro de inference_mode: los pesos se crean fuera para que
+                    # sean tensores normales (mover/transmitir por bloques/aparcar sin errores)
+                    with torch.inference_mode(False), torch.no_grad():
+                        self._load(tier)
+                if self.progress:
+                    self.progress.tier = tier
+                    self.progress.count = 0
                 try:
-                    return self.instance(*args, **kwargs)
+                    result = self.instance(*args, **kwargs)
                 except torch.cuda.OutOfMemoryError:
                     self._drop()
                     if i + 1 >= len(tiers):
                         raise
                     print(f" -> [Memoria] Paint '{self.name}' sin VRAM en '{tier}': reintentando con '{tiers[i + 1]}'...")
+                    continue
+                if torch.cuda.is_available():
+                    # Pesos + cálculo de este submodelo, por encima de lo que ya ocupaba el proceso
+                    used_gb = torch.cuda.max_memory_reserved(0) / (1024 ** 3) - start_gb
+                    _save_paint_vram_stat(f"{self.name}:{tier}", max(used_gb, 0.0))
+                    print(f" -> [Memoria] Paint '{self.name}' en '{tier}': usó {used_gb:.2f} GB de VRAM (medido)")
+                return result
         finally:
-            if not self.keep and self.instance is not None:
-                self._drop()
-                print_real_vram_status(f"Paint '{self.name}' liberado")
+            if self.progress:
+                self.progress.end()
+            if not self.keep and self.instance is not None and not self.parked:
+                self._park_or_drop()
 
 
 class Hunyuan3DGenerator:
@@ -1880,6 +2193,9 @@ class Hunyuan3DGenerator:
         self.shape_mode_pref = "full" if low_vram_mode is False else SHAPE_LOAD_MODE
         self.max_octree = pcfg["max_octree"]
         self.paint_resolution = pcfg["paint_resolution"]
+        # Última geometría: malla HD sin reducir (para el normal map) y semillas probadas
+        self.last_hd_mesh = None
+        self.last_seed_report = None
 
         print(f"[Hunyuan3D] Dispositivo: {self.device.upper()} | Tipo de dato: {self.dtype} | Perfil VRAM: {self.vram_profile_name} | Carga: {self.shape_mode_pref}")
         if "cuda" in str(self.device):
@@ -1985,6 +2301,7 @@ class Hunyuan3DGenerator:
         pipe._studio_cfg = cfg
         pipe._studio_ckpt = ckpt
         pipe._studio_dtype = self.dtype
+        pipe._studio_subfolder = self.shape_subfolder
         pipe._studio_orig_encode_cond = pipe.encode_cond
         pipe._studio_orig_export = pipe._export
         return pipe
@@ -2002,7 +2319,8 @@ class Hunyuan3DGenerator:
         """Devuelve el pipeline de forma listo, con el modo de carga que menos RAM necesita."""
         mem = MODEL_MEMORY_GB["shape"]
         cached = activate_model("shape", vram_needed_gb=mem["vram"], ram_needed_gb=mem["ram_load"])
-        if cached is not None and getattr(cached, "_studio_dtype", None) != self.dtype:
+        if cached is not None and (getattr(cached, "_studio_dtype", None) != self.dtype
+                                   or getattr(cached, "_studio_subfolder", None) != self.shape_subfolder):
             release_model("shape")
             cached = None
 
@@ -2029,6 +2347,9 @@ class Hunyuan3DGenerator:
         # pipe.device (CPU) mientras el DiT corre en CUDA y la inferencia falla con
         # "Cannot generate a cpu tensor from a generator of type cuda".
         def staged_encode_cond(*args, **kwargs):
+            # Varias semillas de la misma imagen: la condición se calcula una sola vez
+            if getattr(shape_pipe, "_studio_cond_cache", None) is not None:
+                return shape_pipe._studio_cond_cache
             if mode == "stream":
                 shape_pipe.conditioner = self._load_shape_component(cfg, ckpt, "conditioner", device)
             else:
@@ -2042,9 +2363,14 @@ class Hunyuan3DGenerator:
                 shape_pipe.conditioner.to("cpu")
                 flush_vram()
                 shape_pipe.model.to(device)
+            if getattr(shape_pipe, "_studio_cache_cond", False):
+                shape_pipe._studio_cond_cache = result
             return result
 
         def staged_export(*args, **kwargs):
+            # Semillas candidatas (output_type="latent"): sin decodificar; el DiT sigue en VRAM
+            if (args[1] if len(args) > 1 else kwargs.get("output_type")) == "latent":
+                return shape_pipe._studio_orig_export(*args, **kwargs)
             # Volume Decoding con la VRAM libre de DiT y condicionador
             if mode == "stream":
                 shape_pipe.model = self._meta_shape_component(cfg, "model")
@@ -2055,6 +2381,18 @@ class Hunyuan3DGenerator:
                 flush_vram()
             shape_pipe.vae.to(device)
             print_real_vram_status("Inicio Volume Decoding")
+            octree = args[5] if len(args) > 5 else None
+            try:
+                return shape_pipe._studio_orig_export(*args, **kwargs)
+            except torch.cuda.OutOfMemoryError:
+                if not (octree and octree > 256):
+                    raise
+            # Reintento FUERA del except: dentro, la traza del error retiene los tensores del intento
+            # fallido y la VRAM no se libera. Los latentes ya están calculados: basta con menos detalle.
+            print(f" -> [Memoria] Sin VRAM para decodificar con octree {octree}: reintentando con 256...")
+            flush_vram()
+            args = list(args)
+            args[5] = 256
             return shape_pipe._studio_orig_export(*args, **kwargs)
 
         shape_pipe.encode_cond = staged_encode_cond
@@ -2077,26 +2415,43 @@ class Hunyuan3DGenerator:
         seed: int = 42,
         target_faces: int = 40000,
         progress_callback: Optional[Callable[[str, int], None]] = None,
-        texture_safe_cap: Optional[int] = None
+        texture_safe_cap: Optional[int] = None,
+        taubin_iterations: int = 5,
+        allow_high_octree: bool = False,
+        guidance_scale: Optional[float] = None,
+        seed_candidates: int = 1,
+        keep_hd: bool = False
     ) -> trimesh.Trimesh:
         """
         Etapa 1 - Generación de Geometría (Hunyuan3D-DiT):
         1. Saca de la VRAM cualquier otro modelo (SF3D / Paint) y prepara el pipeline de forma.
         2. Preprocesa el canal alfa con inpainting de bordes (evita halos oscuros).
         3. Inferencia DiT + Volume Decoding con offload por etapas según el perfil de VRAM.
+           Con seed_candidates > 1 prueba varias semillas y se queda la que más se parece a la silueta.
+           guidance_scale solo afecta al modelo completo (Turbo y Fast vienen destilados de guía).
         4. Limpia islas flotantes y reduce polígonos:
              - target_faces > 0: reduce a ese número de caras.
              - target_faces <= 0: conserva la malla completa (HD).
              - texture_safe_cap: tope adicional cuando después se va a texturizar.
+           Con keep_hd la malla sin reducir queda en self.last_hd_mesh (para el normal map).
         5. Suavizado Taubin y aparca el pipeline en RAM (VRAM libre para la Etapa 2).
         """
-        safe_octree = min(int(octree_resolution or 256), self.max_octree)
+        # "Profundidad mejorada" / "Máxima calidad" permiten 384 en cualquier perfil: si la
+        # decodificación no cabe, staged_export reintenta con 256 (los latentes ya están calculados)
+        octree_cap = max(self.max_octree, 384) if allow_high_octree else self.max_octree
+        safe_octree = min(int(octree_resolution or 256), octree_cap)
+        candidates = max(1, int(seed_candidates or 1))
         faces_txt = f"{target_faces:,}" if target_faces and target_faces > 0 else "HD (sin reducir)"
         print(f"\n[Etapa 1/2] Generando geometría 3D pura con Hunyuan3D-DiT ({self.shape_subfolder})...")
-        print(f" -> Pasos DiT: {steps} | Octree: {safe_octree} | Semilla: {seed} | Objetivo caras: {faces_txt}")
+        print(f" -> Pasos DiT: {steps} | Octree: {safe_octree} | Semilla: {seed}"
+              + (f" (+{candidates - 1} candidatas)" if candidates > 1 else "")
+              + (f" | Guía: {guidance_scale}" if guidance_scale is not None else "")
+              + f" | Objetivo caras: {faces_txt}")
         start_t = time.time()
         shape_pipe = None
         discard_shape = False
+        self.last_hd_mesh = None
+        self.last_seed_report = None
 
         try:
             # Preprocesamiento con Inpainting de bordes en canal alfa (cv2.inpaint)
@@ -2106,13 +2461,15 @@ class Hunyuan3DGenerator:
 
             generator = torch.Generator(device=self.device).manual_seed(seed) if seed >= 0 else None
 
-            # Callback para pasos individuales de difusión DiT
+            # Callback para pasos individuales de difusión DiT (con varias semillas, la barra las recorre todas)
+            run = {"index": 0, "label": ""}
+
             def dit_step_callback(step_idx, t, outputs):
                 if progress_callback:
                     cur_step = step_idx + 1
-                    pct = 30 + int((cur_step / max(steps, 1)) * 35) # 30% a 65%
+                    pct = 30 + int(((run["index"] + cur_step / max(steps, 1)) / candidates) * 35) # 30% a 65%
                     vram_mb = torch.cuda.memory_allocated(0) / (1024 ** 2) if torch.cuda.is_available() else 0
-                    progress_callback(f"[3/4] Inferencia DiT en GPU ({vram_mb:.0f} MB): Paso {cur_step}/{steps} ({pct}%)...", pct)
+                    progress_callback(f"[3/4] Inferencia DiT{run['label']} en GPU ({vram_mb:.0f} MB): Paso {cur_step}/{steps} ({pct}%)...", pct)
 
             # Hook para capturar progreso de Volume Decoding en tiempo real
             import tqdm
@@ -2138,18 +2495,23 @@ class Hunyuan3DGenerator:
             safe_chunks = 32000
             print(f" -> [Inferencia DiT] Octree: {safe_octree} | Chunks: {safe_chunks} | Pasos: {steps}")
 
+            call_kwargs = dict(
+                image=prep_image,
+                num_inference_steps=steps,
+                octree_resolution=safe_octree,
+                num_chunks=safe_chunks,
+                callback=dit_step_callback,
+                callback_steps=1
+            )
+            if guidance_scale is not None:
+                call_kwargs["guidance_scale"] = float(guidance_scale)
+
             try:
                 with torch.inference_mode():
-                    outputs = shape_pipe(
-                        image=prep_image,
-                        num_inference_steps=steps,
-                        octree_resolution=safe_octree,
-                        num_chunks=safe_chunks,
-                        generator=generator,
-                        callback=dit_step_callback,
-                        callback_steps=1,
-                        output_type="trimesh"
-                    )
+                    if candidates > 1:
+                        outputs = self._best_seed_shape(shape_pipe, call_kwargs, seed, candidates, run, image, progress_callback)
+                    else:
+                        outputs = shape_pipe(generator=generator, output_type="trimesh", **call_kwargs)
             finally:
                 tqdm.tqdm.update = orig_tqdm_update
 
@@ -2162,6 +2524,9 @@ class Hunyuan3DGenerator:
 
             # Depuración de geometría: eliminar islas parásitas y losas flotantes
             cleaned_mesh = clean_mesh_floating_artifacts(raw_mesh)
+            if keep_hd:
+                # Sin reducir ni suavizar: es la fuente del detalle del normal map
+                self.last_hd_mesh = cleaned_mesh.copy()
 
             # Reducción de polígonos: lo que pida el usuario y, si después se texturiza,
             # como máximo texture_safe_cap (no se pasa una malla de 280k caras al texturizado)
@@ -2176,7 +2541,7 @@ class Hunyuan3DGenerator:
                 decimated_mesh = cleaned_mesh
 
             print(f" -> [Etapa 1/2] Aplicando filtro de suavizado Taubin ({len(decimated_mesh.faces):,} caras)...")
-            smoothed_mesh = apply_taubin_smoothing(decimated_mesh, lamb=0.53, nu=-0.55, iterations=5)
+            smoothed_mesh = apply_taubin_smoothing(decimated_mesh, lamb=0.53, nu=-0.55, iterations=taubin_iterations)
 
             print(f" -> [Etapa 1/2 Completada] Geometría: {len(smoothed_mesh.vertices):,} vértices, {len(smoothed_mesh.faces):,} caras en {time.time() - start_t:.2f}s")
             return smoothed_mesh
@@ -2210,6 +2575,58 @@ class Hunyuan3DGenerator:
                 park_model("shape")
             print_real_vram_status("Post-Etapa 1 (forma aparcada)")
 
+    def _best_seed_shape(
+        self,
+        shape_pipe,
+        call_kwargs: dict,
+        seed: int,
+        count: int,
+        run: dict,
+        image: Image.Image,
+        progress_callback: Optional[Callable[[str, int], None]] = None
+    ):
+        """
+        Prueba `count` semillas de la misma imagen y devuelve la malla cuya vista frontal se parece
+        más a la silueta de la imagen (IoU). No se elige por fondo: eso inflaría los objetos planos.
+          1. DiT por semilla: la condición se calcula una vez y el DiT sigue en VRAM entre semillas.
+          2. Cada candidata se decodifica a octree DEPTH_SCORE_OCTREE (rápido) solo para compararla.
+          3. Solo la ganadora se decodifica con el octree pedido.
+        """
+        mask = np.asarray(image.convert("RGBA"))[..., 3] > 127
+        base = seed if seed >= 0 else int(time.time()) % 100000
+        seeds = [base + i * 1000 for i in range(count)]
+        latents = []
+        shape_pipe._studio_cache_cond = True
+        try:
+            for i, s in enumerate(seeds):
+                run["index"], run["label"] = i, f" · semilla {i + 1}/{count}"
+                generator = torch.Generator(device=self.device).manual_seed(s)
+                latents.append(shape_pipe(generator=generator, output_type="latent", **call_kwargs))
+        finally:
+            shape_pipe._studio_cache_cond = False
+            shape_pipe._studio_cond_cache = None
+
+        num_chunks = call_kwargs["num_chunks"]
+        scores, depths = [], []
+        for i, candidate in enumerate(latents):
+            if progress_callback:
+                progress_callback(f"[3/4] Comparando cada semilla con la imagen ({i + 1}/{count})...", 66)
+            preview = shape_pipe._export(candidate, "trimesh", 1.01, 0.0, num_chunks, DEPTH_SCORE_OCTREE, None, False)
+            preview = preview[0] if isinstance(preview, (list, tuple)) else preview
+            if preview is None or len(preview.faces) == 0:
+                scores.append(0.0)
+                depths.append(0.0)
+                continue
+            preview = clean_mesh_floating_artifacts(preview)
+            scores.append(silhouette_iou(preview, mask))
+            depths.append(measure_depth_ratio(preview))
+            print(f" -> [Semillas] Semilla {seeds[i]}: silueta {scores[-1]:.1%} · fondo {depths[-1]:.0%}")
+
+        best = int(np.argmax(scores))
+        self.last_seed_report = {"seeds": seeds, "scores": scores, "depths": depths, "best": best}
+        print(f" -> [Semillas] Elegida la semilla {seeds[best]} (silueta {scores[best]:.1%} · fondo {depths[best]:.0%})")
+        return shape_pipe._export(latents[best], "trimesh", 1.01, 0.0, num_chunks, call_kwargs["octree_resolution"], None)
+
     def _get_paint_pipeline(self):
         """
         Prepara Hunyuan3D-Paint con la forma ya fuera de la VRAM. Los submodelos (delight y
@@ -2218,17 +2635,25 @@ class Hunyuan3DGenerator:
                   ubicación (gpu / lean / bloques) según la VRAM libre: cabe en 6 GB.
           full  : se quedan cargados durante la pintura (si sobra VRAM, ~9 GB).
         """
+        from preparar_modelos import paint_opt_ready
         mem = MODEL_MEMORY_GB["paint"]
-        paint_pipeline = activate_model("paint", vram_needed_gb=mem["vram"], strict_vram=True)
+        # Con la caché fp16 la carga es directa y la RAM solo hace de paso (~1.5 GB transitorios)
+        ram_need = mem["ram_load_opt"] if paint_opt_ready() else mem["ram_load"]
+        paint_pipeline = activate_model("paint", vram_needed_gb=mem["vram"], ram_needed_gb=ram_need, strict_vram=True)
         if paint_pipeline is None:
             from hy3dgen.texgen import Hunyuan3DPaintPipeline
             from hy3dgen.texgen.utils.dehighlight_utils import Light_Shadow_Remover
 
+            from preparar_modelos import paint_opt_ready, PAINT_OPT_DIR
             local_model_dir = HUNYUAN_LOCAL_DIR
-            if (local_model_dir / "hunyuan3d-delight-v2-0").exists() and (local_model_dir / self.paint_subfolder).exists():
+            if paint_opt_ready():
+                paint_source = str(PAINT_OPT_DIR)  # Caché fp16 safetensors: carga más rápida
+            elif (local_model_dir / "hunyuan3d-delight-v2-0").exists() and (local_model_dir / self.paint_subfolder).exists():
                 paint_source = str(local_model_dir)
             else:
                 paint_source = self.model_id
+                print(" -> [Hunyuan3D-Paint] Consejo: crea la caché optimizada (una vez) para cargar más rápido:"
+                      " python preparar_modelos.py optimize paint")
 
             # from_pretrained resuelve/descarga las rutas; se evita que cargue los dos submodelos
             # a la vez (load_models) y se sustituyen por cargas perezosas
@@ -2281,7 +2706,8 @@ class Hunyuan3DGenerator:
     def paint_and_texture_mesh(
         self,
         mesh: trimesh.Trimesh,
-        image: Image.Image
+        image: Image.Image,
+        progress_callback: Optional[Callable[[str, int], None]] = None
     ) -> trimesh.Trimesh:
         """
         Etapa 2 - Texturizado Nativo Multivista (Hunyuan3D-Paint):
@@ -2296,12 +2722,15 @@ class Hunyuan3DGenerator:
         start_t = time.time()
 
         textured_mesh = None
+        self.last_paint_fallback = None
+        self.last_paint_summary = None
         if not hunyuan_paint_available():
+            self.last_paint_fallback = f"Hunyuan3D-Paint no disponible ({_PAINT_UNAVAILABLE_REASON})"
             print(f" -> [Hunyuan3D-Paint] No disponible: {_PAINT_UNAVAILABLE_REASON}")
             print(" -> Usando horneado UV de contingencia (proyección frontal/trasera en CPU).")
             textured_mesh = self._fallback_texture_bake(mesh, image)
         else:
-            textured_mesh = self._run_paint_pipeline(mesh, image, start_t)
+            textured_mesh = self._run_paint_pipeline(mesh, image, start_t, progress_callback)
 
         # Ajuste de material PBR mate/limpio (metallicFactor=0.0, roughnessFactor=0.90)
         if textured_mesh is not None and hasattr(textured_mesh, "visual") and hasattr(textured_mesh.visual, "material") and textured_mesh.visual.material is not None:
@@ -2312,30 +2741,67 @@ class Hunyuan3DGenerator:
 
         return textured_mesh if textured_mesh is not None else mesh
 
-    def _run_paint_pipeline(self, mesh: trimesh.Trimesh, image: Image.Image, start_t: float) -> Optional[trimesh.Trimesh]:
-        """Ejecuta Hunyuan3D-Paint; ante OOM o error recurre al horneado de contingencia."""
+    def _run_paint_pipeline(
+        self,
+        mesh: trimesh.Trimesh,
+        image: Image.Image,
+        start_t: float,
+        progress_callback: Optional[Callable[[str, int], None]] = None
+    ) -> Optional[trimesh.Trimesh]:
+        """Ejecuta Hunyuan3D-Paint por etapas medidas; ante OOM o error recurre al horneado de contingencia."""
+        import hy3dgen.texgen.pipelines as texgen_pipelines
         textured_mesh = None
         paint_pipeline = None
         out_of_memory = False
+        tracker = _PaintProgress(progress_callback)
+        original_uv_wrap = texgen_pipelines.mesh_uv_wrap
         try:
+            tracker.report("Preparando Hunyuan3D-Paint...", 88)
             paint_pipeline = self._get_paint_pipeline()
             print_real_vram_status("Pre-Inferencia Hunyuan3D-Paint")
             print(f" -> Pintando malla de {len(mesh.faces):,} caras con Hunyuan3D-Paint...")
+
+            # Cronómetro y avance en vivo por etapa (se restauran en el finally)
+            delight, multiview = paint_pipeline.models["delight_model"], paint_pipeline.models["multiview_model"]
+            delight.progress = tracker.submodel("Delight (quitando luces/sombras)", 88, 90, steps=50)
+            multiview.progress = tracker.submodel("Multivista (pintando 6 vistas)", 91, 96, steps=30)
+            texgen_pipelines.mesh_uv_wrap = tracker.stage("Desplegando UV (xatlas)", original_uv_wrap, 90)
+            for attr, label, pct in (
+                ("render_normal_multiview", "Mapas de normales", 91),
+                ("render_position_multiview", "Mapas de posición", 91),
+                ("bake_from_multiview", "Horneando textura", 96),
+                ("texture_inpaint", "Rellenando huecos de la textura", 97),
+            ):
+                setattr(paint_pipeline, attr, tracker.stage(label, getattr(paint_pipeline, attr), pct))
+
             with torch.inference_mode():
                 textured_mesh = paint_pipeline(mesh, image=image)
             print(f" -> [Hunyuan3D-Paint] Texturizado multivista completado en {time.time() - start_t:.2f}s.")
+            self.last_paint_summary = tracker.summary(time.time() - start_t)
+            print(f" -> [Paint] Tiempos: {self.last_paint_summary}")
 
         except InsufficientMemoryError as e_mem:
             print(f" -> [Hunyuan3D-Paint] No se carga para no saturar el equipo: {e_mem}")
+            self.last_paint_fallback = str(e_mem)
             textured_mesh = None
         except torch.cuda.OutOfMemoryError as e_oom:
             print(f" -> [Aviso CUDA OOM en Hunyuan3D-Paint] {e_oom}. Recurriendo a horneado UV de contingencia...")
+            self.last_paint_fallback = "VRAM insuficiente incluso transmitiendo el modelo por bloques"
             out_of_memory = True
             textured_mesh = None
         except Exception as e_tex:
+            import traceback
+            traceback.print_exc()
             print(f" -> [Aviso Hunyuan3D-Paint] {e_tex}. Recurriendo a horneado UV de contingencia...")
+            self.last_paint_fallback = f"error en Hunyuan3D-Paint: {type(e_tex).__name__}: {e_tex}"
             textured_mesh = None
         finally:
+            texgen_pipelines.mesh_uv_wrap = original_uv_wrap
+            if paint_pipeline is not None:
+                for attr in ("render_normal_multiview", "render_position_multiview", "bake_from_multiview", "texture_inpaint"):
+                    paint_pipeline.__dict__.pop(attr, None)
+                for sub in paint_pipeline.models.values():
+                    sub.progress = None
             paint_pipeline = None  # Soltar la referencia local antes de liberar/aparcar
             if out_of_memory:
                 release_model("paint")  # Tras un OOM el pipeline no es fiable
@@ -2525,6 +2991,190 @@ class Hunyuan3DGenerator:
 # 5b. Generador Secundario: Stable Fast 3D (SF3D de Stability AI)
 # ==============================================================================
 
+_sf3d_overlap_kernel = None
+
+
+def _get_sf3d_overlap_kernel():
+    """
+    Compila (una vez) el detector de solapes UV del unwrapper de SF3D en Numba.
+    Réplica de UVUnwrapper::perform_intersection_check (uv_unwrapper/csrc/unwrapper.cpp):
+    dos triángulos de la misma proyección se solapan si su intersección tiene área >= 1e-10;
+    el que queda detrás según el centroide 3D en el eje de la proyección se marca para moverlo.
+    """
+    global _sf3d_overlap_kernel
+    if _sf3d_overlap_kernel is not None:
+        return _sf3d_overlap_kernel
+    from numba import njit, prange
+
+    @njit(cache=False, fastmath=False)
+    def _overlap_area(t1, t2):
+        # Recorte Sutherland-Hodgman de t2 contra t1 (ambos en sentido antihorario)
+        bx = np.empty(12); by = np.empty(12)
+        nx = np.empty(12); ny = np.empty(12)
+        n = 3
+        for k in range(3):
+            bx[k] = t2[k, 0]; by[k] = t2[k, 1]
+        for e in range(3):
+            ax0, ay0 = t1[(e + 2) % 3, 0], t1[(e + 2) % 3, 1]
+            ax1, ay1 = t1[e, 0], t1[e, 1]
+            m = 0
+            for j in range(n):
+                jp = (j - 1 + n) % n
+                pcx, pcy = bx[j], by[j]
+                ppx, ppy = bx[jp], by[jp]
+                oc = ax0 * (ay1 - pcy) + ax1 * (pcy - ay0) + pcx * (ay0 - ay1)
+                op = ax0 * (ay1 - ppy) + ax1 * (ppy - ay0) + ppx * (ay0 - ay1)
+                in_c = oc >= -1e-7
+                in_p = op >= -1e-7
+                if in_c != in_p:
+                    t = op / (op - oc)
+                    nx[m] = ppx + (pcx - ppx) * t
+                    ny[m] = ppy + (pcy - ppy) * t
+                    m += 1
+                if in_c:
+                    nx[m] = pcx; ny[m] = pcy
+                    m += 1
+            n = m
+            if n < 3:
+                return 0.0
+            for j in range(n):
+                bx[j] = nx[j]; by[j] = ny[j]
+        area = 0.0
+        for j in range(n):
+            jn = (j + 1) % n
+            area += bx[j] * by[jn] - bx[jn] * by[j]
+        return abs(area) * 0.5
+
+    @njit(parallel=True, cache=False)
+    def _find_occluded(tri_uv, centroids, slot, active, grid):
+        nf = tri_uv.shape[0]
+        # Triángulos en sentido antihorario y caja envolvente
+        tri = tri_uv.copy()
+        bmin = np.empty((nf, 2)); bmax = np.empty((nf, 2))
+        valid = np.zeros(nf, dtype=np.bool_)
+        for i in range(nf):
+            det = (tri[i, 0, 0] * (tri[i, 1, 1] - tri[i, 2, 1]) + tri[i, 1, 0] * (tri[i, 2, 1] - tri[i, 0, 1])
+                   + tri[i, 2, 0] * (tri[i, 0, 1] - tri[i, 1, 1]))
+            if det < 0:
+                for c in range(2):
+                    tmp = tri[i, 1, c]; tri[i, 1, c] = tri[i, 2, c]; tri[i, 2, c] = tmp
+            valid[i] = active[i] and abs(det) >= 1e-7  # degenerados se ignoran (isTriDegenerated)
+            for c in range(2):
+                bmin[i, c] = min(tri[i, 0, c], tri[i, 1, c], tri[i, 2, c])
+                bmax[i, c] = max(tri[i, 0, c], tri[i, 1, c], tri[i, 2, c])
+
+        # Rejilla uniforme por ranura: celda = slot * grid^2 + cy * grid + cx (formato CSR)
+        n_cells = 13 * grid * grid
+        counts = np.zeros(n_cells + 1, dtype=np.int64)
+        for i in range(nf):
+            if not valid[i]:
+                continue
+            x0 = min(grid - 1, max(0, int(bmin[i, 0] * grid))); x1 = min(grid - 1, max(0, int(bmax[i, 0] * grid)))
+            y0 = min(grid - 1, max(0, int(bmin[i, 1] * grid))); y1 = min(grid - 1, max(0, int(bmax[i, 1] * grid)))
+            for cy in range(y0, y1 + 1):
+                for cx in range(x0, x1 + 1):
+                    counts[slot[i] * grid * grid + cy * grid + cx + 1] += 1
+        for k in range(n_cells):
+            counts[k + 1] += counts[k]
+        fill = counts[:-1].copy()
+        items = np.empty(counts[-1], dtype=np.int64)
+        for i in range(nf):
+            if not valid[i]:
+                continue
+            x0 = min(grid - 1, max(0, int(bmin[i, 0] * grid))); x1 = min(grid - 1, max(0, int(bmax[i, 0] * grid)))
+            y0 = min(grid - 1, max(0, int(bmin[i, 1] * grid))); y1 = min(grid - 1, max(0, int(bmax[i, 1] * grid)))
+            for cy in range(y0, y1 + 1):
+                for cx in range(x0, x1 + 1):
+                    cell = slot[i] * grid * grid + cy * grid + cx
+                    items[fill[cell]] = i
+                    fill[cell] += 1
+
+        occluded = np.zeros(nf, dtype=np.bool_)
+        for i in prange(nf):
+            if not valid[i]:
+                continue
+            s = slot[i]
+            x0 = min(grid - 1, max(0, int(bmin[i, 0] * grid))); x1 = min(grid - 1, max(0, int(bmax[i, 0] * grid)))
+            y0 = min(grid - 1, max(0, int(bmin[i, 1] * grid))); y1 = min(grid - 1, max(0, int(bmax[i, 1] * grid)))
+            axis = 0 if (s % 6) < 2 else (1 if (s % 6) < 4 else 2)
+            use_max = (s % 2) == 1
+            for cy in range(y0, y1 + 1):
+                for cx in range(x0, x1 + 1):
+                    cell = s * grid * grid + cy * grid + cx
+                    for p in range(counts[cell], counts[cell + 1]):
+                        j = items[p]
+                        if j <= i:
+                            continue
+                        if bmax[i, 0] < bmin[j, 0] or bmax[j, 0] < bmin[i, 0] or bmax[i, 1] < bmin[j, 1] or bmax[j, 1] < bmin[i, 1]:
+                            continue
+                        # Cada par se evalúa solo en la celda de la esquina mínima de la intersección de cajas
+                        rx = min(grid - 1, max(0, int(max(bmin[i, 0], bmin[j, 0]) * grid)))
+                        ry = min(grid - 1, max(0, int(max(bmin[i, 1], bmin[j, 1]) * grid)))
+                        if rx != cx or ry != cy:
+                            continue
+                        if _overlap_area(tri[i], tri[j]) < 1e-10:
+                            continue
+                        pa = centroids[i, axis]; pb = centroids[j, axis]
+                        # Igual que el C++: el "segundo" del par (tapado) es el que se mueve
+                        if (use_max and pa < pb) or ((not use_max) and pa > pb):
+                            occluded[i] = True
+                        else:
+                            occluded[j] = True
+        return occluded
+
+    _sf3d_overlap_kernel = _find_occluded
+    return _sf3d_overlap_kernel
+
+
+def _assign_faces_uv_to_atlas_index_numba(vertex_positions, triangle_idxs, face_uv, face_index):
+    """
+    Sustituto de torch.ops.UVUnwrapper.assign_faces_uv_to_atlas_index (extensión C++ de SF3D).
+    Sin este paso, los triángulos que se tapan entre sí en una misma proyección de la caja
+    (p. ej. un brazo delante del torso) comparten los mismos texeles y la textura se mezcla.
+    Dos pasadas como el original: solapes de las ranuras 0-5 pasan a 6-11 y los de 6-11 a 12.
+    """
+    kernel = _get_sf3d_overlap_kernel()
+    v = vertex_positions.detach().cpu().double().numpy()
+    f = triangle_idxs.detach().cpu().long().numpy()
+    tri_uv = face_uv.detach().cpu().double().reshape(-1, 3, 2).numpy()
+    assign = face_index.detach().cpu().long().numpy().copy()
+    centroids = v[f].mean(axis=1)
+    grid = int(np.clip(np.sqrt(len(f) / 6.0) / 2.0, 8, 512))
+    for offset in (0, 6):
+        active = (assign >= offset) & (assign < offset + 6)
+        if not active.any():
+            continue
+        occluded = kernel(tri_uv, centroids, assign, active, grid)
+        assign[occluded] = np.minimum(assign[occluded] + 6, 12)
+    return torch.from_numpy(assign).to(vertex_positions.device)
+
+
+# Hasta este número de caras SF3D despliega las UV con xatlas (malla de juego); por encima, proyección en caja
+SF3D_XATLAS_MAX_FACES = 60000
+SF3D_XATLAS_RESOLUTION = 2048
+SF3D_XATLAS_PADDING_PX = 4
+
+
+def _xatlas_unwrap(vertex_positions, triangle_idxs):
+    """Atlas UV con xatlas en el formato del Unwrapper de SF3D: (uv únicas, índice uv por cara)."""
+    import xatlas
+    atlas = xatlas.Atlas()
+    atlas.add_mesh(
+        vertex_positions.detach().cpu().numpy().astype(np.float32),
+        triangle_idxs.detach().cpu().numpy().astype(np.uint32),
+    )
+    pack = xatlas.PackOptions()
+    pack.resolution = SF3D_XATLAS_RESOLUTION
+    pack.padding = SF3D_XATLAS_PADDING_PX
+    pack.bilinear = True
+    atlas.generate(xatlas.ChartOptions(), pack)
+    _, indices, uvs = atlas.get_mesh(0)  # xatlas conserva el orden de las caras
+    return (
+        torch.from_numpy(uvs.astype(np.float32)).to(vertex_positions.device),
+        torch.from_numpy(indices.astype(np.int64)).to(triangle_idxs.device),
+    )
+
+
 def _ensure_sf3d_shims(repo_dir: Optional[Path] = None):
     """
     Configura shims / polyfills de alto rendimiento para uv_unwrapper y texture_baker
@@ -2568,6 +3218,13 @@ def _ensure_sf3d_shims(repo_dir: Optional[Path] = None):
                                     ).to(vertex_positions.device)
                             except Exception:
                                 pass
+                            try:
+                                return _assign_faces_uv_to_atlas_index_numba(
+                                    vertex_positions, triangle_idxs, face_uv, face_index
+                                )
+                            except Exception as e_assign:
+                                print(f" -> [Aviso SF3D UV] Detección de solapes UV no disponible ({e_assign}); "
+                                      "las piezas que se tapan compartirán textura.")
                             return face_index
 
                         unwrap_mod.Unwrapper._assign_faces_uv_to_atlas_index = _safe_assign_faces
@@ -2614,8 +3271,22 @@ def _ensure_sf3d_shims(repo_dir: Optional[Path] = None):
                         return dummy_uv, t_pos_idx
             unwrapper_cls = FallbackUnwrapper
 
+        class AtlasFirstUnwrapper(unwrapper_cls):
+            """
+            Mallas de juego (remalladas): atlas xatlas, que aprovecha ~65-75% de la textura frente al
+            ~25% de la proyección en caja de SF3D (2.5x más texeles por triángulo y menos costuras).
+            Mallas HD enormes: proyección en caja original (xatlas tardaría minutos).
+            """
+            def forward(self, vertex_positions, vertex_normals, triangle_idxs, island_padding=0.02):
+                if triangle_idxs.shape[0] <= SF3D_XATLAS_MAX_FACES:
+                    try:
+                        return _xatlas_unwrap(vertex_positions, triangle_idxs)
+                    except Exception as e_xa:
+                        print(f" -> [Aviso SF3D UV] xatlas falló ({e_xa}); se usa la proyección en caja.")
+                return super().forward(vertex_positions, vertex_normals, triangle_idxs, island_padding)
+
         mod_uv = types.ModuleType("uv_unwrapper")
-        mod_uv.Unwrapper = unwrapper_cls
+        mod_uv.Unwrapper = AtlasFirstUnwrapper
         sys.modules["uv_unwrapper"] = mod_uv
 
     # 2. texture_baker
@@ -2624,14 +3295,16 @@ def _ensure_sf3d_shims(repo_dir: Optional[Path] = None):
         # Rasterizador de textura UV ultrarrápido con Numba (CPU multihilo, 0 MB VRAM)
         _numba_rast_fn = None
         try:
-            from numba import njit, prange
+            from numba import njit
 
-            @njit(parallel=True, fastmath=True)
+            # Secuencial a propósito: en paralelo, dos triángulos que tocan el mismo píxel en una
+            # costura podían escribir a la vez y dejar baricéntricas de uno con el índice del otro.
+            @njit(fastmath=True)
             def _numba_rasterize_sf3d(uvs, faces, res):
                 rast = np.zeros((res, res, 4), dtype=np.float32)
                 rast[:, :, 3] = -1.0
                 num_faces = faces.shape[0]
-                for f in prange(num_faces):
+                for f in range(num_faces):
                     i0, i1, i2 = faces[f, 0], faces[f, 1], faces[f, 2]
                     u0, v0 = uvs[i0, 0], uvs[i0, 1]
                     u1, v1 = uvs[i1, 0], uvs[i1, 1]
@@ -2741,17 +3414,652 @@ def _sf3d_load_lowmem(sf3d_cls, source: str, device: str):
     targets = model.state_dict()
     with safe_open(weight_path, framework="pt", device="cpu") as f:
         keys = set(f.keys())
-        if keys == set(targets):
+        # Las claves del modelo que no están en el archivo deben ser alias (pesos compartidos)
+        # de tensores que sí están: safetensors guarda cada tensor compartido una sola vez.
+        loaded_ptrs = {targets[k].data_ptr() for k in keys if k in targets}
+        aliases_only = keys <= set(targets) and all(
+            targets[k].data_ptr() in loaded_ptrs for k in set(targets) - keys
+        )
+        if aliases_only:
             with torch.no_grad():
                 for key in keys:
                     targets[key].copy_(f.get_tensor(key))
-            return model.eval()
+            del targets
+            return _sf3d_prepare_inference(model.eval(), device)
 
-    # Claves distintas (p. ej. pesos compartidos): carga estándar de safetensors
-    print(" -> [SF3D] Claves no coinciden 1:1; usando la carga estándar de safetensors.")
+    # Claves distintas: carga estándar de safetensors. Se sueltan antes las referencias a los
+    # tensores de la GPU para que model.to("cpu") libere de verdad la VRAM.
+    print(" -> [SF3D] Claves no coinciden; usando la carga estándar de safetensors.")
+    del targets, loaded_ptrs
     model.to("cpu")
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     load_model(model, weight_path)
-    return model.to(device).eval()
+    return _sf3d_prepare_inference(model.to(device).eval(), device)
+
+
+def _sf3d_dilate_fill_lowmem(img, mask, iterations=10):
+    """
+    Igual que sf3d.models.utils.dilate_fill (relleno de los bordes de las islas UV con la media
+    de los vecinos válidos), resultado idéntico, pero con convoluciones en vez de unfold/fold:
+    unfold crea tensores 9x la textura (~450 MB cada uno a 2048) y agotaba la VRAM al hornear.
+    """
+    import torch.nn.functional as F
+    c = img.shape[1]
+    ones_c = torch.ones((c, 1, 3, 3), dtype=img.dtype, device=img.device)
+    ones_1 = torch.ones((1, 1, 3, 3), dtype=img.dtype, device=img.device)
+    old_mask = mask.to(img.dtype)
+    old_img = img
+    for _ in range(iterations):
+        new_mask = F.max_pool2d(old_mask, 3, 1, 1)
+        # Media de los válidos en cada ventana 3x3 y reparto a los píxeles nuevos que cubre
+        win_mean = F.conv2d(old_img, ones_c, groups=c) / F.conv2d(old_mask, ones_1).clip(1)
+        spread = F.conv_transpose2d(win_mean, ones_c, groups=c)
+        new_img = spread * new_mask / F.conv2d(new_mask, ones_1, padding=1).clamp(1)
+        old_img = torch.lerp(old_img, new_img, new_mask - old_mask)
+        old_mask = new_mask
+    return old_img
+
+
+# Puntos por lote al consultar el triplano y el decodificador de SF3D (~0.5 GB de pico por lote)
+SF3D_POINT_CHUNK = 262144
+
+
+def _sf3d_chunk_pointwise(model) -> None:
+    """
+    El horneado consulta el triplano y el decodificador con TODOS los texeles a la vez: a 2048x2048
+    son millones de puntos y varios GB de activaciones (OOM en 8 GB). Ambos operan punto a punto,
+    así que procesarlos por lotes da el mismo resultado con un pico de memoria acotado.
+    """
+    if getattr(model, "_chunked_pointwise", False):
+        return
+    query, decode = model.query_triplane, model.decoder.forward
+
+    def chunked_query(positions, triplanes):
+        n = positions.shape[-2]
+        if n <= SF3D_POINT_CHUNK:
+            return query(positions, triplanes)
+        return torch.cat([query(positions[..., s:s + SF3D_POINT_CHUNK, :], triplanes)
+                          for s in range(0, n, SF3D_POINT_CHUNK)], dim=-2)
+
+    def chunked_decode(x, include=None, exclude=None):
+        flat = x.reshape(-1, x.shape[-1])
+        if flat.shape[0] <= SF3D_POINT_CHUNK:
+            return decode(x, include=include, exclude=exclude)
+        parts = [decode(flat[s:s + SF3D_POINT_CHUNK], include=include, exclude=exclude)
+                 for s in range(0, flat.shape[0], SF3D_POINT_CHUNK)]
+        return {k: torch.cat([p[k] for p in parts], dim=0).reshape(*x.shape[:-1], -1) for k in parts[0]}
+
+    model.query_triplane = chunked_query
+    model.decoder.forward = chunked_decode
+    model._chunked_pointwise = True
+
+
+def _sf3d_prepare_inference(model, device: str):
+    """
+    Reduce la VRAM de SF3D sin cambiar el resultado:
+    - Sin gradientes: autocast no guarda copias bf16 de cada peso durante la inferencia (~1.5 GB).
+    - Pesos Linear/Conv del codificador de imagen (DINOv2) y del backbone en bf16: autocast ya los
+      ejecuta en bf16, así que la salida es la misma y se ahorran ~1.5 GB fijos.
+    El decodificador y el meshing (que corren sin autocast) se quedan en fp32.
+    """
+    model.requires_grad_(False)
+    _sf3d_chunk_pointwise(model)
+    if "cuda" in str(device) and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        for part in (model.image_tokenizer, model.backbone):
+            for mod in part.modules():
+                if isinstance(mod, (torch.nn.Linear, torch.nn.Conv2d)):
+                    mod.to(torch.bfloat16)
+        gc.collect()
+        torch.cuda.empty_cache()
+    return model
+
+
+# Margen sobre target_faces que se acepta del remallado de SF3D sin volver a decimar
+SF3D_FACE_TOLERANCE = 1.3
+
+
+def _mark_textures_lossless(mesh: Any) -> None:
+    """Hace que trimesh exporte las texturas del material en PNG (sin pérdida) en vez de JPEG."""
+    mat = getattr(getattr(mesh, "visual", None), "material", None)
+    for attr in ("baseColorTexture", "normalTexture", "metallicRoughnessTexture", "emissiveTexture", "occlusionTexture"):
+        tex = getattr(mat, attr, None) if mat is not None else None
+        if isinstance(tex, Image.Image):
+            tex.format = "PNG"
+
+
+# Acabado del material (metallicFactor, roughnessFactor). "mate" es el acabado cartoon de siempre
+MATERIAL_PRESETS = {
+    "mate": (0.0, 0.90),
+    "satinado": (0.0, 0.50),
+    "metal": (1.0, 0.30),
+}
+
+# Relieve de detalle sacado del albedo: pendiente que alcanza el 3% de texels con más detalle.
+# Por encima de ~0.6 las zonas lisas de los personajes empiezan a verse granuladas.
+TEXTURE_RELIEF_LEVELS = {
+    "none": 0.0,
+    "suave": 0.30,
+    "marcado": 0.60,
+}
+
+
+def apply_material_preset(mesh: Any, preset: str = "mate") -> None:
+    """Aplica el acabado elegido (mate, satinado o metal) al material PBR de la malla."""
+    mat = getattr(getattr(mesh, "visual", None), "material", None)
+    if mat is None:
+        return
+    metallic, roughness = MATERIAL_PRESETS.get(preset, MATERIAL_PRESETS["mate"])
+    mat.metallicFactor = metallic
+    mat.roughnessFactor = roughness
+    mat.doubleSided = True
+
+
+def _rasterize_uv_faces(uv: np.ndarray, faces: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Máscara (bool, filas de la imagen) de los texels que cubren las caras en el atlas UV."""
+    mask = np.zeros((height, width), np.uint8)
+    if len(faces) == 0:
+        return mask > 0
+    px = np.empty((len(uv), 2), np.float64)
+    px[:, 0] = uv[:, 0] * width
+    px[:, 1] = (1.0 - uv[:, 1]) * height
+    # 4 bits de subpíxel con el centro del texel en (0.5, 0.5)
+    pts = np.round(px[faces] * 16.0 - 8.0).astype(np.int32)
+    cv2.fillPoly(mask, list(pts), 255, lineType=cv2.LINE_8, shift=4)
+    return mask > 0
+
+
+def fix_sf3d_normal_convention(mesh: Any) -> bool:
+    """
+    Pasa el normal map de SF3D a la convención glTF/Godot (+X derecha, +Y arriba en la imagen).
+
+    SF3D hornea con su propia base tangente: recorta el determinante UV a positivo (en las islas
+    espejadas la tangente sale invertida) y al exportar invierte el sentido de las caras. En la
+    malla exportada eso deja Y invertida en todas las islas y además X en las espejadas, y la luz
+    entra al revés en el relieve. Comprobado en las costuras UV: tras corregir, la normal coincide
+    a ambos lados (~0.9° de media frente a 2-4° sin corregir).
+    """
+    mat = getattr(getattr(mesh, "visual", None), "material", None)
+    tex = getattr(mat, "normalTexture", None) if mat is not None else None
+    uv = getattr(mesh.visual, "uv", None) if mat is not None else None
+    if not isinstance(tex, Image.Image) or uv is None or len(uv) != len(mesh.vertices):
+        return False
+    nmap = np.array(tex.convert("RGB"))
+    h, w = nmap.shape[:2]
+    uv = np.asarray(uv, dtype=np.float64)
+    faces = np.asarray(mesh.faces)
+    d1 = uv[faces[:, 1]] - uv[faces[:, 0]]
+    d2 = uv[faces[:, 2]] - uv[faces[:, 0]]
+    mirrored_faces = (d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0]) < 0
+    mirrored = _rasterize_uv_faces(uv, faces[mirrored_faces], w, h)
+    regular = _rasterize_uv_faces(uv, faces[~mirrored_faces], w, h)
+    # El relleno entre islas toma la orientación de la isla más cercana
+    dist_mirrored = cv2.distanceTransform((~mirrored).astype(np.uint8), cv2.DIST_L2, 3)
+    dist_regular = cv2.distanceTransform((~regular).astype(np.uint8), cv2.DIST_L2, 3)
+    flip_x = dist_mirrored < dist_regular
+    nmap[..., 1] = 255 - nmap[..., 1]
+    nmap[..., 0] = np.where(flip_x, 255 - nmap[..., 0], nmap[..., 0])
+    fixed = Image.fromarray(nmap, mode="RGB")
+    fixed.format = "PNG"
+    mat.normalTexture = fixed
+    return True
+
+
+def _extend_islands(img: np.ndarray, covered: np.ndarray) -> None:
+    """
+    Rellena todo el espacio entre islas UV con el texel cubierto más cercano. Si ese margen
+    conserva valores antiguos, el filtrado bilineal y los mipmaps los mezclan en el borde de las
+    islas y la costura se ve (más cuanto más lejos está el modelo de la cámara).
+    """
+    _, labels = cv2.distanceTransformWithLabels((~covered).astype(np.uint8), cv2.DIST_L2, 5,
+                                                labelType=cv2.DIST_LABEL_PIXEL)
+    ys, xs = np.nonzero(covered)
+    fill = ~covered
+    nearest = labels[fill] - 1
+    img[fill] = img[ys[nearest], xs[nearest]]
+
+
+def add_texture_relief(mesh: Any, strength: float) -> bool:
+    """
+    Relieve de detalle: saca un mapa de alturas del albedo (paso banda de la luminancia: las
+    líneas oscuras se hunden y los brillos suben) y lo suma al normal map con Reoriented Normal
+    Mapping. El normal map de entrada debe estar ya en convención glTF.
+    """
+    mat = getattr(getattr(mesh, "visual", None), "material", None)
+    albedo = getattr(mat, "baseColorTexture", None) if mat is not None else None
+    uv = getattr(mesh.visual, "uv", None) if mat is not None else None
+    if strength <= 0 or not isinstance(albedo, Image.Image) or uv is None or len(uv) != len(mesh.vertices):
+        return False
+    rgb = np.asarray(albedo.convert("RGB"), dtype=np.float32) / 255.0
+    h, w = rgb.shape[:2]
+    base_img = getattr(mat, "normalTexture", None)
+    if isinstance(base_img, Image.Image):
+        if base_img.size != (w, h):
+            base_img = base_img.resize((w, h), Image.LANCZOS)
+        encoded = np.array(base_img.convert("RGB"))
+    else:
+        encoded = np.empty((h, w, 3), np.uint8)
+        encoded[...] = (128, 128, 255)
+
+    mask = _rasterize_uv_faces(np.asarray(uv, dtype=np.float64), np.asarray(mesh.faces), w, h)
+    if not mask.any():
+        return False
+    m = mask.astype(np.float32)
+    lum = rgb @ np.array([0.299, 0.587, 0.114], np.float32)
+    scale = w / 2048.0
+
+    def masked_blur(x, sigma):
+        # Desenfoque normalizado: el relleno entre islas no entra en el relieve
+        num = cv2.GaussianBlur(x * m, (0, 0), sigma)
+        return num / np.maximum(cv2.GaussianBlur(m, (0, 0), sigma), 1e-4)
+
+    height = masked_blur(lum, 1.0 * scale) - masked_blur(lum, 8.0 * scale)
+
+    # Derivadas centrales sin cruzar el borde de la isla (de un solo lado si falta el vecino)
+    hp = np.pad(height, 1, mode="edge")
+    mp = np.pad(mask, 1, mode="constant")
+
+    def deriv(a_plus, a_minus, m_plus, m_minus):
+        return np.where(m_plus & m_minus, (a_plus - a_minus) * 0.5,
+                        np.where(m_plus, a_plus - height, np.where(m_minus, height - a_minus, 0.0)))
+
+    gx = deriv(hp[1:-1, 2:], hp[1:-1, :-2], mp[1:-1, 2:], mp[1:-1, :-2])
+    gy = deriv(hp[2:, 1:-1], hp[:-2, 1:-1], mp[2:, 1:-1], mp[:-2, 1:-1])
+    grad = np.hypot(gx, gy)
+    ref = float(np.percentile(grad[mask][::4], 97))
+    if ref < 1e-5:
+        return False  # textura lisa: no hay detalle que realzar
+    # Solo los trazos claros (contornos, bordes) dan relieve: el ruido suave del albedo de SF3D
+    # quedaría como una superficie agrietada en las zonas lisas
+    t = np.clip((grad / ref - 0.25) / 0.35, 0.0, 1.0)
+    active = mask & (t > 0)
+    if not active.any():
+        return False
+    t = t[active]
+    keep = t * t * (3.0 - 2.0 * t) * (strength / ref)
+    # glTF: +X hacia la derecha de la imagen, +Y hacia arriba (filas decrecientes)
+    detail = np.stack([-gx[active] * keep, gy[active] * keep, np.ones_like(keep)], axis=-1).astype(np.float32)
+    detail /= np.linalg.norm(detail, axis=-1, keepdims=True)
+
+    # Reoriented Normal Mapping solo en los texels con trazo (el resto conserva el mapa tal cual)
+    base = encoded[active].astype(np.float32) / 127.5 - 1.0
+    base /= np.maximum(np.linalg.norm(base, axis=-1, keepdims=True), 1e-6)
+    tb = base + np.array([0.0, 0.0, 1.0], np.float32)
+    u = detail * np.array([-1.0, -1.0, 1.0], np.float32)
+    combined = tb * (np.sum(tb * u, axis=-1, keepdims=True) / np.maximum(tb[..., 2:3], 1e-4)) - u
+    combined /= np.maximum(np.linalg.norm(combined, axis=-1, keepdims=True), 1e-6)
+    encoded[active] = np.clip(np.round((combined * 0.5 + 0.5) * 255.0), 0, 255).astype(np.uint8)
+    _extend_islands(encoded, mask)
+
+    out = Image.fromarray(encoded, mode="RGB")
+    out.format = "PNG"
+    mat.normalTexture = out
+    return True
+
+
+# Cámara con la que SF3D ve la imagen de entrada (sf3d/system.py: default_fovy_deg, default_distance)
+SF3D_COND_FOVY_DEG = 40.0
+SF3D_COND_DISTANCE = 1.6
+# Proyección HD: zona de mezcla según el ángulo entre la normal y la cámara (coseno)
+SF3D_PROJECTION_COS = (0.25, 0.60)
+# Enfoque de la textura de SF3D (máscara de enfoque) en las zonas que no cubre la proyección
+SF3D_SHARPEN_AMOUNT = 0.5
+
+_sf3d_projection_kernels = None
+
+
+def _get_sf3d_projection_kernels():
+    """Compila (una vez) los rasterizadores Numba de la proyección HD: atlas UV y profundidad."""
+    global _sf3d_projection_kernels
+    if _sf3d_projection_kernels is not None:
+        return _sf3d_projection_kernels
+    from numba import njit
+
+    @njit(cache=False)
+    def _uv_raster(pts, faces, width, height):
+        fid = np.full((height, width), -1, np.int32)
+        bary = np.zeros((height, width, 3), np.float32)
+        for f in range(faces.shape[0]):
+            a, b, c = faces[f, 0], faces[f, 1], faces[f, 2]
+            x0, y0, x1, y1, x2, y2 = pts[a, 0], pts[a, 1], pts[b, 0], pts[b, 1], pts[c, 0], pts[c, 1]
+            den = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+            if abs(den) < 1e-12:
+                continue
+            for py in range(max(0, int(min(y0, y1, y2))), min(height - 1, int(max(y0, y1, y2)) + 1) + 1):
+                for px in range(max(0, int(min(x0, x1, x2))), min(width - 1, int(max(x0, x1, x2)) + 1) + 1):
+                    X = px + 0.5
+                    Y = py + 0.5
+                    w0 = ((y1 - y2) * (X - x2) + (x2 - x1) * (Y - y2)) / den
+                    w1 = ((y2 - y0) * (X - x2) + (x0 - x2) * (Y - y2)) / den
+                    w2 = 1.0 - w0 - w1
+                    if w0 >= -1e-4 and w1 >= -1e-4 and w2 >= -1e-4:
+                        fid[py, px] = f
+                        bary[py, px, 0] = w0
+                        bary[py, px, 1] = w1
+                        bary[py, px, 2] = w2
+        return fid, bary
+
+    @njit(cache=False)
+    def _depth_raster(pts, depth, faces, width, height):
+        zbuf = np.full((height, width), np.inf, np.float32)
+        for f in range(faces.shape[0]):
+            a, b, c = faces[f, 0], faces[f, 1], faces[f, 2]
+            x0, y0, x1, y1, x2, y2 = pts[a, 0], pts[a, 1], pts[b, 0], pts[b, 1], pts[c, 0], pts[c, 1]
+            den = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+            if abs(den) < 1e-12:
+                continue
+            for py in range(max(0, int(min(y0, y1, y2))), min(height - 1, int(max(y0, y1, y2)) + 1) + 1):
+                for px in range(max(0, int(min(x0, x1, x2))), min(width - 1, int(max(x0, x1, x2)) + 1) + 1):
+                    X = px + 0.5
+                    Y = py + 0.5
+                    w0 = ((y1 - y2) * (X - x2) + (x2 - x1) * (Y - y2)) / den
+                    w1 = ((y2 - y0) * (X - x2) + (x0 - x2) * (Y - y2)) / den
+                    w2 = 1.0 - w0 - w1
+                    if w0 >= 0.0 and w1 >= 0.0 and w2 >= 0.0:
+                        z = w0 * depth[a] + w1 * depth[b] + w2 * depth[c]
+                        if z < zbuf[py, px]:
+                            zbuf[py, px] = z
+        return zbuf
+
+    @njit(cache=False)
+    def _uv_interp(fid, bary, faces, attr):
+        # Atributo por vértice interpolado en cada texel cubierto (0 fuera de las islas)
+        h, w = fid.shape
+        out = np.zeros((h, w, attr.shape[1]), np.float32)
+        for y in range(h):
+            for x in range(w):
+                f = fid[y, x]
+                if f < 0:
+                    continue
+                for c in range(attr.shape[1]):
+                    out[y, x, c] = (bary[y, x, 0] * attr[faces[f, 0], c] + bary[y, x, 1] * attr[faces[f, 1], c]
+                                    + bary[y, x, 2] * attr[faces[f, 2], c])
+        return out
+
+    @njit(cache=False)
+    def _rebase_texels(fid, bary, faces, face_n, face_t, face_sign, vnorm, nmap):
+        # Normal del mapa: base plana de la cara -> base con la normal suave interpolada
+        h, w = fid.shape
+        out = nmap.copy()
+        for y in range(h):
+            for x in range(w):
+                f = fid[y, x]
+                if f < 0:
+                    continue
+                nfx, nfy, nfz = face_n[f, 0], face_n[f, 1], face_n[f, 2]
+                tx, ty, tz = face_t[f, 0], face_t[f, 1], face_t[f, 2]
+                s = face_sign[f]
+                # Base plana (tangente ya ortogonal a la normal de la cara)
+                bfx = (nfy * tz - nfz * ty) * s
+                bfy = (nfz * tx - nfx * tz) * s
+                bfz = (nfx * ty - nfy * tx) * s
+                a, b, c = nmap[y, x, 0], nmap[y, x, 1], nmap[y, x, 2]
+                wx = a * tx + b * bfx + c * nfx
+                wy = a * ty + b * bfy + c * nfy
+                wz = a * tz + b * bfz + c * nfz
+                # Normal suave interpolada y tangente reortogonalizada contra ella
+                nsx = nsy = nsz = 0.0
+                for k in range(3):
+                    v = faces[f, k]
+                    bk = bary[y, x, k]
+                    nsx += bk * vnorm[v, 0]
+                    nsy += bk * vnorm[v, 1]
+                    nsz += bk * vnorm[v, 2]
+                ln = np.sqrt(nsx * nsx + nsy * nsy + nsz * nsz)
+                if ln < 1e-12:
+                    continue
+                nsx /= ln
+                nsy /= ln
+                nsz /= ln
+                d = tx * nsx + ty * nsy + tz * nsz
+                tsx, tsy, tsz = tx - d * nsx, ty - d * nsy, tz - d * nsz
+                lt = np.sqrt(tsx * tsx + tsy * tsy + tsz * tsz)
+                if lt < 1e-12:
+                    continue
+                tsx /= lt
+                tsy /= lt
+                tsz /= lt
+                bsx = (nsy * tsz - nsz * tsy) * s
+                bsy = (nsz * tsx - nsx * tsz) * s
+                bsz = (nsx * tsy - nsy * tsx) * s
+                ox = wx * tsx + wy * tsy + wz * tsz
+                oy = wx * bsx + wy * bsy + wz * bsz
+                oz = max(wx * nsx + wy * nsy + wz * nsz, 0.05)
+                lo = np.sqrt(ox * ox + oy * oy + oz * oz)
+                out[y, x, 0] = ox / lo
+                out[y, x, 1] = oy / lo
+                out[y, x, 2] = oz / lo
+        return out
+
+    _sf3d_projection_kernels = (_uv_raster, _depth_raster, _uv_interp, _rebase_texels)
+    return _sf3d_projection_kernels
+
+
+def _smooth_vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """Normales suaves por posición (SF3D separa los vértices en cada costura UV)."""
+    _, pos_id = np.unique(np.round(vertices, 6), axis=0, return_inverse=True)
+    pos_id = pos_id.ravel()
+    fn = np.cross(vertices[faces[:, 1]] - vertices[faces[:, 0]], vertices[faces[:, 2]] - vertices[faces[:, 0]])
+    acc = np.zeros((pos_id.max() + 1, 3))
+    for k in range(3):
+        np.add.at(acc, pos_id[faces[:, k]], fn)
+    acc /= np.maximum(np.linalg.norm(acc, axis=1, keepdims=True), 1e-12)
+    return acc[pos_id]
+
+
+def _sf3d_camera_project(points: np.ndarray, distance: float, fovy_deg: float):
+    """
+    Proyecta puntos del GLB de SF3D a la imagen de entrada (u, v en [0, 1], v hacia abajo).
+    SF3D pone la cámara en +X interno; al exportar rota (x, y, z) -> (-y, z, -x), así que en el
+    GLB la cámara está en (0, 0, -distancia) mirando a +Z, con la derecha de la imagen en -X.
+    """
+    depth = points[:, 2] + distance
+    k = 0.5 / (np.maximum(depth, 1e-3) * np.tan(np.deg2rad(fovy_deg) / 2.0))
+    u = 0.5 - points[:, 0] * k
+    v = 0.5 - points[:, 1] * k
+    return np.stack([u, v], axis=1), depth
+
+
+def _fit_silhouette(sil: np.ndarray, alpha: np.ndarray, max_scale_dev: float):
+    """
+    Ajuste 2D (escala uniforme + desplazamiento) de la silueta proyectada sobre el alfa de la
+    imagen: corrige el pequeño desfase entre la forma de SF3D y el dibujo. Devuelve (escala,
+    du, dv, IoU) en coordenadas normalizadas, con la escala alrededor del centro (0.5, 0.5).
+    """
+    n = sil.shape[0]
+    ys, xs = np.nonzero(sil)
+    ya, xa = np.nonzero(alpha)
+    if len(xs) == 0 or len(xa) == 0:
+        return 1.0, 0.0, 0.0, 0.0
+    c = n / 2.0
+    s0 = ((xa.max() - xa.min()) + (ya.max() - ya.min())) / max((xs.max() - xs.min()) + (ys.max() - ys.min()), 1)
+    s0 = float(np.clip(s0, 1.0 - max_scale_dev, 1.0 + max_scale_dev))
+    cx0 = (xa.min() + xa.max()) / 2.0 - ((xs.min() + xs.max()) / 2.0 - c) * s0 - c
+    cy0 = (ya.min() + ya.max()) / 2.0 - ((ys.min() + ys.max()) / 2.0 - c) * s0 - c
+    sil_u8 = sil.astype(np.uint8)
+    alpha_b = alpha.astype(bool)
+
+    def iou(s, tx, ty):
+        m = np.float32([[s, 0, c - s * c + tx], [0, s, c - s * c + ty]])
+        w = cv2.warpAffine(sil_u8, m, (n, n), flags=cv2.INTER_NEAREST).astype(bool)
+        union = np.count_nonzero(w | alpha_b)
+        return np.count_nonzero(w & alpha_b) / union if union else 0.0
+
+    best = (iou(s0, cx0, cy0), s0, cx0, cy0)
+    for step_s, step_t in ((0.02, 2.0), (0.01, 1.0), (0.005, 0.5)):
+        _, bs, bx, by = best
+        for ds in (-step_s, 0.0, step_s):
+            s = bs + ds
+            if abs(s - 1.0) > max_scale_dev:
+                continue
+            for dx in (-step_t, 0.0, step_t):
+                for dy in (-step_t, 0.0, step_t):
+                    val = iou(s, bx + dx, by + dy)
+                    if val > best[0]:
+                        best = (val, s, bx + dx, by + dy)
+    score, s, tx, ty = best
+    return s, tx / n, ty / n, score
+
+
+def project_input_onto_texture(
+    mesh: Any,
+    rgba_image: Image.Image,
+    distance: float = SF3D_COND_DISTANCE,
+    fovy_deg: float = SF3D_COND_FOVY_DEG,
+    sharpen: float = SF3D_SHARPEN_AMOUNT,
+    max_scale_dev: float = 0.08,
+    min_iou: float = 0.85,
+) -> bool:
+    """
+    Proyección HD: pinta la imagen de entrada (a resolución completa) sobre las caras del GLB de
+    SF3D que la cámara ve de frente, y enfoca la textura de SF3D en el resto. SF3D solo ve la
+    imagen a 512 px y guarda el color en un triplano de ~384 muestras, por eso su albedo sale suave.
+    rgba_image: la imagen ya encuadrada para SF3D (preprocess_image_for_sf3d), con alfa.
+    """
+    t_start = time.time()
+    mat = getattr(getattr(mesh, "visual", None), "material", None)
+    albedo_img = getattr(mat, "baseColorTexture", None) if mat is not None else None
+    uv = getattr(mesh.visual, "uv", None) if mat is not None else None
+    if not isinstance(albedo_img, Image.Image) or uv is None or len(uv) != len(mesh.vertices):
+        return False
+    uv_raster, depth_raster, uv_interp, _ = _get_sf3d_projection_kernels()
+
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    uv = np.asarray(uv, dtype=np.float64)
+    ref = np.asarray(rgba_image.convert("RGBA"))
+    ref_res = ref.shape[0]
+
+    # 1. Silueta de la malla vista desde la cámara de SF3D y ajuste fino contra el alfa del dibujo
+    proj_v, depth_v = _sf3d_camera_project(verts, distance, fovy_deg)
+    fit_res = 256
+    sil = np.isfinite(depth_raster(proj_v * fit_res, depth_v, faces, fit_res, fit_res))
+    alpha_small = cv2.resize(ref[..., 3], (fit_res, fit_res), interpolation=cv2.INTER_AREA) > 127
+    scale, du, dv, iou = _fit_silhouette(sil, alpha_small, max_scale_dev)
+    if iou < min_iou:
+        print(f" -> [Proyección HD] La forma no encaja con el dibujo (IoU {iou:.2f}); se conserva la textura de SF3D.")
+        return False
+
+    # 2. Posición, normal, coordenadas en el dibujo y visibilidad de cada texel del atlas
+    tex_h, tex_w = albedo_img.height, albedo_img.width
+    uv_px = np.stack([uv[:, 0] * tex_w, (1.0 - uv[:, 1]) * tex_h], axis=1)
+    fid, bary = uv_raster(uv_px, faces, tex_w, tex_h)
+    covered = fid >= 0
+    attr = np.concatenate([proj_v, depth_v[:, None], _smooth_vertex_normals(verts, faces), verts], axis=1)
+    texel = uv_interp(fid, bary, faces, attr.astype(np.float32))[covered]
+    proj_t, depth_t, normals, pos = texel[:, :2], texel[:, 2], texel[:, 3:6], texel[:, 6:9]
+    normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
+    to_cam = np.array([0.0, 0.0, -distance], np.float32) - pos
+    to_cam /= np.maximum(np.linalg.norm(to_cam, axis=1, keepdims=True), 1e-12)
+    cos_view = np.sum(normals * to_cam, axis=1)
+
+    z_res = 1024
+    zbuf = depth_raster(proj_v * z_res, depth_v, faces, z_res, z_res)
+    # Mínimo en 3x3: cerca de un borde de profundidad gana la superficie de delante
+    zbuf = cv2.erode(zbuf, np.ones((3, 3), np.uint8))
+    zi = np.clip((proj_t * z_res).astype(np.int64), 0, z_res - 1)
+    visible = depth_t <= zbuf[zi[:, 1], zi[:, 0]] + 0.02 * distance
+
+    # 3. Coordenadas en el dibujo (con el ajuste de silueta) y su núcleo de alfa (sin el borde)
+    img_uv = (proj_t - 0.5) * scale + 0.5 + np.array([du, dv])
+    alpha = (ref[..., 3] > 127).astype(np.uint8)
+    erode_px = max(2, int(round(ref_res * 0.008)))
+    core = cv2.erode(alpha, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * erode_px + 1,) * 2))
+    core = cv2.GaussianBlur(core.astype(np.float32), (0, 0), erode_px)
+    # Mapas de muestreo a tamaño de la textura (cv2.remap no admite más de 32767 filas)
+    map_x = np.full((tex_h, tex_w), -1.0, np.float32)
+    map_y = np.full((tex_h, tex_w), -1.0, np.float32)
+    map_x[covered] = img_uv[:, 0] * ref_res - 0.5
+    map_y[covered] = img_uv[:, 1] * ref_res - 0.5
+    sample = lambda img: cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR,
+                                   borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    projected = sample(np.ascontiguousarray(ref[..., :3])).astype(np.float32)
+    img_core = sample(core)[covered]
+
+    lo, hi = SF3D_PROJECTION_COS
+    t = np.clip((cos_view - lo) / (hi - lo), 0.0, 1.0)
+    weight = np.zeros((tex_h, tex_w), np.float32)
+    weight[covered] = (t * t * (3.0 - 2.0 * t)) * visible * np.clip(img_core, 0.0, 1.0)
+
+    # Suavizado de la máscara dentro de las islas: sin escalones entre texels ni costuras
+    m = covered.astype(np.float32)
+    weight = cv2.GaussianBlur(weight, (0, 0), 1.5) / np.maximum(cv2.GaussianBlur(m, (0, 0), 1.5), 1e-4)
+    weight = np.clip(weight, 0.0, 1.0) * m
+
+    # 4. Enfoque de la textura de SF3D y mezcla con el dibujo
+    out = np.asarray(albedo_img.convert("RGB"), dtype=np.float32)
+    if sharpen > 0:
+        # El relleno entre islas también se enfoca: inpaint_uv_atlas_texture lo rehace después
+        sigma = 1.6 * tex_w / 2048.0
+        blur = cv2.GaussianBlur(out * m[..., None], (0, 0), sigma)
+        blur /= np.maximum(cv2.GaussianBlur(m, (0, 0), sigma), 1e-4)[..., None]
+        out += sharpen * (out - blur)
+    projected -= out
+    projected *= weight[..., None]
+    out += projected
+    out += 0.5
+    np.clip(out, 0, 255, out=out)
+    out = out.astype(np.uint8)
+    _extend_islands(out, covered)
+    result = Image.fromarray(out, mode="RGB")
+    result.format = "PNG"
+    mat.baseColorTexture = result
+    share = float(np.count_nonzero(weight > 0.5)) / max(int(covered.sum()), 1)
+    print(f" -> [Proyección HD] Dibujo proyectado en el {share:.0%} de la textura "
+          f"(encaje IoU {iou:.2f}, escala {scale:.3f}) en {time.time() - t_start:.1f}s.")
+    return True
+
+
+def rebase_normal_map_to_vertex_normals(mesh: Any) -> bool:
+    """
+    SF3D hornea el normal map respecto a la normal plana de cada triángulo (malla sin vértices
+    compartidos), pero el GLB sale con vértices unidos y normales suaves: en Godot cada triángulo
+    se ve como una celda (superficie "agrietada"). Une los vértices por posición y UV y vuelve a
+    expresar el normal map respecto a las normales suaves que trimesh exporta para esa malla.
+    Espera el mapa ya en convención glTF (fix_sf3d_normal_convention).
+    """
+    mat = getattr(getattr(mesh, "visual", None), "material", None)
+    tex = getattr(mat, "normalTexture", None) if mat is not None else None
+    if not isinstance(tex, Image.Image) or getattr(mesh.visual, "uv", None) is None:
+        return False
+    mesh.merge_vertices(merge_tex=False, merge_norm=True)
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    uv = np.asarray(mesh.visual.uv, dtype=np.float64)
+    if len(uv) != len(verts):
+        return False
+    # Las normales que trimesh calcula para esta topología: center_and_orient_mesh (fix_normals)
+    # y cada recarga del GLB las vuelven a calcular igual, así que son las que llegan a Godot
+    smooth = np.asarray(trimesh.geometry.weighted_vertex_normals(
+        len(verts), faces, mesh.face_normals, mesh.face_angles), dtype=np.float64)
+
+    uv_raster, _, _, rebase_texels = _get_sf3d_projection_kernels()
+    h, w = tex.height, tex.width
+    fid, bary = uv_raster(np.stack([uv[:, 0] * w, (1.0 - uv[:, 1]) * h], axis=1), faces, w, h)
+    covered = fid >= 0
+
+    # Base tangente plana de cada cara (la que usó SF3D, ya en convención glTF)
+    p0, p1, p2 = (verts[faces[:, k]] for k in range(3))
+    t0, t1, t2 = (uv[faces[:, k]] for k in range(3))
+    e1, e2, d1, d2 = p1 - p0, p2 - p0, t1 - t0, t2 - t0
+    det = d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0]
+    det = np.where(np.abs(det) < 1e-14, 1e-14, det)
+    tangent = (e1 * d2[:, 1:2] - e2 * d1[:, 1:2]) / det[:, None]
+    face_n = np.cross(e1, e2)
+    face_n /= np.maximum(np.linalg.norm(face_n, axis=1, keepdims=True), 1e-12)
+    tangent -= np.sum(tangent * face_n, axis=1, keepdims=True) * face_n
+    tangent /= np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-12)
+    sign = np.where(det < 0, -1.0, 1.0)
+
+    nmap = np.asarray(tex.convert("RGB"), dtype=np.float32) / 127.5 - 1.0
+    out = rebase_texels(fid, bary, faces, face_n, tangent, sign, smooth, nmap)
+    enc = np.clip(np.round((out * 0.5 + 0.5) * 255.0), 0, 255).astype(np.uint8)
+    _extend_islands(enc, covered)
+    fixed = Image.fromarray(enc, mode="RGB")
+    fixed.format = "PNG"
+    mat.normalTexture = fixed
+    return True
 
 
 class SF3DGenerator:
@@ -2793,12 +4101,14 @@ class SF3DGenerator:
         _ensure_sf3d_shims(repo_dir=found_repo)
 
         try:
+            import sf3d.system as sf3d_system
             from sf3d.system import SF3D
         except ImportError as e:
             raise RuntimeError(
                 f"No se pudo importar la librería de SF3D ({e}).\n"
                 "Ejecuta 'setup.bat' y selecciona la opción de Stable Fast 3D."
             ) from e
+        sf3d_system.dilate_fill = _sf3d_dilate_fill_lowmem
 
         local_weights_dir = SF3D_LOCAL_DIR
         target_path_or_id = str(local_weights_dir) if (local_weights_dir / "model.safetensors").exists() else self.model_id
@@ -2834,11 +4144,31 @@ class SF3DGenerator:
         texture_resolution: int = 2048,
         generate_texture: bool = True,
         foreground_ratio: float = 0.82,
-        progress_callback: Optional[Callable[[str, int], None]] = None
+        progress_callback: Optional[Callable[[str, int], None]] = None,
+        target_faces: Optional[int] = None,
+        remesh: str = "triangle",
+        material: str = "mate",
+        relief: str = "suave",
+        project_input: bool = True
     ) -> trimesh.Trimesh:
+        """
+        target_faces > 0: SF3D remalla la geometría a ~target_faces triángulos ANTES de desplegar
+        las UV y hornear, así la textura y el normal map se hornean sobre la malla final del juego
+        (decimar después de hornear deforma las UV y el normal map deja de corresponder).
+        remesh: "triangle" (isotrópico, robusto) o "quad" (Instant Meshes, topología más limpia).
+        material: clave de MATERIAL_PRESETS. relief: clave de TEXTURE_RELIEF_LEVELS.
+        project_input: Proyección HD (pinta la imagen de entrada a resolución completa sobre las
+        caras que se ven de frente y enfoca la textura de SF3D en el resto).
+        """
         self._load_model()
         if progress_callback:
             progress_callback("⚡ SF3D: Preprocesando silueta (Anti-Color Bleeding y Padding 0.82)...", 35)
+
+        if target_faces and target_faces > 0 and remesh in ("triangle", "quad"):
+            # Una malla cerrada de triángulos tiene ~2 caras por vértice
+            remesh_mode, vertex_count = remesh, max(500, int(target_faces) // 2)
+        else:
+            remesh_mode, vertex_count = "none", -1
 
         # 1. Preprocesamiento Inpainting 2D Anti-Halos y encuadre con foreground_ratio=0.82 fijo
         rgba_img = preprocess_image_for_sf3d(
@@ -2846,10 +4176,6 @@ class SF3DGenerator:
             foreground_ratio=foreground_ratio,
             edge_dilation_pixels=10
         )
-
-        temp_dir = Path(os.environ["TEMP"])
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        temp_glb = temp_dir / f"sf3d_tmp_{int(time.time()*1000)}.glb"
 
         try:
             from contextlib import nullcontext
@@ -2863,41 +4189,46 @@ class SF3DGenerator:
             target_res = texture_resolution
             mesh_out = None
 
-            with torch.inference_mode():
-                with torch.autocast(device_type=self.device, dtype=torch.bfloat16) if "cuda" in self.device else nullcontext():
-                    try:
-                        print(f" -> [SF3D Inferencia] Generando modelo 3D con textura a {target_res}x{target_res}...")
-                        mesh_out, _ = self.model.run_image(
-                            [rgba_img],
-                            bake_resolution=target_res,
-                            remesh="none"
-                        )
-                    except (torch.cuda.OutOfMemoryError, RuntimeError) as e_oom:
-                        err_str = str(e_oom).lower()
-                        if ("out of memory" in err_str or "cuda" in err_str) and target_res > 1024:
-                            print(f" -> [SF3D VRAM Fallback] VRAM insuficiente para textura {target_res}x{target_res} en 8GB. "
-                                  f"Liberando caché y reintentando automáticamente a 1024x1024...")
-                            flush_vram()
-                            target_res = 1024
-                            mesh_out, _ = self.model.run_image(
-                                [rgba_img],
-                                bake_resolution=target_res,
-                                remesh="none"
-                            )
-                        else:
-                            raise e_oom
+            def _run(res: int, mode: str, count: int):
+                with torch.inference_mode():
+                    with torch.autocast(device_type=self.device, dtype=torch.bfloat16) if "cuda" in self.device else nullcontext():
+                        return self.model.run_image([rgba_img], bake_resolution=res, remesh=mode, vertex_count=count)[0]
 
-            mesh_out.export(str(temp_glb), include_normals=True)
-            loaded_mesh = trimesh.load(str(temp_glb), process=False)
-
-            if isinstance(loaded_mesh, trimesh.Scene):
-                geometries = list(loaded_mesh.geometry.values())
-                if geometries:
-                    final_mesh = geometries[0] if len(geometries) == 1 else trimesh.util.concatenate(geometries)
+            print(f" -> [SF3D Inferencia] Generando modelo 3D con textura a {target_res}x{target_res}"
+                  + (f", remallado '{remesh_mode}' a ~{vertex_count * 2:,} caras..." if remesh_mode != "none" else "..."))
+            # Los reintentos se hacen FUERA del except: dentro, la traza de la excepción mantiene vivos
+            # los tensores del intento fallido (GB de VRAM) y el reintento vuelve a quedarse sin memoria
+            attempt = (target_res, remesh_mode, vertex_count)
+            while mesh_out is None:
+                failure = None
+                try:
+                    mesh_out = _run(*attempt)
+                except Exception as e_run:
+                    err_str = str(e_run)
+                    is_vram = isinstance(e_run, torch.cuda.OutOfMemoryError) or "out of memory" in err_str.lower()
+                    failure = (type(e_run).__name__, err_str, is_vram)
+                if failure is None:
+                    break
+                flush_vram()  # la excepción ya se soltó: aquí sí se libera la VRAM del intento fallido
+                name, err_str, is_vram = failure
+                res, mode, count = attempt
+                if is_vram and res > 1024:
+                    print(f" -> [SF3D VRAM Fallback] VRAM insuficiente para textura {res}x{res}; reintentando a 1024x1024...")
+                    attempt = (1024, mode, count)
+                elif not is_vram and mode != "none":
+                    # Remallado (gpytoolbox / Instant Meshes) fallido: malla completa, el pipeline decima
+                    print(f" -> [SF3D Remesh] El remallado falló ({err_str}); se genera la malla completa.")
+                    attempt = (res, "none", -1)
                 else:
-                    final_mesh = trimesh.Trimesh()
-            else:
-                final_mesh = loaded_mesh
+                    raise RuntimeError(f"SF3D falló ({name}): {err_str}")
+            target_res = attempt[0]
+
+            # SF3D marca las texturas como JPEG y trimesh las guarda con calidad 75 y croma
+            # submuestreado: en PNG el GLB final no pierde calidad (el normal map en JPEG mete
+            # bloques en la iluminación). SF3D ya entrega un trimesh: no hace falta pasar por un
+            # GLB temporal (codificar y leer las texturas costaba ~1 s por generación)
+            _mark_textures_lossless(mesh_out)
+            final_mesh = mesh_out
 
             # 2. Suavizado Taubin post-baking ELIMINADO:
             # Desplazar vértices 3D después del UV unwrap desalinea la geometría respecto a la textura
@@ -2905,20 +4236,37 @@ class SF3DGenerator:
 
             # 3. TEXTURA NATIVA SF3D: Dilatación e inpainting de fondo para eliminar costuras UV y texture bleeding
             if generate_texture:
+                # Normal map a convención glTF y relieve de detalle (antes del relleno del atlas,
+                # que solo toca el albedo)
+                if fix_sf3d_normal_convention(final_mesh):
+                    print(" -> [SF3D Normal map] Convertido a la convención glTF/Godot.")
+                try:
+                    if rebase_normal_map_to_vertex_normals(final_mesh):
+                        print(f" -> [SF3D Normal map] Expresado respecto a las normales suaves del GLB "
+                              f"({len(final_mesh.vertices):,} vértices unidos).")
+                except Exception as e_rebase:
+                    print(f" -> [Aviso Normal map] {e_rebase}")
+                if project_input:
+                    try:
+                        # El dibujo con el mismo encuadre que vio SF3D, a la resolución de la entrada
+                        proj_res = int(np.clip(max(image.size) / foreground_ratio, 1024, 2048))
+                        proj_img = rgba_img if proj_res == rgba_img.width else preprocess_image_for_sf3d(
+                            image, foreground_ratio=foreground_ratio, edge_dilation_pixels=10,
+                            target_resolution=proj_res)
+                        project_input_onto_texture(final_mesh, proj_img)
+                    except Exception as e_proj:
+                        print(f" -> [Aviso Proyección HD] {e_proj}. Se conserva la textura de SF3D.")
+                relief_strength = TEXTURE_RELIEF_LEVELS.get(relief, 0.0)
+                if relief_strength > 0 and add_texture_relief(final_mesh, relief_strength):
+                    print(f" -> [SF3D Relieve] Relieve de detalle '{relief}' añadido al normal map.")
                 final_mesh = inpaint_uv_atlas_texture(final_mesh, dilation_radius=48)
+                _mark_textures_lossless(final_mesh)
                 if progress_callback:
                     progress_callback("🎨 SF3D: Textura PBR y atlas UV protegidos...", 80)
 
-            # 4. Ajuste de material PBR anti-glare / mate limpio
-            # - metallicFactor forzado a 0.0 (evita reflejos metálicos/plásticos)
-            # - roughnessFactor configurado en 0.90 (acabado mate limpio y estilizado)
-            # - doubleSided = True
-            if generate_texture and hasattr(final_mesh, "visual") and hasattr(final_mesh.visual, "material"):
-                mat = final_mesh.visual.material
-                if mat is not None:
-                    mat.metallicFactor = 0.0
-                    mat.roughnessFactor = 0.90
-                    mat.doubleSided = True
+            # 4. Acabado del material elegido (mate, satinado o metal), doble cara
+            if generate_texture:
+                apply_material_preset(final_mesh, material)
 
             if not generate_texture:
                 neutral_mat = trimesh.visual.material.PBRMaterial(
@@ -2932,11 +4280,6 @@ class SF3DGenerator:
             return final_mesh
 
         finally:
-            if temp_glb.exists():
-                try:
-                    temp_glb.unlink()
-                except Exception:
-                    pass
             # SF3D sale de la VRAM y queda aparcado en RAM para la siguiente generación
             self.model = None
             park_model("sf3d")
@@ -2956,7 +4299,8 @@ def postprocess_and_validate_glb(
     Inspecciona y valida el archivo binario .glb con pygltflib:
     - Asegura que todos los materiales tengan doubleSided = True (evita caras invisibles).
     - Configura baseColorFactor PBR estándar [1.0, 1.0, 1.0, 1.0].
-    - Aplica parámetros anti-glare / anti-grasa (metallicFactor=0.0, roughnessFactor=0.90).
+    - Conserva el acabado elegido; solo si el material llega sin él (valores por defecto de glTF,
+      metal 1.0 / rugosidad 1.0) aplica el mate anti-glare (metallicFactor=0.0, roughnessFactor=0.90).
     - Inyecta metadatos de exportación para Godot 4.
     """
     try:
@@ -2972,11 +4316,15 @@ def postprocess_and_validate_glb(
             for mat in gltf.materials:
                 mat.doubleSided = True
                 if mat.pbrMetallicRoughness:
-                    mat.pbrMetallicRoughness.baseColorFactor = [1.0, 1.0, 1.0, 1.0]
-                    # Parámetros PBR anti-glare / anti-grasa:
-                    # metallicFactor = 0.0 (difuso mate puro) y roughnessFactor alto (0.90)
-                    mat.pbrMetallicRoughness.metallicFactor = 0.0
-                    mat.pbrMetallicRoughness.roughnessFactor = 0.90
+                    pbr = mat.pbrMetallicRoughness
+                    pbr.baseColorFactor = [1.0, 1.0, 1.0, 1.0]
+                    # Sin acabado explícito glTF asume metal 1.0 / rugosidad 1.0 (se ve oscuro y
+                    # sucio): ahí se pone el mate anti-glare. Ningún preset usa rugosidad 1.0.
+                    metallic = 1.0 if pbr.metallicFactor is None else pbr.metallicFactor
+                    roughness = 1.0 if pbr.roughnessFactor is None else pbr.roughnessFactor
+                    if metallic >= 1.0 and roughness >= 1.0:
+                        pbr.metallicFactor = 0.0
+                        pbr.roughnessFactor = 0.90
 
         # Metadatos embebidos en el asset glTF
         gltf.asset.extras = {
@@ -3081,7 +4429,12 @@ def generate_model_pipeline(
     rembg_session: Optional[Any] = None,
     clean_image_input: Optional[Image.Image] = None,
     step_callback: Optional[Callable[[int, str], None]] = None,
-    export_formats: Optional[list] = None
+    export_formats: Optional[list] = None,
+    improved_depth: bool = False,
+    max_quality: bool = False,
+    material: str = "mate",
+    relief: str = "suave",
+    project_input: bool = True
 ) -> Path:
     """
     Ejecuta el pipeline automático multi-motor de 4 etapas:
@@ -3130,12 +4483,21 @@ def generate_model_pipeline(
         else:
             step_callback(2, "🧠 Descargando pesos de Hunyuan3D-2 a D:\\AI_Models... (primera vez, por favor espera)")
             
+    quality = shape_quality_settings(octree_resolution, improved_depth, max_quality)
+    shape_subfolder, taubin_iters, octree_resolution = quality["shape_subfolder"], quality["taubin_iterations"], quality["octree"]
+    steps = quality["steps"] or steps
+    if (improved_depth or max_quality) and "sf3d" not in model_type.lower():
+        print(f" -> [Calidad] {shape_subfolder} · {steps} pasos · octree {octree_resolution} · "
+              f"Taubin {taubin_iters} · semillas {quality['seeds']}")
+        if quality["missing"]:
+            print(f" -> [Calidad] Para mejor resultado: python preparar_modelos.py download {quality['missing'][0]}")
+
     if "sf3d" in model_type.lower():
         generator = None
     else:
         generator = Hunyuan3DGenerator(
             model_id="tencent/Hunyuan3D-2",
-            shape_subfolder="hunyuan3d-dit-v2-0-turbo",
+            shape_subfolder=shape_subfolder,
             paint_subfolder="hunyuan3d-paint-v2-0",
             use_fp16=True,
             low_vram_mode=low_vram_mode,
@@ -3156,9 +4518,13 @@ def generate_model_pipeline(
             clean_image,
             texture_resolution=2048,
             generate_texture=generate_texture,
-            foreground_ratio=0.82
+            foreground_ratio=0.82,
+            target_faces=target_faces,
+            relief=relief,
+            project_input=project_input
         )
-        if target_faces and target_faces < len(raw_mesh.faces):
+        # SF3D ya remalla a ~target_faces antes de hornear; solo se decima si el remallado falló
+        if target_faces and len(raw_mesh.faces) > target_faces * SF3D_FACE_TOLERANCE:
             decimated_mesh = decimate_mesh_preserving_texture(raw_mesh, target_faces=target_faces)
         else:
             decimated_mesh = raw_mesh
@@ -3168,11 +4534,6 @@ def generate_model_pipeline(
             align_floor=align_bottom,
             normalize_scale=normalize_scale
         )
-
-        if hasattr(final_textured_mesh, "visual") and hasattr(final_textured_mesh.visual, "material") and final_textured_mesh.visual.material is not None:
-            final_textured_mesh.visual.material.metallicFactor = 0.0
-            final_textured_mesh.visual.material.roughnessFactor = 0.90
-            final_textured_mesh.visual.material.doubleSided = True
 
         if not generate_texture:
             neutral_mat = trimesh.visual.material.PBRMaterial(
@@ -3192,13 +4553,28 @@ def generate_model_pipeline(
             octree_resolution=octree_resolution,
             seed=seed,
             target_faces=target_faces,
-            texture_safe_cap=TEXTURE_SAFE_MAX_FACES if generate_texture else None
+            texture_safe_cap=TEXTURE_SAFE_MAX_FACES if generate_texture else None,
+            taubin_iterations=taubin_iters,
+            allow_high_octree=improved_depth or max_quality,
+            guidance_scale=quality["guidance"],
+            seed_candidates=quality["seeds"],
+            keep_hd=quality["normal_map"]
         )
+        hd_mesh, generator.last_hd_mesh = generator.last_hd_mesh, None
         aligned_mesh = center_and_orient_mesh(
             raw_mesh,
             align_floor=align_bottom,
             normalize_scale=normalize_scale
         )
+        if hd_mesh is not None:
+            hd_mesh.vertices = follow_frame(hd_mesh.vertices, raw_mesh, aligned_mesh)
+        if improved_depth:
+            aligned_mesh, d_before, d_after, _ = reinforce_depth(
+                aligned_mesh, image=clean_image, companions=(hd_mesh,) if hd_mesh is not None else ()
+            )
+        else:
+            d_before = d_after = measure_depth_ratio(aligned_mesh)
+        print(f" -> [Profundidad] Fondo/alto: {d_before:.2f}" + (f" → reforzada a {d_after:.2f}" if d_after > d_before else ""))
 
         # Purga total de VRAM entre Etapa 1 y Etapa 2
         flush_vram()
@@ -3230,6 +4606,19 @@ def generate_model_pipeline(
         # La CLI termina al exportar: se liberan RAM y VRAM
         unload_all_models()
         print_real_vram_status("CLI Fin Generación")
+
+        # Detalle de la malla HD horneado en un normal map (la malla final conserva sus caras)
+        if hd_mesh is not None:
+            hd_mesh.vertices = follow_frame(hd_mesh.vertices, aligned_mesh, final_textured_mesh)
+            try:
+                final_textured_mesh = bake_normal_map(final_textured_mesh, hd_mesh) or final_textured_mesh
+            except Exception as e_bake:
+                print(f" -> [Aviso Normal map] {e_bake}")
+            hd_mesh = None
+
+    # Acabado elegido sobre el material existente (solo factores: conserva texturas y normal map)
+    if generate_texture:
+        apply_material_preset(final_textured_mesh, material)
 
     # 5. Exportación Multi-Formato (.GLB, .STL, .3MF)
     req_formats = list(export_formats) if export_formats else []
@@ -3360,6 +4749,35 @@ def main():
         help="Exportar también en formato 3MF (.3mf) para slicers de manufactura aditiva (Bambu, Prusa)"
     )
     parser.add_argument(
+        "--profundidad",
+        action="store_true",
+        help="Profundidad mejorada (Hunyuan): variante Fast de 30 pasos, 3 semillas (gana la más fiel a la silueta), "
+             "octree 384, refuerzo guiado si sale plano y normal map del detalle HD"
+    )
+    parser.add_argument(
+        "--maxima",
+        action="store_true",
+        help="Máxima calidad (Hunyuan): modelo completo de 50 pasos con guía, octree 384, sin suavizado y "
+             "normal map del detalle HD (más lento; descarga: preparar_modelos.py download dit_full)"
+    )
+    parser.add_argument(
+        "--material",
+        choices=list(MATERIAL_PRESETS),
+        default="mate",
+        help="Acabado del material: mate (cartoon), satinado (plástico/barniz) o metal (oro, plata, monedas)"
+    )
+    parser.add_argument(
+        "--relieve",
+        choices=list(TEXTURE_RELIEF_LEVELS),
+        default="suave",
+        help="Relieve de detalle sacado de la textura (SF3D): none, suave o marcado"
+    )
+    parser.add_argument(
+        "--sin-proyeccion",
+        action="store_true",
+        help="SF3D: no proyectar la imagen de entrada en HD sobre el frente del modelo"
+    )
+    parser.add_argument(
         "--gpu",
         default=None,
         help="GPU para la IA: índice de nvidia-smi (0, 1...), 'cpu' o 'ask' (se aplica en gpu_select.py antes de importar torch)"
@@ -3395,7 +4813,12 @@ def main():
             generate_texture=not args.no_texture,
             vram_profile=args.vram_profile,
             low_vram_mode=False if args.no_low_vram else None,
-            export_formats=requested_formats
+            export_formats=requested_formats,
+            improved_depth=args.profundidad,
+            max_quality=args.maxima,
+            material=args.material,
+            relief=args.relieve,
+            project_input=not args.sin_proyeccion
         )
     except Exception as e:
         print(f"\n[ERROR FATAL] La generación falló: {e}")
